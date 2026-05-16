@@ -1,0 +1,305 @@
+================================================================================
+  APOLLO SUPPORT — GUÍA DE DESPLIEGUE EN PRODUCCIÓN
+  Servidor: Windows Server 2016 + Apache HTTP Server
+  Fecha: Mayo 2026
+================================================================================
+
+ARQUITECTURA
+─────────────────────────────────────────────────────────────────────────────
+  Internet/LAN
+      │
+      ▼
+  Apache (puerto 80/443)
+      │
+      ├── /           → carpeta dist\ del frontend (archivos estáticos)
+      └── /api/*      → proxy → http://localhost:8001 (FastAPI backend)
+                                      │
+                                      └── WebSocket: /api/ws/*
+
+  PostgreSQL  →  192.168.11.223:5432  (ya existente)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PARTE 1 — BACKEND (FastAPI)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PASO 1 — Copiar archivos al servidor
+─────────────────────────────────────
+  Copiar SOLO estos archivos a: C:\ApolloSupport\backend\
+
+    main.py
+    auth.py
+    models.py
+    schemas.py
+    database.py
+    erp_licensing.py
+    audit_schema.py
+    requirements.txt
+    .env.example
+
+  NO copiar: venv\  __pycache__\  *.log  Error.log  *.spec
+
+
+PASO 2 — Instalar Python 3.11 (si no está)
+────────────────────────────────────────────
+  Descargar: https://www.python.org/downloads/release/python-3119/
+  Elegir: "Windows installer (64-bit)"
+  ✔ Marcar "Add Python to PATH"
+
+
+PASO 3 — Crear entorno virtual e instalar dependencias
+────────────────────────────────────────────────────────
+  Abrir CMD como Administrador en C:\ApolloSupport\backend\
+
+    python -m venv venv
+    venv\Scripts\pip install --upgrade pip
+    venv\Scripts\pip install fastapi==0.110.0 uvicorn==0.27.1 ^
+      SQLAlchemy==2.0.48 "psycopg[binary]==3.3.3" python-dotenv==1.0.1 ^
+      "python-jose[cryptography]==3.5.0" passlib==1.7.4 bcrypt==4.0.1 ^
+      psutil==7.2.2 websockets==16.0 email-validator==2.3.0 ^
+      python-multipart==0.0.22 httpx==0.28.1 Pillow==12.1.1 ^
+      requests==2.33.1 dbfread==2.0.7 PyMySQL==1.1.3 ^
+      cryptography==46.0.6 anyio==4.13.0 pydantic==2.12.5 tzdata==2025.3
+
+
+PASO 4 — Configurar variables de entorno
+──────────────────────────────────────────
+  Copiar .env.example como .env y completar:
+
+    DB_USER=postgres
+    DB_PASSWORD=INGENIERIA
+    DB_HOST=192.168.11.223
+    DB_PORT=5432
+    DB_NAME=apollosupport_db
+    ERP_REMOTE_HOST=http://192.168.11.223
+
+    # Generar secreto seguro (ejecutar una vez):
+    # venv\Scripts\python -c "import secrets; print(secrets.token_hex(32))"
+    APOLLO_SECRET_KEY=<pegar resultado aqui>
+
+
+PASO 5 — Crear directorios necesarios
+───────────────────────────────────────
+  mkdir C:\ApolloSupport\backend\logs
+  mkdir C:\ApolloSupport\backend\uploads
+  mkdir C:\ApolloSupport\backend\temp_files
+
+
+PASO 6 — Probar que el backend arranca
+────────────────────────────────────────
+  Desde CMD en C:\ApolloSupport\backend\:
+
+    venv\Scripts\uvicorn main:app --host 127.0.0.1 --port 8001
+
+  Abrir navegador: http://localhost:8001/docs
+  Si responde → OK. Cerrar con Ctrl+C.
+
+
+PASO 7 — Registrar el backend como Servicio Windows
+─────────────────────────────────────────────────────
+  Usar NSSM (Non-Sucking Service Manager):
+  Descargar gratis: https://nssm.cc/download (nssm-2.24.zip)
+  Extraer nssm.exe a C:\Windows\System32\
+
+  Desde CMD como Administrador:
+
+    nssm install ApolloBackend "C:\ApolloSupport\backend\venv\Scripts\uvicorn.exe"
+    nssm set ApolloBackend AppParameters "main:app --host 127.0.0.1 --port 8001 --workers 1"
+    nssm set ApolloBackend AppDirectory "C:\ApolloSupport\backend"
+    nssm set ApolloBackend AppEnvironmentExtra "PYTHONPATH=C:\ApolloSupport\backend"
+    nssm set ApolloBackend DisplayName "Apollo Support Backend"
+    nssm set ApolloBackend Description "FastAPI backend para ApolloSupport"
+    nssm set ApolloBackend Start SERVICE_AUTO_START
+    nssm set ApolloBackend AppStdout "C:\ApolloSupport\backend\logs\backend.log"
+    nssm set ApolloBackend AppStderr "C:\ApolloSupport\backend\logs\backend_error.log"
+
+    nssm start ApolloBackend
+
+  Verificar:
+    sc query ApolloBackend
+    → Estado: RUNNING ✔
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PARTE 2 — FRONTEND (React/Vite → Apache)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PASO 8 — Copiar el build del frontend al servidor Apache
+──────────────────────────────────────────────────────────
+  El build ya fue generado en: p:\ApolloSupport\frontend\dist\
+
+  Copiar TODO el contenido de dist\ a:
+    C:\Apache24\htdocs\apollosupport\
+  (o el directorio que use su instalación de Apache, ej: C:\xampp\htdocs\apollosupport\)
+
+  Estructura final:
+    C:\Apache24\htdocs\apollosupport\
+        index.html
+        assets\
+            index-XXXX.js
+            index-XXXX.css
+        favicon.svg
+        manifest.json
+        sw.js
+
+
+PASO 9 — Habilitar módulos de Apache necesarios
+─────────────────────────────────────────────────
+  Editar C:\Apache24\conf\httpd.conf y asegurarse que estén SIN comentario (#):
+
+    LoadModule proxy_module modules/mod_proxy.so
+    LoadModule proxy_http_module modules/mod_proxy_http.so
+    LoadModule proxy_wstunnel_module modules/mod_proxy_wstunnel.so
+    LoadModule rewrite_module modules/mod_rewrite.so
+    LoadModule headers_module modules/mod_headers.so
+
+  ⚠ Si alguna línea tiene # al inicio, quitarlo y guardar.
+
+
+PASO 10 — Configurar Virtual Host en Apache
+─────────────────────────────────────────────
+  Editar o crear: C:\Apache24\conf\extra\httpd-vhosts.conf
+  Agregar al final:
+
+  ──────────────────────────────────────────────────────────────
+  <VirtualHost *:80>
+      ServerName support.ultimate.net.ar
+      DocumentRoot "C:/Apache24/htdocs/apollosupport"
+
+      # ── Frontend SPA: todas las rutas van a index.html ────────
+      <Directory "C:/Apache24/htdocs/apollosupport">
+          Options -Indexes +FollowSymLinks
+          AllowOverride All
+          Require all granted
+          FallbackResource /index.html
+      </Directory>
+
+      # ── API: proxy al backend FastAPI ─────────────────────────
+      ProxyPreserveHost On
+
+      # WebSocket (PRIMERO, antes que el proxy HTTP genérico)
+      RewriteEngine On
+      RewriteCond %{HTTP:Upgrade} websocket [NC]
+      RewriteCond %{HTTP:Connection} upgrade [NC]
+      RewriteRule ^/api/(.*) ws://127.0.0.1:8001/api/$1 [P,L]
+
+      # HTTP normal
+      ProxyPass        /api  http://127.0.0.1:8001/api
+      ProxyPassReverse /api  http://127.0.0.1:8001/api
+
+      # ── Headers de seguridad ───────────────────────────────────
+      Header always set X-Frame-Options "SAMEORIGIN"
+      Header always set X-Content-Type-Options "nosniff"
+
+      # ── Logs ──────────────────────────────────────────────────
+      ErrorLog  "logs/apollosupport_error.log"
+      CustomLog "logs/apollosupport_access.log" combined
+  </VirtualHost>
+  ──────────────────────────────────────────────────────────────
+
+  Verificar que httpd.conf incluye este archivo:
+    Include conf/extra/httpd-vhosts.conf
+
+
+PASO 11 — Crear .htaccess en la carpeta del frontend (alternativa al FallbackResource)
+────────────────────────────────────────────────────────────────────────────────────────
+  Crear C:\Apache24\htdocs\apollosupport\.htaccess:
+
+    Options -MultiViews
+    RewriteEngine On
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^ /index.html [QSA,L]
+
+
+PASO 12 — Reiniciar Apache y verificar
+────────────────────────────────────────
+  Desde CMD como Admin:
+
+    httpd -t
+    → Syntax OK ✔
+
+    net stop Apache2.4
+    net start Apache2.4
+
+  Probar en navegador:
+    http://support.ultimate.net.ar         → carga el login ✔
+    http://support.ultimate.net.ar/api/health → {"status":"ok"} ✔
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PARTE 3 — AGENTE CENTINELA (en PCs de clientes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PASO 13 — Distribuir el instalador
+────────────────────────────────────
+  Archivo a entregar al cliente:
+    p:\ApolloSupport\agent\installer_output\ApolloSetup_v3.0.0.exe
+
+  El cliente solo hace doble click → Siguiente → Instalar.
+  No requiere Python, no requiere configuración manual.
+
+  Instala automáticamente:
+    • ApolloCentinelaService.exe  → Servicio Windows (siempre activo)
+    • ApolloCentinela.exe         → Companion con tray icon (al iniciar sesión)
+
+  Config en el cliente: C:\ProgramData\ApolloSupport\centinela_config.json
+  (se crea automáticamente en el primer inicio)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PARTE 4 — VERIFICACIÓN FINAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ✔ Frontend carga en http://support.ultimate.net.ar
+  ✔ Login funciona (usuario + contraseña)
+  ✔ Backend responde: /api/health
+  ✔ Servicios Windows corriendo:
+      sc query ApolloBackend      → RUNNING
+      sc query ApolloSupport      → (si existe)
+  ✔ Al instalar el agente en un cliente:
+      - Aparece online en el dashboard
+      - Tray icon visible en la barra de tareas del cliente
+      - Conexión remota funcional
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SOLUCIÓN DE PROBLEMAS COMUNES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Backend no arranca:
+    → Revisar C:\ApolloSupport\backend\logs\backend_error.log
+    → Verificar que PostgreSQL acepta conexiones desde el servidor
+
+  WebSocket falla (visor en negro):
+    → Verificar que mod_proxy_wstunnel está activo en Apache
+    → Revisar que la regla RewriteRule del WS está ANTES del ProxyPass
+
+  Agente no aparece online:
+    → Verificar services.msc: "Apollo Centinela Agent" debe estar RUNNING
+    → Revisar C:\ProgramData\ApolloSupport\service.log
+    → Verificar que base_ws_url en centinela_config.json apunta al servidor correcto
+
+  "Acceso denegado" al reinstalar agente:
+    → Ya corregido en ApolloSetup_v3.0.0.exe (PrepareToInstall mata procesos antes)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ACTUALIZAR EN EL FUTURO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Backend:
+    1. Copiar main.py actualizado al servidor
+    2. nssm restart ApolloBackend
+
+  Frontend:
+    1. Correr: npm run build  (en p:\ApolloSupport\frontend)
+    2. Copiar dist\ al servidor Apache (reemplazar)
+    3. No es necesario reiniciar Apache
+
+  Agente (Centinela):
+    1. Correr: build_installer.bat
+    2. Distribuir el nuevo ApolloSetup_vX.X.X.exe a los clientes
+    3. El cliente hace doble click → reinstala sin errores
+
+================================================================================

@@ -1,0 +1,23 @@
+Fields in CLIGESCO.DBF:
+Name: CCOD            Type: C     Length: 4    
+Name: CDES            Type: C     Length: 30   
+Name: CSERIAL         Type: C     Length: 12   
+Name: CPARTE          Type: C     Length: 9    
+Name: CACTI           Type: L     Length: 1    
+Name: CNOMFA          Type: C     Length: 30   
+Name: CVERSION        Type: C     Length: 1    
+Name: CCLIFAC         Type: C     Length: 7    
+Name: CDIASTOPE       Type: N     Length: 3    
+Name: CCANFAC         Type: N     Length: 10   
+Name: CCANSER         Type: N     Length: 10   
+Name: CSALDO          Type: N     Length: 15   
+Name: CFECHA          Type: D     Length: 8    
+Name: CULPA           Type: D     Length: 8    
+Name: CRASO           Type: C     Length: 50   
+Name: CVENDEDOR       Type: C     Length: 5    
+Name: CNOMVEN         Type: C     Length: 30   
+Name: CCLAS           Type: C     Length: 5    
+Name: CNOMCLAS        Type: C     Length: 30   
+Name: CLOCALIDA       Type: C     Length: 30   
+Name: CEMAIL          Type: C     Length: 100  
+Name: CEXTRACTO       Type: M     Length: 10   

@@ -1,0 +1,11 @@
+ID	Nombre de Usuario	Correo Electrónico (Para Login)	Rol de Acceso	Departamento Asignado
+1	Juan Administrador	admin@masteris.com	?? Administrador	Desarrollo
+2	María Programadora	dev@masteris.com	?? Administrador	Desarrollo
+5	Boris / Sirobche	borischesini@apollogescom.com.ar	?? Administrador	Desarrollo
+3	Principal	facturacion@apollogescom.com.ar	??? Soporte Técnico	Atención al Cliente
+4	Mariano F	marianofilippi@apollogescom.com.ar	??? Soporte Técnico	Atención al Cliente
+6	Joaquin	joaquincasarotto@apollogescom.com.ar	??? Soporte Técnico	Atención al Cliente
+7	Rogelio	rogelionissero@apllogescom.com.ar	??? Soporte Técnico	Atención al Cliente
+8	Gustavo	gustavoaguilar@apollogescom.com.ar	??? Soporte Técnico	Atención al Cliente
+9	Augusto	augustorobaldo@apollogescom.com.ar	??? Soporte Técnico	Atención al Cliente
+10	Mariano B	marianobibel@apollogescom.com.ar	??? Soporte Técnico	Atención al Cliente

@@ -1,0 +1,25 @@
+cd p:\ApolloSupport\backend
+.\venv\Scripts\activate
+uvicorn main:app --reload --port 8001
+
+cd p:\ApolloSupport\frontend
+npm run dev
+
+
+Excelente pregunta. La razón por la que te recomendé uvicorn en lugar de python runservice es técnica y específica de cómo está estructurado FastAPI:
+
+FastAPI necesita un Servidor ASGI: FastAPI no es un programa que "corre solo" con Python (como un script normal). Es un framework que requiere un servidor de interfaz de puerta de enlace asíncrona (ASGI) para funcionar. Uvicorn es ese servidor.
+No hay un script "runservice": He revisado tu carpeta backend y no existe ningún archivo llamado runservice.py o similar. Si en otros proyectos usabas ese comando, probablemente era porque tenían un script personalizado que llamaba a uvicorn internamente.
+Estructura de 
+
+main.py
+: En tu archivo 
+
+main.py
+, solo se define la aplicación (app = FastAPI(...)). No tiene el bloque de código final (if __name__ == "__main__": ...) que permitiría ejecutarlo directamente con python main.py.
+Puerto Específico (8001): Tu Frontend (en 
+
+api.ts
+) está configurado estrictamente para buscar la API en http://localhost:8001. El comando de uvicorn me permite forzar ese puerto fácilmente con --port 8001.
+Modo Desarrollo (--reload): Al usar uvicorn directamente con el parámetro --reload, el servidor se reinicia automáticamente cada vez que guardas un cambio en el código, lo cual es mucho más cómodo para programar.
+En resumen: uvicorn main:app es la forma estándar y más directa de "despertar" la aplicación FastAPI que tienes en

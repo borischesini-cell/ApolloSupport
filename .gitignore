@@ -1,0 +1,39 @@
+# Binaries and large files
+ffmpeg.exe
+*.zip
+*.exe
+*.spec
+dist/
+build/
+__pycache__/
+*.log
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Node dependencies
+node_modules/
+.npm/
+
+# Environment variables (SECURITY)
+.env
+.env.local
+.env.*.local
+*.env
+
+# IDEs and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Project specific
+backend/logs/
+backend/uploads/
+backend/temp_files/
+agent/build/
+agent/dist/
+agent/installer_output/

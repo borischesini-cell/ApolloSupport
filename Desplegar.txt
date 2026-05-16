@@ -1,0 +1,42 @@
+Para que el sistema de escritorios remotos (Centinela) funcione en tu VM, necesitamos que el Backend sea accesible desde la red y que el Agente sepa a dónde conectarse.
+
+Aquí tienes la lista de lo que necesitas subir y configurar en tu VM para las primeras pruebas:
+
+1. Backend (El "Cerebro")
+Sube la carpeta backend/ completa.
+
+Instalar: Python 3.10+ y pip install -r requirements.txt.
+Configurar 
+
+.env
+: Asegúrate de que las credenciales de PostgreSQL coincidan con las de tu VM.
+Ejecutar: uvicorn main:app --host 0.0.0.0 --port 8001 (el --host 0.0.0.0 es vital para que acepte conexiones externas).
+2. Base de Datos
+Instalar PostgreSQL en la VM.
+Ejecutar el script 
+
+backend/create_db.py
+ para crear las tablas iniciales.
+3. Frontend (El Dashboard del Técnico)
+No subas todo el código fuente del frontend. Haz lo siguiente en tu PC local primero:
+
+En 
+
+frontend/src/api.ts
+, cambia http://localhost:8001 por la URL o IP de tu VM.
+Ejecuta npm run build.
+Sube solo la carpeta dist/ resultante a la VM y sírvela con Nginx o Apache (o un simple servidor de archivos).
+4. Agente Centinela (La PC Remota)
+Para probar el acceso remoto, el agente debe conectarse a la URL de tu VM:
+
+Configuración: En 
+
+agent/centinela.py
+, asegúrate de que BASE_WS_URL apunte a tu servidor (ej: wss://tu-url.com/api/ws/centinela).
+Compilación: Ejecuta python agent/build_agent.py para generar el ApolloCentinela.exe.
+Prueba: Sube ese .exe a la máquina que quieras monitorear (puede ser otra VM o tu propia PC).
+Resumen de lo que debe estar "vivo" en la VM:
+
+Puerto 8001 abierto (para la API y WebSockets).
+Base de Datos PostgreSQL corriendo.
+Frontend en el puerto 80 (o el que destines a tu URL).

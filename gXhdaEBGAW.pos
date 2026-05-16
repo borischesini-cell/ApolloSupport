@@ -1,0 +1,9 @@
+{
+  "action": "browse",
+  "folder": "ventas",
+  "table": "clientes",
+  "orden": "Nil",
+  "filter": "CSaldo>0",
+  "fields": "[\"CSaldo\", \"CRaSo\", \"CCod\", \"CTel\", \"CCelu\"]",
+  "user": "--"
+}
