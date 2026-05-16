@@ -23,6 +23,10 @@ node_modules/
 .env.local
 .env.*.local
 *.env
+!.env.example
+!.env.production
+!.env.development
+
 
 # IDEs and OS
 .vscode/
