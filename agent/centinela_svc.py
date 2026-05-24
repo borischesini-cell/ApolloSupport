@@ -144,7 +144,7 @@ def get_active_session_id():
 
     return best_session
 
-def spawn_in_user_session(exe_path):
+def spawn_in_user_session(exe_path, session_id=None):
     """
     Lanza exe_path en la sesion interactiva del usuario usando WTSQueryUserToken.
     Retorna el handle del proceso o None si falla.
@@ -158,9 +158,11 @@ def spawn_in_user_session(exe_path):
         )
         return None
 
-    session_id = get_active_session_id()
+    if session_id is None:
+        session_id = get_active_session_id()
     if session_id == 0xFFFFFFFF:
         return None
+
 
     user_token = ctypes.wintypes.HANDLE()
     if not WTSAPI32.WTSQueryUserToken(session_id, ctypes.byref(user_token)):
@@ -259,8 +261,36 @@ def companion_monitor():
     global _companion_handle, _last_session
 
     while _svc_running:
+        # --- SOPORTE DE SWITCH_SESSION.TXT ---
+        SWITCH_SESSION_FILE = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "switch_session.txt")
+        if os.path.isfile(SWITCH_SESSION_FILE):
+            try:
+                with open(SWITCH_SESSION_FILE) as f:
+                    switch_data = json.load(f)
+                target_sess = int(switch_data.get("session_id", -1))
+                if target_sess != -1:
+                    logger.info("[SWITCH] Detectada solicitud de cambio de sesion a %d", target_sess)
+                    # Matar companion actual
+                    if _companion_handle:
+                        KERNEL32.TerminateProcess(_companion_handle, 0)
+                        KERNEL32.CloseHandle(_companion_handle)
+                        _companion_handle = None
+                    
+                    # Lanzar en la sesion destino
+                    _companion_handle = spawn_in_user_session(COMPANION_EXE, session_id=target_sess)
+                    _last_session = target_sess
+                    
+                    # Eliminar archivo de señal
+                    os.remove(SWITCH_SESSION_FILE)
+            except Exception as switch_err:
+                logger.error("[SWITCH] Error procesando switch: %s", switch_err)
+                if os.path.exists(SWITCH_SESSION_FILE):
+                    try: os.remove(SWITCH_SESSION_FILE)
+                    except: pass
+
         session_id = get_active_session_id()
         has_user   = session_id != 0xFFFFFFFF
+
 
         if has_user:
             companion_alive = is_process_alive(_companion_handle)

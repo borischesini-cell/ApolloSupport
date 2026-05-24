@@ -171,6 +171,7 @@ class CentinelaDevice(Base):
     device_name = Column(String, index=True)
     last_seen = Column(DateTime, default=datetime.datetime.utcnow)
     remote_password = Column(String, nullable=True)
+    alt_remote_id = Column(String, nullable=True)
     is_online = Column(Boolean, default=False)
     current_technician_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     session_start = Column(DateTime, nullable=True)
@@ -222,3 +223,12 @@ class SupportSession(Base):
         if self.end_time and self.start_time:
             return int((self.end_time - self.start_time).total_seconds())
         return 0
+
+class RemoteLog(Base):
+    __tablename__ = "remote_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(Integer, ForeignKey("centinela_devices.id"), nullable=True)
+    source = Column(String)  # 'agent' o 'backend'
+    level = Column(String, default="INFO")
+    message = Column(Text)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)

@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 setlocal enabledelayedexpansion
 set AGENT_DIR=%~dp0
 set BACKEND_VENV=%AGENT_DIR%..\backend\venv\Scripts
@@ -10,9 +10,11 @@ echo [1/3] Compilando Apollo Centinela...
 "%PYINSTALLER%" --clean --noconfirm "%AGENT_DIR%..\ApolloCentinela_x64.spec"
 "%PYINSTALLER%" --clean --noconfirm "%AGENT_DIR%ApolloCentinelaService.spec"
 
-copy /Y "%AGENT_DIR%..\dist\ApolloCentinela_x64.exe"       "%AGENT_DIR%dist\ApolloCentinela.exe"
-copy /Y "%AGENT_DIR%..\dist\ApolloCentinelaService.exe"    "%AGENT_DIR%dist\ApolloCentinelaService.exe"
+copy /Y "%AGENT_DIR%dist\ApolloCentinela_x64.exe"       "%AGENT_DIR%dist\ApolloCentinela.exe"
+copy /Y "%AGENT_DIR%dist\ApolloCentinelaService_x64.exe"    "%AGENT_DIR%dist\ApolloCentinelaService.exe"
 copy /Y "%AGENT_DIR%ffmpeg.exe"                             "%AGENT_DIR%dist\ffmpeg.exe"
+copy /Y "%AGENT_DIR%..\dist\ApolloCentinelaService_x86.exe" "%AGENT_DIR%dist\ApolloCentinelaService_x86.exe"
+copy /Y "%AGENT_DIR%..\dist\ApolloCentinela_x86.exe"        "%AGENT_DIR%dist\ApolloCentinela_x86.exe"
 
 echo [2/3] Generando instalador...
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"

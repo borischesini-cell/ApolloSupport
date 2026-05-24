@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Ticket, Users, Settings, Bell, Search, Moon, Sun, Monitor, MessageSquare, X, LogOut, ArrowUpRight, Sparkles, FileText, Clipboard, Plus, Folder, Trash2, Menu, DollarSign, CheckCircle2, AlertCircle, Activity, UserPlus, Shield, Phone, MapPin, Mail, Lock, Key, Camera, Edit2, Maximize2, Minimize } from 'lucide-react';
+import { Ticket, Users, Settings, Bell, Search, Moon, Sun, Monitor, MessageSquare, X, LogOut, ArrowUpRight, Sparkles, FileText, Clipboard, Plus, Folder, Trash2, Menu, DollarSign, CheckCircle2, AlertCircle, Activity, UserPlus, Shield, Phone, MapPin, Mail, Lock, Key, Camera, Edit2, Maximize2, Minimize, Terminal } from 'lucide-react';
 import {
   API_URL, getTickets, getClients, createTicket, createClient, updateClient,
   toggleClientStatus, getActiveCentinelas, fetchAiAnalysis, getCentinelaFrame,
@@ -10,6 +10,7 @@ import {
   getClientBalance, getClientExtracto, viewVoucherPdf,
   useViewerWebSocket, type ConnectionQuality, useHqViewerWebSocket,
   REMOTE_STREAM_WORKABLE_FPS, REMOTE_STREAM_COMFORTABLE_FPS, connectionQualityFromFps,
+  getCentinelaLogs, clearCentinelaLogs,
 } from './api';
 import Login from './Login';
 
@@ -223,6 +224,21 @@ export default function App() {
 
   const [darkMode, setDarkMode] = useState(true);
   const [activeTab, setActiveTab] = useState('tickets');
+  
+  // === ESTADOS PARA BITÁCORA DE LOGS (TELEMETRÍA) ===
+  const [telemetryLogs, setTelemetryLogs] = useState<any[]>([]);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsAutoRefresh, setLogsAutoRefresh] = useState(true);
+  const [logsFilterDevice, setLogsFilterDevice] = useState<string>('all');
+  const [logsFilterLevel, setLogsFilterLevel] = useState<string>('all');
+  const [logsFilterSource, setLogsFilterSource] = useState<string>('all');
+  const [logsSearchTerm, setLogsSearchTerm] = useState('');
+
+  // === ESTADOS PARA LOGS EN SOPORTE EN VIVO (STANDALONE) ===
+  const [isDeviceLogsOpen, setIsDeviceLogsOpen] = useState(false);
+  const [deviceLogs, setDeviceLogs] = useState<any[]>([]);
+  const [deviceLogsLoading, setDeviceLogsLoading] = useState(false);
+
   const [globalSearchTerm, setGlobalSearchTerm] = useState('');
   const [licenses, setLicenses] = useState<any[]>([]);
   const [showLicenseModal, setShowLicenseModal] = useState(false);
@@ -575,6 +591,8 @@ export default function App() {
   // Alertas Proactivas
   const [activeAlerts, setActiveAlerts] = useState<any>({});
   const [showNotification, setShowNotification] = useState<string | null>(null);
+  const [nativeConnectionState, setNativeConnectionState] = useState<'idle' | 'connecting' | 'success' | 'error'>('idle');
+
 
   // Estados Centinela (Live View Multi-Sesión)
   const standaloneIdInit = new URLSearchParams(window.location.search).get('remote_device_id');
@@ -695,31 +713,66 @@ export default function App() {
   //
   // ROLLBACK: cambiar applyFrame para que solo llame setSessionFrames(prev=>(...)
   //   y eliminar ref={setLiveImgRef} de los img tags.
-  // ───────────────────────────────────────────────────────────────────────────
-  const liveImgRef       = useRef<HTMLImageElement | null>(null);
+  const liveCanvasRef       = useRef<HTMLCanvasElement | null>(null);
   const latestLiveFrameRef = useRef<string>('');   // último base64 para re-renders de React
+  const rafIdRef         = useRef<number | null>(null);
 
-  // Callback ref compartido entre el img de fullscreen y el img normal.
-  // Solo uno está montado a la vez → siempre apunta al img visible.
-  const setLiveImgRef = (el: HTMLImageElement | null) => {
-    liveImgRef.current = el;
-    // Al montar: aplicar el último frame si ya teníamos uno
-    if (el && latestLiveFrameRef.current) {
-      el.src = `data:image/webp;base64,${latestLiveFrameRef.current}`;
-    }
+  // Callback ref compartido
+  const setLiveCanvasRef = (el: HTMLCanvasElement | null) => {
+    liveCanvasRef.current = el;
   };
 
-  const applyFrame = (base64: string, _delta?: import('./api').DeltaMeta) => {
+  const frameQueueRef = useRef<{base64: string, delta?: import('./api').DeltaMeta}[]>([]);
+  const isProcessingQueueRef = useRef(false);
+
+  const processFrameQueue = () => {
+    if (isProcessingQueueRef.current || frameQueueRef.current.length === 0) return;
+    isProcessingQueueRef.current = true;
+
+    const frame = frameQueueRef.current.shift();
+    if (!frame) {
+      isProcessingQueueRef.current = false;
+      return;
+    }
+
+    const img = new window.Image();
+    img.src = `data:image/webp;base64,${frame.base64}`;
+    img.decode().then(() => {
+      requestAnimationFrame(() => {
+        if (liveCanvasRef.current) {
+          const ctx = liveCanvasRef.current.getContext('2d', { alpha: false });
+          if (ctx) {
+            if (!frame.delta && liveCanvasRef.current.width !== img.width) {
+              liveCanvasRef.current.width = img.width;
+              liveCanvasRef.current.height = img.height;
+            }
+            if (frame.delta) {
+              ctx.drawImage(img, frame.delta.x, frame.delta.y, frame.delta.w, frame.delta.h);
+            } else {
+              ctx.drawImage(img, 0, 0);
+            }
+          }
+        }
+        isProcessingQueueRef.current = false;
+        processFrameQueue();
+      });
+    }).catch((err) => {
+      console.error(err);
+      isProcessingQueueRef.current = false;
+      processFrameQueue();
+    });
+  };
+
+  const applyFrame = (base64: string, delta?: import('./api').DeltaMeta) => {
     const devId = standaloneDeviceId ?? activeSessions[0]?.id;
     if (!devId) return;
 
     // Guardar siempre para que re-renders de React tengan el frame correcto
     latestLiveFrameRef.current = base64;
 
-    if (liveImgRef.current) {
-      // ── PATH RÁPIDO: DOM directo, sin React, sin re-render ──────────────
-      liveImgRef.current.src = `data:image/webp;base64,${base64}`;
-      // No llamamos setSessionFrames → React no re-renderiza el componente
+    if (liveCanvasRef.current) {
+      frameQueueRef.current.push({ base64, delta });
+      processFrameQueue();
     } else {
       // ── FALLBACK: img no montada aún (primera conexión) ─────────────────
       setSessionFrames(prev => ({ ...prev, [devId]: base64 }));
@@ -748,7 +801,7 @@ export default function App() {
 
   const { sendCommand: sendViewerCommand } = useViewerWebSocket({
     deviceId: standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0].id : null),
-    enabled: isAuthenticated && activeSessions.length === 1,
+    enabled: isAuthenticated && (!!standaloneDeviceId || activeSessions.length === 1),
     onFrame: (base64, delta) => {
       applyFrame(base64, delta);
       setWsViewerConnected(true);
@@ -769,6 +822,19 @@ export default function App() {
   const viewerStreamDeviceId = standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
   const streamPresetStorageKey = viewerStreamDeviceId != null ? `apollo_stream_preset_${viewerStreamDeviceId}` : null;
   const [streamPreset, setStreamPreset] = useState<StreamPreset>('auto');
+
+  // ── ALTO RENDIMIENTO (HQ MODE) ──────────────────────────────────────────────
+  const hqDeviceId = standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
+  const hqStorageKey = hqDeviceId ? `hq_mode_${hqDeviceId}` : null;
+
+  const [hqEnabled, setHqEnabled] = useState<boolean>(() =>
+    hqStorageKey ? localStorage.getItem(hqStorageKey) === 'true' : false
+  );
+  const [hqState, setHqState] = useState<'connecting' | 'open' | 'closed' | 'off'>(() => 
+    (hqStorageKey && localStorage.getItem(hqStorageKey) === 'true') ? 'open' : 'off'
+  );
+  const [hqReconnectAttempt, setHqReconnectAttempt] = useState(0);
+  // ────────────────────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!streamPresetStorageKey) return;
@@ -808,7 +874,7 @@ export default function App() {
   }, [wsViewerConnected, viewerStreamDeviceId, streamPreset, sendStreamTier]);
 
   useEffect(() => {
-    if (!wsViewerConnected || !viewerStreamDeviceId || streamPreset !== 'auto') return;
+    if (!wsViewerConnected || !viewerStreamDeviceId || streamPreset !== 'auto' || hqEnabled) return;
     streamAutoTierRef.current = 3;
     streamLowFpsStreakRef.current = 0;
     streamHighFpsStreakRef.current = 0;
@@ -844,7 +910,7 @@ export default function App() {
       }
     }, 2000);
     return () => window.clearInterval(id);
-  }, [wsViewerConnected, viewerStreamDeviceId, streamPreset, sendStreamTier]);
+  }, [wsViewerConnected, viewerStreamDeviceId, streamPreset, hqEnabled, sendStreamTier]);
 
   /* Stream quality selector (compact, reused in header + fullscreen bar) */
   const streamQualitySelect = activeSessions.length === 1 ? (
@@ -867,20 +933,6 @@ export default function App() {
     sendViewerCommand({ type: 'get_sessions' });
   }, [wsViewerConnected, sendViewerCommand]);
 
-  // ── ALTO RENDIMIENTO (HQ MODE) ──────────────────────────────────────────────
-  // Toggle por dispositivo guardado en localStorage. Por defecto OFF.
-  // Cuando ON: conecta al endpoint /hq y usa MediaSource Extensions (MSE)
-  //   para decodear H.264 con hardware acceleration.
-  // ROLLBACK: si hqEnabled es false, todo este bloque es inerte.
-  //           El modo estándar (JPEG/WebP via useViewerWebSocket) sigue activo.
-  // ────────────────────────────────────────────────────────────────────────────
-  const hqDeviceId = standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
-  const hqStorageKey = hqDeviceId ? `hq_mode_${hqDeviceId}` : null;
-  const [hqEnabled, setHqEnabled] = useState<boolean>(() =>
-    hqStorageKey ? localStorage.getItem(hqStorageKey) === 'true' : false
-  );
-  const [hqState, setHqState] = useState<'connecting' | 'open' | 'closed' | 'off'>('off');
-
   // ─── SESIONES WINDOWS ─────────────────────────────────────────────────
   type WinSession = { id: number; name: string; username: string; state: string; current: boolean; };
   const [winSessions, setWinSessions] = useState<WinSession[]>([]);
@@ -892,109 +944,175 @@ export default function App() {
   const [sessionSwitching, setSessionSwitching] = useState(false);
   // ─────────────────────────────────────────────────────────────────────
 
-  // Refs para MSE (no causan re-renders)
-  const hqVideoRef      = useRef<HTMLVideoElement | null>(null);
-  const mediaSourceRef  = useRef<MediaSource | null>(null);
-  const sourceBufferRef = useRef<SourceBuffer | null>(null);
-  const chunkQueueRef   = useRef<ArrayBuffer[]>([]);
-  const mseReadyRef     = useRef<boolean>(false);
+  // Refs eliminados para MSE (usando MJPEG nativo)
 
-  // Inicializar/destruir MSE cuando se activa HQ
-  useEffect(() => {
-    if (!hqEnabled || !hqVideoRef.current) return;
-    if (!('MediaSource' in window)) {
-      console.warn('[HQ] MediaSource no soportado en este browser');
-      return;
-    }
-    const ms = new MediaSource();
-    mediaSourceRef.current = ms;
-    hqVideoRef.current.src = URL.createObjectURL(ms);
-
-    ms.addEventListener('sourceopen', () => {
-      const MIME = 'video/mp4; codecs="avc1.42E01E"'; // H.264 Baseline
-      if (!MediaSource.isTypeSupported(MIME)) {
-        console.warn('[HQ] Codec H.264 no soportado');
-        return;
-      }
-      const sb = ms.addSourceBuffer(MIME);
-      sb.mode = 'sequence';
-      sourceBufferRef.current = sb;
-      mseReadyRef.current = true;
-
-      sb.addEventListener('updateend', () => {
-        if (chunkQueueRef.current.length > 0 && !sb.updating) {
-          try { sb.appendBuffer(chunkQueueRef.current.shift()!); } catch { /* */ }
+  const logFrontendToBackend = useCallback(async (message: string, level: string = 'INFO') => {
+    if (!hqDeviceId) return;
+    try {
+      const token = localStorage.getItem('token');
+      const authHeader = token ? `Bearer ${token}` : '';
+      const { API_URL } = await import('./api');
+      await fetch(`${API_URL}/centinelas/logs/frontend?device_id=${hqDeviceId}&message=${encodeURIComponent(message)}&level=${level}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': authHeader
         }
-        const v = hqVideoRef.current;
-        if (!v || sb.updating || v.readyState < 2) return;
-        try {
-          if (v.buffered.length > 0) {
-            const start = v.buffered.start(0);
-            const cut = v.currentTime - 18;
-            if (cut > start + 3) sb.remove(start, cut);
-          }
-        } catch { /* QuotaExceeded / race: ignorar */ }
       });
+    } catch (err) {
+      console.error('Error logging to backend:', err);
+    }
+  }, [hqDeviceId]);
 
-      // Vaciar cola si ya llegaron chunks antes que MSE estuviera lista
-      if (chunkQueueRef.current.length > 0 && !sb.updating) {
-        try { sb.appendBuffer(chunkQueueRef.current.shift()!); } catch {}
-      }
-    });
+  // Capturador global de excepciones, errores y rechazos de promesas en la consola para telemetría
+  useEffect(() => {
+    if (!hqDeviceId) return;
+
+    const handleGlobalError = (event: ErrorEvent) => {
+      const msg = `[FRONTEND-CONSOLA-ERROR] ${event.message || 'Error sin mensaje'} en ${event.filename || 'desconocido'}:${event.lineno || 0}:${event.colno || 0}`;
+      logFrontendToBackend(msg, 'ERROR');
+    };
+
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const errorMsg = event.reason?.message || (typeof event.reason === 'object' ? JSON.stringify(event.reason) : String(event.reason));
+      const msg = `[FRONTEND-CONSOLA-RECHAZO] Promesa no manejada: ${errorMsg}`;
+      logFrontendToBackend(msg, 'ERROR');
+    };
+
+    window.addEventListener('error', handleGlobalError);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+    
+    // Log de confirmación de versión
+    logFrontendToBackend('[FRONTEND-TELEMETRÍA] Telemetría global de consola activada en el visor (v3.1.2-HQ)', 'INFO');
 
     return () => {
-      mseReadyRef.current = false;
-      sourceBufferRef.current = null;
-      chunkQueueRef.current = [];
-      mediaSourceRef.current = null;
-      if (hqVideoRef.current) hqVideoRef.current.src = '';
+      window.removeEventListener('error', handleGlobalError);
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
     };
-  }, [hqEnabled]);
+  }, [hqDeviceId, logFrontendToBackend]);
 
-  const handleHqChunk = useCallback((chunk: ArrayBuffer) => {
-    const MAX_QUEUED = 100;
-    if (chunkQueueRef.current.length >= MAX_QUEUED) {
-      chunkQueueRef.current.splice(0, chunkQueueRef.current.length - MAX_QUEUED + 24);
-    }
-    const sb = sourceBufferRef.current;
-    if (!sb) { chunkQueueRef.current.push(chunk); return; }
-    if (sb.updating) { chunkQueueRef.current.push(chunk); return; }
-    try { sb.appendBuffer(chunk); } catch { chunkQueueRef.current.push(chunk); }
-  }, []);
-
-  // IMPORTANTE: estabilizar con useCallback para no causar reconnect loop
-  const handleHqStateChange = useCallback((state: 'connecting' | 'open' | 'closed') => {
-    setHqState(state);
-    if (state === 'open') setWsViewerConnected(true);
-    if (state === 'closed') {
-      setHqState('off');
-      setHqEnabled(false);
-      // HQ falló o se cerró: no dejar el modo "WS OK" colgado (bloquea el polling HTTP).
-      setWsViewerConnected(false);
-    }
-  }, []);
-
-  useHqViewerWebSocket({
-    deviceId: hqDeviceId,
-    enabled: isAuthenticated && hqEnabled && !!hqDeviceId,
-    onChunk: handleHqChunk,
-    onStateChange: handleHqStateChange,
-  });
-
+  // MSE and useHqViewerWebSocket have been removed in favor of MJPEG Turbo
+  // via the standard viewer websocket.
 
   const toggleHqMode = () => {
     const next = !hqEnabled;
     setHqEnabled(next);
+    setHqState(next ? 'open' : 'off');
     if (hqStorageKey) localStorage.setItem(hqStorageKey, String(next));
-    if (!next) {
-      // Al desactivar: limpiar MSE
-      mseReadyRef.current = false;
-      sourceBufferRef.current = null;
-      chunkQueueRef.current = [];
-      setHqState('off');
-      setWsViewerConnected(false);
+    
+    // Notificar al backend/agente que active/desactive la transmision MJPEG HQ
+    sendViewerCommand({ type: next ? 'start_hq' : 'stop_hq' });
+  };
+  
+  const handleAltViewer = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (!hqDeviceId) return;
+    
+    // Buscar el dispositivo en activeSessions o buscarlo en la DB si estuviera disponible.
+    // Asumimos que activeSessions[0] es el dispositivo actual en la vista remota principal.
+    const activeDevice = standaloneDeviceId 
+        ? null 
+        : activeSessions.find(s => s.id === hqDeviceId);
+        
+    let id = activeDevice?.alt_remote_id || null;
+    const storageKey = `alt_viewer_id_${hqDeviceId}`;
+    
+    if (!id) {
+        id = localStorage.getItem(storageKey);
+    }
+    
+    // Si presiona Shift o Ctrl, o no hay ID, pedimos uno nuevo
+    if (!id || e.shiftKey || e.ctrlKey) {
+      const promptText = id 
+        ? `ID actual de RustDesk/Nativo: ${id}\nIngrese el nuevo ID de conexión nativa (en blanco para borrar):` 
+        : `No se detectó un ID nativo automáticamente desde el Centinela.\nIngrese el ID de la conexión nativa de RustDesk manualmente:`;
+      const newId = prompt(promptText, id || '');
+      if (newId !== null) {
+        id = newId.replace(/\s+/g, ''); // Limpiar espacios
+        if (id) {
+            localStorage.setItem(storageKey, id);
+        } else {
+            localStorage.removeItem(storageKey);
+            return;
+        }
+      } else {
+        return; // Cancelado
+      }
+    }
+
+    if (id) {
+      setNativeConnectionState('connecting');
+
+      // 1. Usar un iframe oculto para abrir el protocolo sin recargar la página y evitar que el WebSocket se desconecte.
+      let iframe = document.getElementById('native-protocol-iframe') as HTMLIFrameElement;
+      if (!iframe) {
+        iframe = document.createElement('iframe');
+        iframe.id = 'native-protocol-iframe';
+        iframe.style.display = 'none';
+        document.body.appendChild(iframe);
+      }
+      iframe.src = `rustdesk://${id}`;
+
+      // 2. Detección inteligente de lanzamiento exitoso:
+      // Si el navegador abre con éxito la aplicación de RustDesk, la ventana del navegador perderá el foco (blur).
+      // Si no la tiene instalada, el foco no se perderá nunca.
+      let hasBlurred = false;
+      const handleBlur = () => {
+        hasBlurred = true;
+      };
+      window.addEventListener('blur', handleBlur);
+
+      setTimeout(() => {
+        window.removeEventListener('blur', handleBlur);
+        if (hasBlurred) {
+          setNativeConnectionState('success');
+          // Volver a estado normal después de 4 segundos
+          setTimeout(() => setNativeConnectionState('idle'), 4000);
+        } else {
+          setNativeConnectionState('error');
+          alert(`❌ No se pudo abrir RustDesk automáticamente (ID: ${id})\n\n` +
+                `Razones posibles:\n` +
+                `1. No tienes la aplicación de RustDesk instalada en esta computadora.\n` +
+                `2. RustDesk no tiene registrado su protocolo "rustdesk://" en tu Windows.\n\n` +
+                `Por favor, abre la aplicación de RustDesk manualmente en tu PC e introduce el ID: ${id}`);
+          setTimeout(() => setNativeConnectionState('idle'), 5000);
+        }
+      }, 1500);
     }
   };
+
+  const getNativeButtonStyles = () => {
+    switch (nativeConnectionState) {
+      case 'connecting':
+        return 'bg-amber-600 border-amber-500/30 text-amber-100 animate-pulse';
+      case 'success':
+        return 'bg-emerald-600 border-emerald-500/30 text-white shadow-emerald-500/20';
+      case 'error':
+        return 'bg-rose-600 border-rose-500/30 text-white shadow-rose-500/20';
+      default:
+        return 'bg-blue-600/80 border-blue-500/30 text-white hover:bg-blue-500/80';
+    }
+  };
+
+  const getNativeButtonText = (short: boolean = false) => {
+    switch (nativeConnectionState) {
+      case 'connecting':
+        return short ? 'Abriendo...' : '🚀 Abriendo...';
+      case 'success':
+        return short ? 'Conectado' : '✅ ¡Abierto!';
+      case 'error':
+        return short ? 'Error' : '❌ Error';
+      default:
+        return short ? 'Visor Nativo' : '🚀 Visor Nativo';
+    }
+  };
+
+
+  
+  useEffect(() => {
+    if (wsViewerConnected && hqEnabled) {
+      sendViewerCommand({ type: 'start_hq' });
+    }
+  }, [wsViewerConnected, hqEnabled, sendViewerCommand]);
   // ── FIN ALTO RENDIMIENTO ────────────────────────────────────────────────────
 
 
@@ -1274,11 +1392,14 @@ export default function App() {
 
           if (standaloneId) {
             const devId = parseInt(standaloneId);
-            const matchedDev = clientsData.flatMap((c: any) => c.devices || []).find((d: any) => d.id === devId);
+            let matchedDev = clientsData.flatMap((c: any) => c.devices || []).find((d: any) => d.id === devId);
+            if (!matchedDev && pendingData) {
+              matchedDev = pendingData.find((d: any) => d.id === devId);
+            }
             if (matchedDev) {
               setActiveSessions([{ id: devId, device_name: matchedDev.device_name, ...matchedDev }]);
               const client = clientsData.find((c: any) => c.id === matchedDev.client_id);
-              const clientName = client ? client.razon_social : "Cliente";
+              const clientName = client ? client.razon_social : "Cliente Pendiente";
               document.title = `🔴 ${matchedDev.device_name} - ${clientName} | ApolloSupport`;
 
               // Leer cantidad de monitores desde la telemetría en vivo del agente
@@ -1773,72 +1894,46 @@ export default function App() {
   };
 
   const handleImageInteraction = async (
-    e: React.MouseEvent<HTMLImageElement>,
+    e: React.MouseEvent<HTMLElement>,
     deviceId: number,
     clickType: 'left' | 'right' | 'double'
   ) => {
     if (!isControlEnabled) return;
     setFocusedSessionId(deviceId);
     e.preventDefault();
-    const rect = e.currentTarget.getBoundingClientRect();
-    const img = e.currentTarget;
-    const naturalWidth = img.naturalWidth;
-    const naturalHeight = img.naturalHeight;
+    const coords = getCoordinates(e);
 
-    if (!naturalWidth || !naturalHeight) return;
-
-    const containerWidth = rect.width;
-    const containerHeight = rect.height;
-
-    const containerRatio = containerWidth / containerHeight;
-    const imageRatio = naturalWidth / naturalHeight;
-
-    let renderWidth = containerWidth;
-    let renderHeight = containerHeight;
-    let offsetX = 0;
-    let offsetY = 0;
-
-    if (containerRatio > imageRatio) {
-      // El contenedor es más ancho que la pantalla remota (franjas negras a los lados)
-      renderHeight = containerHeight;
-      renderWidth = containerHeight * imageRatio;
-      offsetX = (containerWidth - renderWidth) / 2;
-    } else {
-      // El contenedor es más alto que la pantalla remota (franjas negras arriba y abajo)
-      renderWidth = containerWidth;
-      renderHeight = containerWidth / imageRatio;
-      offsetY = (containerHeight - renderHeight) / 2;
-    }
-
-    const clickX = e.clientX - rect.left - offsetX;
-    const clickY = e.clientY - rect.top - offsetY;
-
-    const x = clickX / renderWidth;
-    const y = clickY / renderHeight;
-
-    // Solo enviar si el clic fue dentro de la pantalla remota real
-    if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+    if (coords) {
       await sendCentinelaControl(deviceId, {
         type: 'mouse_click',
-        x,
-        y,
+        x: coords.x,
+        y: coords.y,
         click_type: clickType
       });
     }
   };
 
-  const getCoordinates = (e: React.MouseEvent<HTMLImageElement>) => {
+  const getCoordinates = (e: React.MouseEvent<HTMLElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const naturalWidth = e.currentTarget.naturalWidth;
-    const naturalHeight = e.currentTarget.naturalHeight;
+    const target = e.currentTarget;
+    let originalWidth = 0;
+    let originalHeight = 0;
 
-    if (!naturalWidth || !naturalHeight) return null;
+    if (target instanceof HTMLImageElement) {
+      originalWidth = target.naturalWidth;
+      originalHeight = target.naturalHeight;
+    } else if (target instanceof HTMLCanvasElement) {
+      originalWidth = target.width;
+      originalHeight = target.height;
+    }
+
+    if (!originalWidth || !originalHeight) return null;
 
     const containerWidth = rect.width;
     const containerHeight = rect.height;
 
     const containerRatio = containerWidth / containerHeight;
-    const imageRatio = naturalWidth / naturalHeight;
+    const imageRatio = originalWidth / originalHeight;
 
     let renderWidth = containerWidth;
     let renderHeight = containerHeight;
@@ -1867,7 +1962,7 @@ export default function App() {
     return null;
   };
 
-  const handleMouseDown = async (e: React.MouseEvent<HTMLImageElement>, deviceId: number) => {
+  const handleMouseDown = async (e: React.MouseEvent<HTMLElement>, deviceId: number) => {
     if (!isControlEnabled) return;
     setFocusedSessionId(deviceId);
     // e.button: 0 = Izquierdo, 2 = Derecho
@@ -1891,7 +1986,7 @@ export default function App() {
     }
   };
 
-  const handleMouseUp = async (e: React.MouseEvent<HTMLImageElement>, deviceId: number) => {
+  const handleMouseUp = async (e: React.MouseEvent<HTMLElement>, deviceId: number) => {
     if (!isControlEnabled) return;
     const buttonMap: { [key: number]: string } = { 0: 'left', 2: 'right' };
     const button = buttonMap[e.button];
@@ -1913,10 +2008,10 @@ export default function App() {
     }
   };
 
-  const handleImageWheel = async (e: React.WheelEvent<HTMLImageElement>, deviceId: number) => {
+  const handleImageWheel = async (e: React.WheelEvent<HTMLElement>, deviceId: number) => {
     if (!isControlEnabled) return;
     const direction = e.deltaY > 0 ? 'down' : 'up';
-    const coords = getCoordinates(e as unknown as React.MouseEvent<HTMLImageElement>);
+    const coords = getCoordinates(e as unknown as React.MouseEvent<HTMLElement>);
     await sendCentinelaControl(deviceId, {
       type: 'mouse_scroll',
       direction,
@@ -2018,7 +2113,7 @@ export default function App() {
     } else alert("Error al procesar el cliente.");
   };
 
-  const handleVerifyRemotePassword = async (deviceId: number) => {
+  const handleVerifyRemotePassword = async (deviceId: number, pin: string = "") => {
     const token = localStorage.getItem('token');
     try {
       const response = await fetch(`${API_URL}/centinelas/devices/${deviceId}/verify-password`, {
@@ -2027,7 +2122,7 @@ export default function App() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ password: "" })
+        body: JSON.stringify({ password: pin || "" })
       });
       if (response.ok) {
         const url = `${window.location.origin}${window.location.pathname}?remote_device_id=${deviceId}`;
@@ -2205,6 +2300,77 @@ export default function App() {
     }
   };
 
+  const fetchTelemetryLogs = async () => {
+    setLogsLoading(true);
+    try {
+      const devId = logsFilterDevice !== 'all' ? Number(logsFilterDevice) : undefined;
+      const lvl = logsFilterLevel !== 'all' ? logsFilterLevel : undefined;
+      const src = logsFilterSource !== 'all' ? logsFilterSource : undefined;
+      const data = await getCentinelaLogs(devId, lvl, src, 100);
+      setTelemetryLogs(data);
+    } catch (err: any) {
+      console.error("Error fetching telemetry logs:", err);
+    } finally {
+      setLogsLoading(false);
+    }
+  };
+
+  const fetchDeviceLogs = async (deviceId: number) => {
+    setDeviceLogsLoading(true);
+    try {
+      const data = await getCentinelaLogs(deviceId, undefined, undefined, 100);
+      setDeviceLogs(data);
+    } catch (err: any) {
+      console.error("Error fetching device logs:", err);
+    } finally {
+      setDeviceLogsLoading(false);
+    }
+  };
+
+  const handleClearTelemetryLogs = async (deviceId?: number | null) => {
+    if (!window.confirm("¿Está seguro de que desea limpiar el historial de logs? Esta acción no se puede deshacer.")) return;
+    try {
+      await clearCentinelaLogs(deviceId);
+      setShowNotification("Historial de logs limpiado con éxito.");
+      if (deviceId) {
+        fetchDeviceLogs(deviceId);
+      } else {
+        fetchTelemetryLogs();
+      }
+    } catch (err: any) {
+      alert("Error al limpiar logs: " + err.message);
+    }
+  };
+
+  // Poll para bitácora global de logs
+  useEffect(() => {
+    if (activeTab === 'logs') {
+      fetchTelemetryLogs();
+    }
+  }, [activeTab, logsFilterDevice, logsFilterLevel, logsFilterSource]);
+
+  useEffect(() => {
+    if (activeTab !== 'logs' || !logsAutoRefresh) return;
+    const interval = setInterval(() => {
+      fetchTelemetryLogs();
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [activeTab, logsAutoRefresh, logsFilterDevice, logsFilterLevel, logsFilterSource]);
+
+  // Poll para logs de dispositivo en vivo (soporte standalone)
+  useEffect(() => {
+    const devId = standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
+    if (!devId || !isDeviceLogsOpen) return;
+    
+    fetchDeviceLogs(devId);
+    
+    if (!logsAutoRefresh) return;
+    const interval = setInterval(() => {
+      fetchDeviceLogs(devId);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [isDeviceLogsOpen, logsAutoRefresh, activeSessions]);
+
   const generateLicense = async (clientId: number, devices: number, days: number) => {
     const token = localStorage.getItem('token');
     const response = await fetch(`${API_URL}/licenses`, {
@@ -2318,162 +2484,12 @@ export default function App() {
     const isChatOpen = !!chatVisibility[String(session.id)];
     const isFilesOpen = !!sessionFiles[session.id]?.visible;
 
-    // ─── OVERLAY DE FULLSCREEN REAL DEL VISOR ─────────────────────────────────
-    if (isViewerFullscreen) {
-      return (
-        <div
-          className="fixed inset-0 z-[9999] bg-black flex items-center justify-center select-none"
-          onMouseMove={resetToolbarTimer}
-          style={{ cursor: toolbarVisible ? 'default' : 'none' }}
-        >
-          {/* ── Imagen remota estándar (JPEG/WebP) — siempre montada como fallback ── */}
-          {(frame || latestLiveFrameRef.current || wsViewerConnected) ? (
-            <img
-              ref={setLiveImgRef}
-              src={
-                latestLiveFrameRef.current
-                  ? `data:image/webp;base64,${latestLiveFrameRef.current}`
-                  : (frame?.startsWith('blob:') || frame?.startsWith('data:') ? frame : `data:image;base64,${frame ?? ''}`)
-              }
-              onMouseDown={(e) => handleMouseDown(e, session.id)}
-              onMouseUp={(e) => handleMouseUp(e, session.id)}
-              onDoubleClick={(e) => handleImageInteraction(e, session.id, 'double')}
-              onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
-              onWheel={(e) => handleImageWheel(e, session.id)}
-              onMouseMove={(e) => {
-                resetToolbarTimer();
-                if (isControlEnabled) {
-                  const rect = (e.target as HTMLImageElement).getBoundingClientRect();
-                  const x = (e.clientX - rect.left) / rect.width;
-                  const y = (e.clientY - rect.top) / rect.height;
-                  if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
-                    sendCentinelaControl(session.id, { type: 'mouse_move', x, y });
-                  }
-                }
-              }}
-              className="w-full h-full object-contain"
-              style={{ display: hqEnabled && hqState === 'open' ? 'none' : 'block' }}
-              alt="Remote Screen Fullscreen"
-              draggable={false}
-            />
-          ) : (
-            <div className="flex flex-col items-center gap-4 text-white">
-              <div className="animate-spin rounded-full h-12 w-12 border-4 border-brand-500 border-t-transparent" />
-              <span className="text-sm text-slate-400">Esperando imagen del cliente...</span>
-            </div>
-          )}
-
-          {/* ── Video HQ (H.264 MSE) — superpuesto, visible solo cuando HQ activo ── */}
-          <video
-            ref={hqVideoRef}
-            autoPlay
-            muted
-            playsInline
-            className="w-full h-full object-contain absolute inset-0"
-            style={{ display: hqEnabled && hqState === 'open' ? 'block' : 'none' }}
-            onMouseDown={(e) => handleMouseDown(e as any, session.id)}
-            onMouseUp={(e) => handleMouseUp(e as any, session.id)}
-            onDoubleClick={(e) => handleImageInteraction(e as any, session.id, 'double')}
-            onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
-            onWheel={(e) => handleImageWheel(e as any, session.id)}
-            onMouseMove={(e) => {
-              resetToolbarTimer();
-              if (isControlEnabled) {
-                const rect = (e.target as HTMLVideoElement).getBoundingClientRect();
-                const x = (e.clientX - rect.left) / rect.width;
-                const y = (e.clientY - rect.top) / rect.height;
-                if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
-                  sendCentinelaControl(session.id, { type: 'mouse_move', x, y });
-                }
-              }
-            }}
-          />
-
-
-
-          {/* Barra flotante auto-oculta — aparece al mover el mouse, desaparece a los 3s */}
-          <div
-            className="absolute top-0 left-0 right-0 z-10 transition-all duration-500"
-            style={{
-              opacity: toolbarVisible ? 1 : 0,
-              transform: toolbarVisible ? 'translateY(0)' : 'translateY(-100%)',
-              pointerEvents: toolbarVisible ? 'auto' : 'none',
-            }}
-          >
-            <div className="flex items-center justify-between gap-3 px-5 py-3"
-              style={{ background: 'linear-gradient(to bottom, rgba(2,6,23,0.96) 0%, rgba(2,6,23,0) 100%)' }}
-            >
-              {/* Info izquierda */}
-              <div className="flex items-center gap-3">
-                <span className={`w-2.5 h-2.5 rounded-full ${(session.is_online || frame) ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
-                <span className="text-white font-bold text-sm tracking-tight">{session.device_name || 'Soporte Remoto'}</span>
-                <span className="text-slate-400 text-xs font-mono bg-slate-800/70 px-2 py-0.5 rounded-md">ID: {session.id}</span>
-                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wider border ${isControlEnabled ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20' : 'bg-amber-500/15 text-amber-400 border-amber-500/20'}`}>
-                  {isControlEnabled ? '⚡ Control Activo' : '👁 Solo Observando'}
-                </span>
-                {isCapsLockActive && (
-                  <span className="text-[10px] bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded-md font-bold flex items-center gap-1 animate-pulse">
-                    🔠 MAYÚS
-                  </span>
-                )}
-                <span className="text-slate-500 text-[10px]">Mover el mouse para mostrar/ocultar barra · ESC para salir</span>
-              </div>
-
-              {/* Controles derecha */}
-              <div className="flex items-center gap-2">
-                {streamQualitySelect}
-                {/* ── ALTO RENDIMIENTO TOGGLE ── */}
-                <button
-                  onClick={toggleHqMode}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
-                    hqEnabled
-                      ? hqState === 'open'
-                        ? 'bg-violet-600/80 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
-                        : 'bg-amber-600/60 border-amber-500/30 text-amber-200 animate-pulse'
-                      : 'bg-slate-700/60 border-white/10 text-slate-400 hover:bg-violet-700/50 hover:text-white'
-                  }`}
-                  title="Modo Alto Rendimiento: H.264 via MediaSource (menos latencia, menos datos)"
-                >
-                  {hqEnabled
-                    ? hqState === 'open' ? '⚡ HQ ON' : '⚡ HQ...'
-                    : '⚡ Alto Rendimiento'}
-                </button>
-                <button
-                  onClick={() => setIsControlEnabled(v => !v)}
-
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${isControlEnabled ? 'bg-emerald-600/80 border-emerald-500/30 text-white hover:bg-red-600/80 hover:border-red-500/30' : 'bg-slate-700/80 border-white/10 text-slate-300 hover:bg-emerald-600/80'}`}
-                  title="Alternar Control / Solo Ver"
-                >
-                  {isControlEnabled ? '🖱 Control ON' : '👁 Solo Ver'}
-                </button>
-                <button
-                  onClick={exitViewerFullscreen}
-                  className="flex items-center gap-1.5 bg-red-600/80 hover:bg-red-600 border border-red-500/30 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-lg"
-                  title="Salir de Pantalla Completa (ESC)"
-                >
-                  <Minimize className="w-3.5 h-3.5" /> Salir Fullscreen
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Indicador discreto de "mover mouse" cuando la barra está oculta */}
-          {!toolbarVisible && (
-            <div
-              className="absolute top-2 left-1/2 -translate-x-1/2 text-[10px] text-white/20 pointer-events-none select-none transition-opacity duration-500"
-            >
-              ↑ mover mouse para ver controles
-            </div>
-          )}
-        </div>
-      );
-    }
-    // ──────────────────────────────────────────────────────────────────────────
+    // ─── OVERLAY DE FULLSCREEN REAL DEL VISOR DECORADO (MANEJADO EN EL CONTENEDOR PRINCIPAL) ───
 
     return (
       <div className="flex h-screen w-screen flex-col bg-slate-950 text-white p-4 overflow-hidden select-none">
         {/* Cabecera Standalone */}
-        <div className="flex flex-col sm:flex-row gap-3 justify-between items-start sm:items-center mb-3">
+        <div className="flex flex-col sm:flex-row gap-3 justify-between items-start sm:items-center mb-3" style={{ display: isViewerFullscreen ? 'none' : 'flex' }}>
           <div className="flex flex-wrap items-center gap-2 sm:gap-3">
             <span className={`w-3.5 h-3.5 rounded-full ${(session.is_online || frame) ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
             <h1 className="text-sm sm:text-lg font-black tracking-tight truncate max-w-[200px] sm:max-w-none">{session.device_name || "Soporte Remoto"}</h1>
@@ -2608,18 +2624,17 @@ export default function App() {
               onClick={toggleHqMode}
               className={`flex-shrink-0 px-3 py-2 rounded-xl text-xs font-bold border transition-all flex items-center gap-1.5 ${
                 hqEnabled
-                  ? hqState === 'open'
-                    ? 'bg-violet-600 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
-                    : 'bg-amber-600/70 border-amber-500/30 text-amber-100 animate-pulse'
+                  ? 'bg-violet-600 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
                   : 'bg-slate-700 border-white/10 text-slate-400 hover:bg-violet-700/50 hover:text-white'
               }`}
-              title="Modo Alto Rendimiento: H.264 vía MediaSource — menos latencia"
+              title="Modo Alto Rendimiento: Turbo WebP Canvas a 30 FPS"
             >
               <span>⚡</span>
               <span className="hidden sm:inline">
-                {hqEnabled ? (hqState === 'open' ? 'HQ ON' : 'HQ...') : 'HQ'}
+                {hqEnabled ? 'HQ ON' : 'HQ'}
               </span>
             </button>
+
             {/* Botón de Pantalla Completa del Visor */}
 
             <button
@@ -2641,7 +2656,7 @@ export default function App() {
         </div>
 
         {/* ÚLTIMO ACCESO DETECTADO CON COMENTARIOS Y REPORTE IA (NUEVO) */}
-        {lastSupportSession && !isLastSessionBannerDismissed && (
+        {lastSupportSession && !isLastSessionBannerDismissed && !isViewerFullscreen && (
           <div className="mb-3 p-4 rounded-2xl glass-dark border border-brand-500/20 text-slate-300 relative animate-in slide-in-from-top-4 flex flex-col md:flex-row gap-4 items-start justify-between shadow-lg">
             <div className="flex-1 min-w-0">
               <div className="flex flex-wrap items-center gap-2 mb-2">
@@ -2697,25 +2712,27 @@ export default function App() {
         {/* Cuerpo Principal */}
         <div className="flex-1 flex flex-col lg:flex-row gap-4 overflow-y-auto lg:overflow-hidden min-h-0">
           {/* Pantalla Remota */}
-          <div className="flex-1 bg-black rounded-2xl border border-white/5 flex items-center justify-center relative overflow-hidden min-h-0">
+          <div 
+            className={isViewerFullscreen 
+              ? "fixed inset-0 z-[9999] bg-black flex items-center justify-center select-none" 
+              : "flex-1 bg-black rounded-2xl border border-white/5 flex items-center justify-center relative overflow-hidden min-h-0"}
+            onMouseMove={isViewerFullscreen ? resetToolbarTimer : undefined}
+            style={{ cursor: isViewerFullscreen ? (toolbarVisible ? 'default' : 'none') : 'default' }}
+          >
             {(frame || latestLiveFrameRef.current || wsViewerConnected) ? (
               <div className="relative w-full h-full flex items-center justify-center">
-                <img
-                  ref={setLiveImgRef}
-                  src={
-                    latestLiveFrameRef.current
-                      ? `data:image/webp;base64,${latestLiveFrameRef.current}`
-                      : (frame?.startsWith('blob:') || frame?.startsWith('data:') ? frame : `data:image;base64,${frame ?? ''}`)
-                  }
-
+                <canvas
+                  ref={setLiveCanvasRef}
                   onMouseDown={(e) => handleMouseDown(e, session.id)}
                   onMouseUp={(e) => handleMouseUp(e, session.id)}
                   onDoubleClick={(e) => handleImageInteraction(e, session.id, 'double')}
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
                   onWheel={(e) => handleImageWheel(e, session.id)}
+                  style={{ display: 'block' }}
                   className={`w-full h-full object-contain cursor-default select-none transition-all duration-500 ${(!session.is_online && !frame) ? 'filter blur-[4px] brightness-[0.35] grayscale contrast-75' : ''}`}
-                  alt="Remote Screen"
                 />
+
+                {/* Video HQ MSE removido en favor de MJPEG sobre WebSocket estandar */}
 
                 {/* Overlay Estético de Conexión Perdida (NUEVO) */}
                 {(!session.is_online && !frame) && (
@@ -2729,6 +2746,78 @@ export default function App() {
                     <p className="text-[11px] sm:text-xs text-slate-400 mt-2 max-w-sm leading-relaxed">
                       El agente Centinela se ha desconectado de internet o la PC se apagó. El enlace se restablecerá automáticamente en cuanto vuelva a estar en línea.
                     </p>
+                  </div>
+                )}
+
+                {/* ── Barra flotante auto-oculta en Fullscreen ── */}
+                {isViewerFullscreen && (
+                  <div
+                    className="absolute top-0 left-0 right-0 z-30 transition-all duration-500"
+                    style={{
+                      opacity: toolbarVisible ? 1 : 0,
+                      transform: toolbarVisible ? 'translateY(0)' : 'translateY(-100%)',
+                      pointerEvents: toolbarVisible ? 'auto' : 'none',
+                    }}
+                  >
+                    <div className="flex items-center justify-between gap-3 px-5 py-3"
+                      style={{ background: 'linear-gradient(to bottom, rgba(2,6,23,0.96) 0%, rgba(2,6,23,0) 100%)' }}
+                    >
+                      {/* Info izquierda */}
+                      <div className="flex items-center gap-3">
+                        <span className={`w-2.5 h-2.5 rounded-full ${(session.is_online || frame) ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
+                        <span className="text-white font-bold text-sm tracking-tight">{session.device_name || 'Soporte Remoto'}</span>
+                        <span className="text-slate-400 text-xs font-mono bg-slate-800/70 px-2 py-0.5 rounded-md">ID: {session.id}</span>
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wider border ${isControlEnabled ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20' : 'bg-amber-500/15 text-amber-400 border-amber-500/20'}`}>
+                          {isControlEnabled ? '⚡ Control Activo' : '👁 Solo Observando'}
+                        </span>
+                        {isCapsLockActive && (
+                          <span className="text-[10px] bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded-md font-bold flex items-center gap-1 animate-pulse">
+                            🔠 MAYÚS
+                          </span>
+                        )}
+                        <span className="text-slate-500 text-[10px]">Mover el mouse para mostrar/ocultar barra · ESC para salir</span>
+                      </div>
+
+                      {/* Controles derecha */}
+                      <div className="flex items-center gap-2">
+                        {streamQualitySelect}
+                        {/* ── ALTO RENDIMIENTO TOGGLE ── */}
+                        <button
+                          onClick={toggleHqMode}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                            hqEnabled
+                              ? 'bg-violet-600/80 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
+                              : 'bg-slate-700/60 border-white/10 text-slate-400 hover:bg-violet-700/50 hover:text-white'
+                          }`}
+                          title="Modo Alto Rendimiento: Turbo WebP Canvas a 30 FPS"
+                        >
+                          {hqEnabled ? '⚡ HQ ON' : '⚡ Alto Rendimiento'}
+                        </button>
+                        <button
+                          onClick={() => setIsControlEnabled(v => !v)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${isControlEnabled ? 'bg-emerald-600/80 border-emerald-500/30 text-white hover:bg-red-600/80 hover:border-red-500/30' : 'bg-slate-700/80 border-white/10 text-slate-300 hover:bg-emerald-600/80'}`}
+                          title="Alternar Control / Solo Ver"
+                        >
+                          {isControlEnabled ? '🖱 Control ON' : '👁 Solo Ver'}
+                        </button>
+                        <button
+                          onClick={exitViewerFullscreen}
+                          className="flex items-center gap-1.5 bg-red-600/80 hover:bg-red-600 border border-red-500/30 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-lg"
+                          title="Salir de Pantalla Completa (ESC)"
+                        >
+                          <Minimize className="w-3.5 h-3.5" /> Salir Fullscreen
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Indicador discreto de "mover mouse" en Fullscreen */}
+                {isViewerFullscreen && !toolbarVisible && (
+                  <div
+                    className="absolute top-2 left-1/2 -translate-x-1/2 text-[10px] text-white/20 pointer-events-none select-none transition-opacity duration-500 z-30"
+                  >
+                    ↑ mover mouse para ver controles
                   </div>
                 )}
               </div>
@@ -2785,11 +2874,20 @@ export default function App() {
               >
                 <FileText size={18} />
               </button>
+              <button
+                onClick={() => {
+                  setIsDeviceLogsOpen(prev => !prev);
+                }}
+                className={`p-2.5 rounded-xl text-white shadow-lg border border-white/10 ${isDeviceLogsOpen ? 'bg-violet-600 shadow-violet-500/20' : 'bg-violet-500/80 hover:bg-violet-500'}`}
+                title="Bitácora de Logs de Telemetría"
+              >
+                <Terminal size={18} />
+              </button>
             </div>
           </div>
 
-          {/* Paneles de Apoyo: Chat y Archivos */}
-          {(isChatOpen || isFilesOpen) && (
+          {/* Paneles de Apoyo: Chat, Archivos y Logs */}
+          {(isChatOpen || isFilesOpen || isDeviceLogsOpen) && (
             <div className="w-full lg:w-80 flex flex-col gap-4 overflow-y-auto">
               {isChatOpen && (
                 <div className="flex-1 bg-slate-900 border border-white/5 rounded-2xl p-4 flex flex-col min-h-[250px]">
@@ -2870,6 +2968,83 @@ export default function App() {
                       }}
                       className="text-[10px] text-slate-500 cursor-pointer"
                     />
+                  </div>
+                </div>
+              )}
+
+              {isDeviceLogsOpen && (
+                <div className="flex-1 bg-slate-900 border border-white/5 rounded-2xl p-4 flex flex-col min-h-[300px]">
+                  <div className="flex items-center justify-between mb-3 border-b border-white/5 pb-2">
+                    <h3 className="text-xs font-black uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                      <Terminal size={14} className="text-violet-400 animate-pulse" /> Logs de Telemetría
+                    </h3>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => fetchDeviceLogs(session.id)}
+                        className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold transition-all"
+                        title="Actualizar ahora"
+                      >
+                        🔄
+                      </button>
+                      <button
+                        onClick={() => handleClearTelemetryLogs(session.id)}
+                        className="p-1 rounded bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white text-[10px] font-bold transition-all"
+                        title="Limpiar logs"
+                      >
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
+                  
+                  {/* Feed de Logs */}
+                  <div className="flex-1 overflow-y-auto space-y-2 mb-2 pr-1 font-mono text-[10px] leading-tight select-text scrollbar-thin max-h-[400px]">
+                    {deviceLogsLoading && deviceLogs.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center h-full text-slate-500 py-8">
+                        <div className="animate-spin rounded-full h-4 w-4 border-2 border-brand-500 border-t-transparent mb-2" />
+                        <span>Cargando logs...</span>
+                      </div>
+                    ) : deviceLogs.length === 0 ? (
+                      <div className="text-center text-slate-500 italic py-8">
+                        No hay logs registrados para este dispositivo.
+                      </div>
+                    ) : (
+                      deviceLogs.map((log: any) => {
+                        let levelColor = "text-slate-300 bg-slate-800/40 border-slate-700/20";
+                        if (log.level === 'DEBUG') levelColor = "text-cyan-400 bg-cyan-950/20 border-cyan-800/10";
+                        if (log.level === 'WARNING') levelColor = "text-amber-400 bg-amber-950/20 border-amber-800/10 animate-pulse";
+                        if (log.level === 'ERROR') levelColor = "text-red-400 bg-red-950/20 border-red-800/20 font-bold border shadow-sm shadow-red-500/5";
+
+                        return (
+                          <div key={log.id} className={`p-2 rounded-lg border bg-slate-950/40 hover:bg-slate-950/60 transition-all`}>
+                            <div className="flex items-center justify-between gap-1 mb-1 text-[9px] text-slate-500 border-b border-white/5 pb-0.5">
+                              <span className="font-sans">
+                                {new Date(log.timestamp).toLocaleTimeString('es-AR')}
+                              </span>
+                              <span className={`px-1 rounded text-[8px] font-extrabold uppercase ${levelColor.split(' ').slice(0,2).join(' ')}`}>
+                                {log.level}
+                              </span>
+                            </div>
+                            <p className={`whitespace-pre-wrap break-all ${log.level === 'ERROR' ? 'text-red-300' : log.level === 'WARNING' ? 'text-amber-300' : 'text-slate-300'}`}>
+                              {log.message}
+                            </p>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                  
+                  {/* Pie de Panel */}
+                  <div className="flex items-center justify-between text-[9px] text-slate-500 border-t border-white/5 pt-2">
+                    <span className="flex items-center gap-1">
+                      <span className={`w-1.5 h-1.5 rounded-full ${logsAutoRefresh ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`} />
+                      {logsAutoRefresh ? 'Auto-refrescando' : 'Pausado'}
+                    </span>
+                    <button 
+                      onClick={() => setLogsAutoRefresh(v => !v)}
+                      className="text-brand-400 hover:text-brand-300 font-bold"
+                    >
+                      {logsAutoRefresh ? 'Pausar' : 'Activar'}
+                    </button>
                   </div>
                 </div>
               )}
@@ -3228,6 +3403,11 @@ export default function App() {
           <div className="mb-4">
             <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Control Interno</p>
             <NavItem icon={<Activity size={20} />} text="Plantel de Personal" active={activeTab === 'personnel'} onClick={() => { setActiveTab('personnel'); setIsSidebarOpen(false); }} />
+          </div>
+
+          <div className="mb-4">
+            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Diagnóstico</p>
+            <NavItem icon={<Terminal size={20} />} text="Bitácora de Logs" active={activeTab === 'logs'} onClick={() => { setActiveTab('logs'); setIsSidebarOpen(false); }} />
           </div>
 
           <div>
@@ -3646,7 +3826,7 @@ export default function App() {
                                   <button
                                     onClick={() => {
                                       if (isOnline) {
-                                        handleVerifyRemotePassword(dev.id);
+                                        handleVerifyRemotePassword(dev.id, dev.remote_password);
                                       }
                                     }}
                                     disabled={!isOnline}
@@ -4304,6 +4484,220 @@ export default function App() {
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'logs' && (
+              <div className="space-y-8 animate-in slide-in-from-bottom-8">
+                {/* Cabecera premium */}
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div>
+                    <h1 className="text-4xl font-extrabold tracking-tight flex items-center gap-3">
+                      Bitácora de Telemetría <span className="relative flex h-3 w-3"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span><span className="relative inline-flex rounded-full h-3 w-3 bg-violet-500"></span></span>
+                    </h1>
+                    <p className="text-slate-400 mt-2">Diagnóstico de eventos del agente Centinela y el servidor en tiempo real.</p>
+                  </div>
+                  
+                  {/* Botones de acción */}
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      onClick={() => fetchTelemetryLogs()}
+                      className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs px-4 py-3 rounded-2xl border border-white/5 transition-all shadow-md cursor-pointer"
+                      title="Refrescar logs ahora"
+                    >
+                      🔄 Refrescar
+                    </button>
+                    <button
+                      onClick={() => handleClearTelemetryLogs(null)}
+                      className="flex items-center gap-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white font-bold text-xs px-4 py-3 rounded-2xl border border-red-500/20 transition-all cursor-pointer"
+                    >
+                      🗑️ Limpiar Bitácora
+                    </button>
+                  </div>
+                </div>
+
+                {/* Filtros */}
+                <div className={`p-6 rounded-[2rem] border shadow-2xl ${darkMode ? 'glass-dark border-brand-500/10' : 'bg-white border-slate-200'} space-y-4`}>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                    {/* Búsqueda */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Buscar Mensaje</label>
+                      <div className="relative">
+                        <Search size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" />
+                        <input
+                          type="text"
+                          value={logsSearchTerm}
+                          onChange={(e) => setLogsSearchTerm(e.target.value)}
+                          className={`w-full pl-10 pr-4 py-2.5 rounded-xl text-xs font-semibold outline-none border transition-all ${
+                            darkMode ? 'bg-black/30 border-white/10 text-white focus:border-brand-500' : 'bg-slate-50 border-slate-200 text-slate-700 focus:border-brand-500'
+                          }`}
+                          placeholder="Buscar término..."
+                        />
+                      </div>
+                    </div>
+
+                    {/* Dispositivo */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Filtrar por PC</label>
+                      <select
+                        value={logsFilterDevice}
+                        onChange={(e) => setLogsFilterDevice(e.target.value)}
+                        className={`w-full px-4 py-2.5 rounded-xl text-xs font-semibold outline-none border transition-all ${
+                          darkMode ? 'bg-slate-900 border-white/10 text-slate-300 focus:border-brand-500' : 'bg-slate-50 border-slate-200 text-slate-700 focus:border-brand-500'
+                        }`}
+                      >
+                        <option value="all">🖥️ Todos los Equipos</option>
+                        {clients.flatMap(c => c.devices || []).map((dev: any) => (
+                          <option key={dev.id} value={dev.id}>🖥️ {dev.device_name} (ID: {dev.id})</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Nivel */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Nivel de Gravedad</label>
+                      <select
+                        value={logsFilterLevel}
+                        onChange={(e) => setLogsFilterLevel(e.target.value)}
+                        className={`w-full px-4 py-2.5 rounded-xl text-xs font-semibold outline-none border transition-all ${
+                          darkMode ? 'bg-slate-900 border-white/10 text-slate-300 focus:border-brand-500' : 'bg-slate-50 border-slate-200 text-slate-700 focus:border-brand-500'
+                        }`}
+                      >
+                        <option value="all">⚖️ Todos los niveles</option>
+                        <option value="DEBUG">🔵 DEBUG</option>
+                        <option value="INFO">🟢 INFO</option>
+                        <option value="WARNING">🟡 WARNING</option>
+                        <option value="ERROR">🔴 ERROR</option>
+                      </select>
+                    </div>
+
+                    {/* Origen */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Origen del Evento</label>
+                      <select
+                        value={logsFilterSource}
+                        onChange={(e) => setLogsFilterSource(e.target.value)}
+                        className={`w-full px-4 py-2.5 rounded-xl text-xs font-semibold outline-none border transition-all ${
+                          darkMode ? 'bg-slate-900 border-white/10 text-slate-300 focus:border-brand-500' : 'bg-slate-50 border-slate-200 text-slate-700 focus:border-brand-500'
+                        }`}
+                      >
+                        <option value="all">🔌 Todos los orígenes</option>
+                        <option value="agent">🤖 Agente Centinela</option>
+                        <option value="backend">☁️ Servidor Backend</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Auto refresh status */}
+                  <div className="flex items-center justify-between text-xs text-slate-500 pt-2 border-t border-slate-200 dark:border-white/5">
+                    <div className="flex items-center gap-2">
+                      <span className={`relative flex h-2.5 w-2.5 ${logsAutoRefresh ? 'inline-flex' : 'hidden'}`}>
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                      </span>
+                      <span>
+                        {logsAutoRefresh ? 'Auto-actualizando cada 3 segundos' : 'Actualización automática en pausa'}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => setLogsAutoRefresh(v => !v)}
+                      className={`font-extrabold text-[10px] uppercase px-3 py-1.5 rounded-lg border transition-all ${
+                        logsAutoRefresh 
+                          ? 'bg-slate-800 border-white/5 text-slate-400 hover:text-white' 
+                          : 'bg-brand-500/10 border-brand-500/20 text-brand-400 hover:bg-brand-500/20'
+                      }`}
+                    >
+                      {logsAutoRefresh ? 'Pausar' : 'Activar Auto-Refresh'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Tabla de Logs */}
+                <div className={`rounded-[2rem] border shadow-2xl overflow-hidden ${darkMode ? 'glass-dark border-brand-500/10' : 'bg-white border-slate-200'}`}>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 dark:border-white/5 bg-slate-850 dark:bg-black/30 text-[10px] uppercase font-black tracking-wider text-slate-400">
+                          <th className="py-4 px-6 w-24">Hora</th>
+                          <th className="py-4 px-6 w-32">Nivel</th>
+                          <th className="py-4 px-6 w-32">Origen</th>
+                          <th className="py-4 px-6 w-48">PC / Dispositivo</th>
+                          <th className="py-4 px-6">Mensaje</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 dark:divide-white/5 font-medium">
+                        {logsLoading && telemetryLogs.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="py-12 text-center text-slate-500">
+                              <div className="flex flex-col items-center justify-center gap-3">
+                                <div className="animate-spin rounded-full h-8 w-8 border-4 border-brand-500 border-t-transparent" />
+                                <span>Cargando bitácora de logs...</span>
+                              </div>
+                            </td>
+                          </tr>
+                        ) : telemetryLogs.filter(log => {
+                          if (!logsSearchTerm) return true;
+                          return log.message?.toLowerCase().includes(logsSearchTerm.toLowerCase());
+                        }).length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="py-12 text-center text-slate-500 italic">
+                              No se encontraron logs con los filtros aplicados.
+                            </td>
+                          </tr>
+                        ) : (
+                          telemetryLogs
+                            .filter(log => {
+                              if (!logsSearchTerm) return true;
+                              return log.message?.toLowerCase().includes(logsSearchTerm.toLowerCase());
+                            })
+                            .map((log: any) => {
+                              let levelBadge = "";
+                              if (log.level === 'DEBUG') levelBadge = "bg-cyan-500/10 text-cyan-400 border border-cyan-500/20";
+                              else if (log.level === 'WARNING') levelBadge = "bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse";
+                              else if (log.level === 'ERROR') levelBadge = "bg-red-500/20 text-red-400 border border-red-500/30 font-black shadow-md shadow-red-500/5";
+                              else levelBadge = "bg-emerald-500/10 text-emerald-400 border border-emerald-500/10";
+
+                              const isAgent = log.source === 'agent';
+                              const sourceBadge = isAgent 
+                                ? "bg-orange-500/10 text-orange-400 border border-orange-500/20" 
+                                : "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20";
+
+                              return (
+                                <tr key={log.id} className="hover:bg-slate-900/40 dark:hover:bg-white/[0.02] transition-colors select-text">
+                                  <td className="py-4 px-6 text-slate-400 font-mono whitespace-nowrap">
+                                    {new Date(log.timestamp).toLocaleString('es-AR', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+                                  </td>
+                                  <td className="py-4 px-6">
+                                    <span className={`px-2 py-1 rounded-full text-[9px] uppercase font-black ${levelBadge}`}>
+                                      {log.level}
+                                    </span>
+                                  </td>
+                                  <td className="py-4 px-6">
+                                    <span className={`px-2.5 py-1 rounded-full text-[9px] uppercase font-bold ${sourceBadge}`}>
+                                      {isAgent ? '🤖 Agente' : '☁️ Servidor'}
+                                    </span>
+                                  </td>
+                                  <td className="py-4 px-6 font-bold text-slate-300">
+                                    {log.device_id ? (
+                                      <div className="flex flex-col">
+                                        <span className="text-slate-200">{log.device_name}</span>
+                                        <span className="text-[9px] text-slate-500 font-mono font-normal">ID: {log.device_id}</span>
+                                      </div>
+                                    ) : (
+                                      <span className="text-slate-500 italic">No aplica</span>
+                                    )}
+                                  </td>
+                                  <td className="py-4 px-6 font-mono text-slate-300 break-all whitespace-pre-wrap leading-relaxed max-w-xl">
+                                    {log.message}
+                                  </td>
+                                </tr>
+                              );
+                            })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </div>
             )}
@@ -5380,7 +5774,7 @@ export default function App() {
                                     Limpiar Temp
                                   </button>
                                   <button
-                                    onClick={() => handleVerifyRemotePassword(dev.id)}
+                                    onClick={() => handleVerifyRemotePassword(dev.id, dev.remote_password)}
                                     className="py-2 px-1 text-[8px] font-black uppercase text-white bg-brand-500 hover:bg-brand-600 rounded-xl transition-all text-center"
                                   >
                                     Control

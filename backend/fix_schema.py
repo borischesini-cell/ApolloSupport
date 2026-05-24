@@ -43,6 +43,19 @@ try:
             else:
                 print("Column 'notes' already exists.")
 
+            # Check if alt_remote_id column exists
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='centinela_devices' AND column_name='alt_remote_id';
+            """)
+            if not cur.fetchone():
+                print("Adding 'alt_remote_id' column to 'centinela_devices' table...")
+                cur.execute("ALTER TABLE centinela_devices ADD COLUMN alt_remote_id VARCHAR;")
+                print("Column added successfully.")
+            else:
+                print("Column 'alt_remote_id' already exists.")
+
             # Nuevas columnas de control de personal y perfil para la tabla 'users'
             cols_to_add_users = [
                 ("celular", "VARCHAR"),

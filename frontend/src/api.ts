@@ -1,10 +1,32 @@
-export const API_URL = import.meta.env.VITE_API_URL || 
-  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-    ? 'http://localhost:8001/api'
-    : 'https://support.ultimate.net.ar/api');
+// ─── CONFIGURACIÓN DE ENTORNO ───────────────────────────────────────────────
+// Para cambiar entre local y producción sin recompilar, edita el archivo
+// .env.development (local) o .env.production (producción):
+//
+//   VITE_BACKEND_MODE=local        → apunta a http://localhost:8001
+//   VITE_BACKEND_MODE=production   → apunta a https://support.ultimate.net.ar
+//
+// Si no se define VITE_BACKEND_MODE, se detecta automáticamente por hostname.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BACKEND_MODE = import.meta.env.VITE_BACKEND_MODE as string | undefined;
+
+const LOCAL_API    = 'http://localhost:8001/api';
+const PROD_API     = 'https://support.ultimate.net.ar/api';
+
+export const API_URL: string =
+  import.meta.env.VITE_API_URL ||
+  (BACKEND_MODE === 'local'      ? LOCAL_API  :
+   BACKEND_MODE === 'production' ? PROD_API   :
+   // Auto-detect por hostname cuando no se define VITE_BACKEND_MODE
+   (window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1')
+     ? LOCAL_API
+     : PROD_API);
 
 // URL base para WebSockets (http→ws, https→wss automático)
 export const WS_BASE_URL = API_URL.replace(/^http/, 'ws');
+
+console.info(`[Apollo] Backend mode: ${BACKEND_MODE ?? 'auto'} → ${API_URL}`);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // HOOK: useViewerWebSocket
@@ -21,9 +43,9 @@ import { useEffect, useRef, useCallback } from 'react';
 export type ConnectionQuality = 'excellent' | 'good' | 'poor' | 'disconnected';
 
 /** Por debajo de esto el remoto en WebP es poco usable para operar a diario. */
-export const REMOTE_STREAM_WORKABLE_FPS = 8;
+export const REMOTE_STREAM_WORKABLE_FPS = 12;
 /** Holgura para volver a subir calidad en modo automático sin quedar en el límite. */
-export const REMOTE_STREAM_COMFORTABLE_FPS = 12;
+export const REMOTE_STREAM_COMFORTABLE_FPS = 15;
 
 export function connectionQualityFromFps(fps: number): ConnectionQuality {
   if (fps >= REMOTE_STREAM_COMFORTABLE_FPS) return 'excellent';
@@ -59,6 +81,7 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
   const backoffRef = useRef<number>(1000);
   const failCountRef = useRef<number>(0);
   const frameTimestampsRef = useRef<number[]>([]);
+  const lastQualityUpdateRef = useRef<number>(0);
   const mountedRef = useRef<boolean>(true);
 
   const cleanup = useCallback(() => {
@@ -93,7 +116,7 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
       // Ping periódico cada 25s para mantener viva la conexión
       pingTimerRef.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send('ping');
-      }, 25000);
+      }, 10000);
     };
 
     ws.onmessage = (event) => {
@@ -110,9 +133,12 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
           frameTimestampsRef.current.push(now);
           const twoSecsAgo = now - 2000;
           frameTimestampsRef.current = frameTimestampsRef.current.filter(t => t > twoSecsAgo);
-          const fps = Math.round(frameTimestampsRef.current.length / 2);
-
-          onQuality?.(fps, connectionQualityFromFps(fps));
+          
+          if (!lastQualityUpdateRef.current || now - lastQualityUpdateRef.current >= 2000) {
+            const fps = Math.round(frameTimestampsRef.current.length / 2);
+            onQuality?.(fps, connectionQualityFromFps(fps));
+            lastQualityUpdateRef.current = now;
+          }
         } else if (data.type === 'ping') {
           /* keepalive del servidor */
         } else if (onMessage) {
@@ -143,7 +169,7 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
         if (mountedRef.current && enabled) connect();
       }, delay);
     };
-  }, [deviceId, enabled, onFrame, onQuality, onMessage, onClose, cleanup]);
+  }, [deviceId, enabled, cleanup]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -494,9 +520,11 @@ interface HqViewerOptions {
   enabled: boolean;                              // true solo cuando toggle HQ está ON
   onChunk: (chunk: ArrayBuffer) => void;         // recibe cada chunk H.264/fMP4
   onStateChange?: (state: 'connecting' | 'open' | 'closed') => void;
+  reconnectAttempt?: number;                     // número incremental para forzar reconexión de stream
+  logCallback?: (message: string, level?: string) => void; // NUEVO: Callback de telemetría
 }
 
-export function useHqViewerWebSocket({ deviceId, enabled, onChunk, onStateChange }: HqViewerOptions) {
+export function useHqViewerWebSocket({ deviceId, enabled, onChunk, onStateChange, reconnectAttempt, logCallback }: HqViewerOptions) {
   const wsRef             = useRef<WebSocket | null>(null);
   const mountedRef        = useRef<boolean>(true);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -516,14 +544,30 @@ export function useHqViewerWebSocket({ deviceId, enabled, onChunk, onStateChange
     if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
   }, []);
 
+  const onChunkRef = useRef(onChunk);
+  const onStateChangeRef = useRef(onStateChange);
+  const logCallbackRef = useRef(logCallback);
+
+  useEffect(() => {
+    onChunkRef.current = onChunk;
+    onStateChangeRef.current = onStateChange;
+    logCallbackRef.current = logCallback;
+  }, [onChunk, onStateChange, logCallback]);
+
   const connect = useCallback(() => {
     if (!mountedRef.current || !deviceId || !enabled) return;
     cleanup();
 
     const token = localStorage.getItem('token');
-    if (!token) return;
+    if (!token) {
+      console.warn('[HQ-WS] No se encontró token para la conexión WS');
+      if (logCallbackRef.current) logCallbackRef.current('[FRONTEND-WS] ERROR: No se encontró token de sesión para la conexión WebSocket', 'ERROR');
+      return;
+    }
 
     const url = `${WS_BASE_URL}/ws/viewer/${deviceId}/hq?token=${encodeURIComponent(token)}`;
+    console.log(`[HQ-WS] Iniciando WebSocket hacia: ${url}`);
+    if (logCallbackRef.current) logCallbackRef.current(`[FRONTEND-WS] Iniciando intento de conexión WebSocket hacia: ${url}`, 'INFO');
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';   // recibir chunks como ArrayBuffer, no Blob
     wsRef.current = ws;
@@ -531,52 +575,75 @@ export function useHqViewerWebSocket({ deviceId, enabled, onChunk, onStateChange
 
     let firstChunkReceived = false;
     let noDataTimer: ReturnType<typeof setTimeout> | null = null;
+    let totalChunksReceived = 0;
+    let totalBytesReceived = 0;
 
     ws.onopen = () => {
       if (!mountedRef.current) { ws.close(); return; }
+      console.log('[HQ-WS] Conexión establecida con el Backend. Esperando primer chunk de video...');
+      if (logCallbackRef.current) logCallbackRef.current('[FRONTEND-WS] Conexión establecida con el Backend con éxito. Esperando primer chunk de video...', 'INFO');
       backoffRef.current = 1000;
-      // NO ponemos 'open' aqui — esperamos el primer chunk real.
-      // Mientras hqState = 'connecting', la imagen normal sigue visible.
-      // Timeout: si en 30s no llegan datos, el agente no soporta HQ → cerrar.
+      // Timeout: si en 30s no llegan datos, el agente no soporta HQ o no está transmitiendo.
       noDataTimer = setTimeout(() => {
         if (!firstChunkReceived && ws.readyState === WebSocket.OPEN) {
-          console.warn('[HQ] Sin datos en 30s — agente no soporta HQ o backend no reiniciado');
+          console.warn('[HQ-WS] Sin datos en 30s — agente no soporta HQ o backend no reiniciado');
+          if (logCallbackRef.current) logCallbackRef.current('[FRONTEND-WS] ADVERTENCIA: Conexión abierta por 30s pero no se ha recibido ningún chunk binario de video. Cerrando.', 'WARNING');
           ws.close();
         }
       }, 30000);
       // Ping cada 25s para mantener viva la conexión
       pingTimerRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+        if (ws.readyState === WebSocket.OPEN) {
+          console.log('[HQ-WS] Enviando ping al servidor');
+          ws.send('ping');
+        }
       }, 25000);
     };
 
     ws.onmessage = (event) => {
       if (!mountedRef.current) return;
       if (event.data instanceof ArrayBuffer && event.data.byteLength > 0) {
+        totalChunksReceived++;
+        totalBytesReceived += event.data.byteLength;
+        
         if (!firstChunkReceived) {
           firstChunkReceived = true;
           if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; }
-          onStateChange?.('open');  // ← ahora si: hay datos reales
+          console.log(`[HQ-WS] ¡PRIMER CHUNK RECIBIDO! Tamaño: ${event.data.byteLength} bytes. Cambiando estado a OPEN.`);
+          if (logCallbackRef.current) logCallbackRef.current(`[FRONTEND-WS] ¡ÉXITO! Recibido primer chunk binario del backend (${event.data.byteLength} bytes). Decodificador MSE listo.`, 'INFO');
+          if (onStateChangeRef.current) onStateChangeRef.current('open');  // ← ahora si: hay datos reales
         }
-        onChunk(event.data);
+        
+        if (totalChunksReceived % 100 === 0) {
+          console.log(`[HQ-WS] Estadísticas: Recibidos ${totalChunksReceived} chunks, total ${totalBytesReceived} bytes.`);
+          if (logCallbackRef.current) logCallbackRef.current(`[FRONTEND-WS] Estadísticas: Recibidos ${totalChunksReceived} chunks de video (total: ${totalBytesReceived} bytes)`, 'INFO');
+        }
+        if (onChunkRef.current) onChunkRef.current(event.data);
+      } else {
+        console.log('[HQ-WS] Mensaje de texto recibido (pong/control):', event.data);
       }
-      // Ignorar mensajes de texto (ping/pong del servidor)
     };
 
-    ws.onerror = () => { /* handled in onclose */ };
+    ws.onerror = (err) => {
+      console.error('[HQ-WS] Error en la conexión WebSocket:', err);
+      if (logCallbackRef.current) logCallbackRef.current(`[FRONTEND-WS] ERROR en WebSocket: Conexión fallida o rechazada por el servidor/proxy`, 'ERROR');
+    };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      console.log(`[HQ-WS] Conexión cerrada. Código: ${event.code}, Razón: ${event.reason || 'Sin especificar'}`);
+      if (logCallbackRef.current) logCallbackRef.current(`[FRONTEND-WS] Conexión cerrada. Código: ${event.code}, Razón: ${event.reason || 'Sin especificar'}`, 'WARNING');
       if (pingTimerRef.current) { clearInterval(pingTimerRef.current); pingTimerRef.current = null; }
-      onStateChange?.('closed');
+      if (onStateChangeRef.current) onStateChangeRef.current('closed');
       if (!mountedRef.current || !enabled) return;
       const cap = Math.min(backoffRef.current, 30000);
       const delay = cap + Math.floor(Math.random() * 600);
       backoffRef.current = Math.min(backoffRef.current * 2, 30000);
+      console.log(`[HQ-WS] Intentando reconectar en ${delay}ms...`);
       reconnectTimerRef.current = setTimeout(() => {
         if (mountedRef.current && enabled) connect();
       }, delay);
     };
-  }, [deviceId, enabled, onChunk, onStateChange, cleanup]);
+  }, [deviceId, enabled, cleanup]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -587,5 +654,42 @@ export function useHqViewerWebSocket({ deviceId, enabled, onChunk, onStateChange
       cleanup();
     };
   }, [deviceId, enabled, connect, cleanup]);
+
+  // Forzar reconexión cuando reconnectAttempt cambie (e.g. por decode error)
+  useEffect(() => {
+    if (enabled && deviceId && reconnectAttempt && reconnectAttempt > 0) {
+      console.log(`[HQ] Forzando reconexion por error de reproduccion. Intento: ${reconnectAttempt}`);
+      connect();
+    }
+  }, [reconnectAttempt, enabled, deviceId, connect]);
 }
+
+// ==========================================
+// BITÁCORA DE LOGS DE TELEMETRÍA (NUEVO)
+// ==========================================
+export const getCentinelaLogs = async (deviceId?: number | null, level?: string, source?: string, limit: number = 100) => {
+    let url = `${API_URL}/centinelas/logs?limit=${limit}`;
+    if (deviceId !== undefined && deviceId !== null) url += `&device_id=${deviceId}`;
+    if (level) url += `&level=${encodeURIComponent(level)}`;
+    if (source) url += `&source=${encodeURIComponent(source)}`;
+    
+    const response = await fetch(url, { headers: getAuthHeaders() });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) throw new Error('Error al obtener logs de telemetría');
+    return await response.json();
+};
+
+export const clearCentinelaLogs = async (deviceId?: number | null) => {
+    let url = `${API_URL}/centinelas/logs/clear`;
+    if (deviceId !== undefined && deviceId !== null) url += `?device_id=${deviceId}`;
+    
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: getAuthHeaders()
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) throw new Error('Error al limpiar la bitácora de logs');
+    return await response.json();
+};
+
 

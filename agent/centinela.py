@@ -186,9 +186,62 @@ DEVICE_NAME = LOCAL_CFG.get("device_name", "Desconocido")
 LIC_KEY = LOCAL_CFG.get("license_key", "DEMO-KEY")
 BASE_WS_URL = LOCAL_CFG.get("base_ws_url", "wss://support.ultimate.net.ar/api/ws/centinela")
 
-SERVER_WS_URL = f"{BASE_WS_URL}/{CLIENT_ID}?device_name={DEVICE_NAME}&license_key={LIC_KEY}"
+def get_alt_remote_id():
+    import os, re
+    # Check RustDesk
+    dirs = [
+        os.path.join(os.environ.get("APPDATA", ""), "RustDesk", "config"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustDesk", "config"),
+        r"C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config",
+        r"C:\Windows\SysWOW64\config\systemprofile\AppData\Roaming\RustDesk\config"
+    ]
+    filenames = ["RustDesk.toml", "RustDesk_local.toml", "rustdesk.toml", "RustDesk2.toml"]
+    
+    rustdesk_paths = []
+    for d in dirs:
+        for f in filenames:
+            rustdesk_paths.append(os.path.join(d, f))
+            
+    for p in rustdesk_paths:
+        if p and os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip().startswith("id ="):
+                            m = re.search(r"id\s*=\s*'([^']+)'", line)
+                            if m: return m.group(1)
+            except: pass
+            
+    # Check AnyDesk
+    anydesk_paths = [
+        os.path.join(os.environ.get("ProgramData", "C:\\ProgramData"), "AnyDesk", "system.conf"),
+        os.path.join(os.environ.get("APPDATA", ""), "AnyDesk", "system.conf")
+    ]
+    for p in anydesk_paths:
+        if p and os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("ad.anynet.id="):
+                            return line.split("=")[1].strip()
+            except: pass
+    return ""
 
+def get_current_session_id():
+    """Retorna el ID de sesión Windows del proceso actual."""
+    try:
+        import ctypes
+        pid = os.getpid()
+        session_id = ctypes.c_ulong(0)
+        ctypes.windll.kernel32.ProcessIdToSessionId(pid, ctypes.byref(session_id))
+        return session_id.value
+    except Exception:
+        return 1  # Asumir sesión 1 si no podemos detectarla
+
+ALT_REMOTE_ID = get_alt_remote_id()
+SERVER_WS_URL = f"{BASE_WS_URL}/{CLIENT_ID}?device_name={DEVICE_NAME}&license_key={LIC_KEY}&alt_id={ALT_REMOTE_ID}&session_id={get_current_session_id()}"
 APP_VERSION = "3.0.1"
+
 logger.info("Apollo Centinela v%s | Device: %s | ID: %s", APP_VERSION, DEVICE_NAME, CLIENT_ID)
 
 IS_ENABLED = True # Control de habilitaciÃ³n del cliente
@@ -202,7 +255,7 @@ FORCE_NEXT_FRAME    = False  # Fuerza envÃ­o del prÃ³ximo frame sin comparar
 # LATEST_FRAME siempre tiene el frame COMPLETO (sin delta) para compatibilidad
 # con HTTP polling y con viewers que no soporten deltas.
 # LATEST_FRAME_PACKET es lo que envÃ­a el video loop WS: incluye delta si aplica.
-USE_DIRTY_RECT     = False  # Desactivado: bug de canvas vacÃ­o al primer delta.
+USE_DIRTY_RECT     = True  # Desactivado: bug de canvas vacÃ­o al primer delta.
                              # Las mejoras reales son 25 FPS + method=0. Reactivar cuando
                              # el canvas buffer se inicialice correctamente antes del primer delta.
 LATEST_FRAME_PACKET = None  # dict {"frame": b64, "delta": {x,y,w,h,fw,fh} | None}
@@ -239,6 +292,7 @@ SWITCH_SESSION_FILE = os.path.join(APPDATA_DIR, 'ApolloSupport', 'switch_session
 # â”€â”€ FIN DIRTY RECTANGLES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
+REAL_DEVICE_ID = None
 REMOTE_PASSWORD = str(random.randint(1000, 9999))
 ROOT_WINDOW = None
 SHOW_FLOATING_PANEL_CALLBACK = None
@@ -753,17 +807,6 @@ def get_windows_sessions():
     return sessions
 
 
-def get_current_session_id():
-    """Retorna el ID de sesiÃ³n Windows del proceso actual."""
-    try:
-        import ctypes
-        pid = os.getpid()
-        session_id = ctypes.c_ulong(0)
-        ctypes.windll.kernel32.ProcessIdToSessionId(pid, ctypes.byref(session_id))
-        return session_id.value
-    except Exception:
-        return 1  # Asumir sesiÃ³n 1 si no podemos detectarla
-
 
 def request_session_switch(target_session_id: int, username: str = '', password: str = ''):
     """Escribe un archivo de seÃ±al para que el Servicio reinicie el companion
@@ -796,6 +839,21 @@ async def send_telemetry(lbl_status):
                 await asyncio.sleep(5)
                 continue
 
+            # Actualizacion dinamica de RustDesk ID en cada reconexion
+            try:
+                global ALT_REMOTE_ID
+                new_alt_id = get_alt_remote_id()
+                if new_alt_id and new_alt_id != ALT_REMOTE_ID:
+                    ALT_REMOTE_ID = new_alt_id
+                    SERVER_WS_URL = f"{BASE_WS_URL}/{CLIENT_ID}?device_name={DEVICE_NAME}&license_key={LIC_KEY}&alt_id={ALT_REMOTE_ID}&session_id={get_current_session_id()}"
+                    logger.info("[WS] RustDesk ID detectado o cambiado dinamicamente: %s", ALT_REMOTE_ID)
+                elif not ALT_REMOTE_ID and new_alt_id:
+                    ALT_REMOTE_ID = new_alt_id
+                    SERVER_WS_URL = f"{BASE_WS_URL}/{CLIENT_ID}?device_name={DEVICE_NAME}&license_key={LIC_KEY}&alt_id={ALT_REMOTE_ID}&session_id={get_current_session_id()}"
+                    logger.info("[WS] Primer RustDesk ID detectado dinamicamente: %s", ALT_REMOTE_ID)
+            except Exception as ex_rd:
+                logger.error("[WS] Error al actualizar dinamicamente RustDesk ID: %s", ex_rd)
+
             logger.info("[WS] Conectando a: %s", SERVER_WS_URL)
             update_status_threadsafe(lbl_status, "Estado: Triangulando con Servidor...", "#ea580c")
             # ping_interval y ping_timeout mantienen el socket vivo en NATs/proxies y detectan conexiones zombie
@@ -812,6 +870,8 @@ async def send_telemetry(lbl_status):
                 update_status_threadsafe(lbl_status, "Estado: â— Listo para Recibir Soporte", "#10b981") # Esmeralda / Verde
                 import pyautogui
                 pyautogui.FAILSAFE = False
+                pyautogui.PAUSE = 0
+                pyautogui.PAUSE = 0
 
                 frames_sent_count = 0
                 logged_no_frame = False
@@ -882,8 +942,8 @@ async def send_telemetry(lbl_status):
                             # â”€â”€ DIRTY_RECT_END â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
                             if frame_to_check:
-                                current_hash = frame_to_check[:64]
-                                if current_hash != last_sent_frame_hash:
+                                current_hash = packet["id"] if packet and "id" in packet else frame_to_check[:64]
+                                if current_hash != last_sent_frame_hash or still_frames > 60:
                                     # â”€â”€ DIRTY_RECT_START â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                                     if USE_DIRTY_RECT and packet:
                                         frame_payload = {
@@ -913,12 +973,8 @@ async def send_telemetry(lbl_status):
                         except Exception as e:
                             logger.error("[VIDEO] Error enviando frame: %s", e)
                             await asyncio.sleep(0.5)
-                        # Antes: sleep(1.0) con HQ activo capaba el canal JSON a ~1 FPS (MSE caído = pantalla a cámara lenta).
-                        # Con ffmpeg OK, H.264 lleva el vídeo; JSON solo respaldo (~15 FPS tope).
-                        if HQ_MODE_ACTIVE and _hq_ffmpeg_running():
-                            await asyncio.sleep(0.066)
-                        elif HQ_MODE_ACTIVE:
-                            await asyncio.sleep(0.025)
+                        if HQ_MODE_ACTIVE:
+                            await asyncio.sleep(0.016)
                         else:
                             await asyncio.sleep(0.025 if still_frames < 12 else 0.08)
 
@@ -934,7 +990,13 @@ async def send_telemetry(lbl_status):
                         message = await websocket.recv()
                         data = json.loads(message)
                         
-                        if data.get("type") == "error":
+                        if data.get("type") == "welcome":
+                            global REAL_DEVICE_ID
+                            REAL_DEVICE_ID = data.get("device_id")
+                            logger.info("[WS] Mensaje de bienvenida recibido. Real Device ID asignado: %s", REAL_DEVICE_ID)
+                            continue
+                        
+                        elif data.get("type") == "error":
                             err_msg = data.get("message", "Error del servidor")
                             update_status_threadsafe(lbl_status, f"Error: {err_msg}", "#ef4444")
                             await asyncio.sleep(5)
@@ -946,7 +1008,7 @@ async def send_telemetry(lbl_status):
                             LOCAL_CFG["license_key"] = new_lic
                             save_local_config(LOCAL_CFG)
                             LIC_KEY = new_lic
-                            SERVER_WS_URL = f"{BASE_WS_URL}/{CLIENT_ID}?device_name={DEVICE_NAME}&license_key={LIC_KEY}"
+                            SERVER_WS_URL = f"{BASE_WS_URL}/{CLIENT_ID}?device_name={DEVICE_NAME}&license_key={LIC_KEY}&alt_id={ALT_REMOTE_ID}&session_id={get_current_session_id()}"
                             update_status_threadsafe(lbl_status, "Licencia activada remotamente...", "#2563eb")
                             await asyncio.sleep(1)
                             break
@@ -1183,8 +1245,8 @@ async def send_telemetry(lbl_status):
 
                             elif data.get("type") == "download_from_server":
                                 # El tÃ©cnico envÃ­a un archivo a la PC del cliente
-                                url = data["url"]
-                                dest = data["dest_path"]
+                                url = data.get("url")
+                                dest = data.get("dest_path")
                                 # Asegurar carpeta temporal para este cliente
                                 temp_dir = os.path.join(os.environ.get("TEMP", "C:\\temp"), "ApolloSupport", str(CLIENT_ID))
                                 if not os.path.exists(temp_dir):
@@ -1248,7 +1310,16 @@ async def send_telemetry(lbl_status):
                                 HAS_ACTIVE_VIEWER = True
                                 global FORCE_NEXT_FRAME
                                 FORCE_NEXT_FRAME = True  # Forzar frame fresco al conectar/reconectar viewer
-                                logger.info("[SOPORTE] TÃ©cnico %s se uniÃ³ â€” forzando frame fresco", name)
+                                logger.info("[SOPORTE] Técnico %s se unió — forzando frame fresco", name)
+
+                            elif data.get("type") == "active_technicians":
+                                techs = data.get("technicians", [])
+                                if not techs:
+                                    HAS_ACTIVE_VIEWER = False
+                                    logger.info("[SOPORTE] No quedan técnicos mirando. Pausando captura.")
+                                else:
+                                    HAS_ACTIVE_VIEWER = True
+
 
                             elif data.get("type") == "refresh_frame":
                                 # El viewer pide un frame fresco (ej: tras cambio de fullscreen)
@@ -1276,25 +1347,18 @@ async def send_telemetry(lbl_status):
                                     logger.warning("[STREAM] set_stream_params inválido: %s", e)
 
                             elif data.get("type") == "start_hq":
-                                # Backend pide iniciar modo Alto Rendimiento (H.264 MSE)
+                                # Backend pide iniciar modo Alto Rendimiento (MJPEG Turbo)
                                 if not HQ_MODE_ACTIVE:
                                     HQ_MODE_ACTIVE = True
-                                    logger.info("[HQ] Modo Alto Rendimiento activado")
-                                    # Usar el ID primario de la DB que manda el backend, o el CLIENT_ID si falla
-                                    real_device_id = data.get("device_id", CLIENT_ID)
-                                    asyncio.create_task(hq_stream_loop(real_device_id, LIC_KEY))
+                                    logger.info("[HQ] Modo Alto Rendimiento (WebP Turbo Canvas) activado")
+                                    # asyncio.create_task(hq_stream_loop(REAL_DEVICE_ID, LIC_KEY)) # Deshabilitado FFmpeg redundante
                                 else:
                                     logger.debug("[HQ] start_hq recibido pero ya activo")
 
                             elif data.get("type") == "stop_hq":
                                 # Backend pide detener modo HQ (no quedan viewers HQ)
                                 HQ_MODE_ACTIVE = False
-                                _proc = HQ_FFMPEG_PROC
-                                if _proc:
-                                    try: _proc.terminate()
-                                    except: pass
-                                    HQ_FFMPEG_PROC = None
-                                logger.info("[HQ] Modo Alto Rendimiento desactivado")
+                                logger.info("[HQ] Modo Alto Rendimiento (WebP Turbo Canvas) desactivado")
 
                             elif data.get("type") == "get_sessions":
                                 # Técnico solicita lista de sesiones Windows
@@ -1327,8 +1391,10 @@ async def send_telemetry(lbl_status):
                     print(f"Error recibiendo comando: {e}")
                 finally:
                     ACTIVE_WEBSOCKET = None
+                    HAS_ACTIVE_VIEWER = False
                     telemetry_task.cancel()
                     video_task.cancel()
+
         except Exception as e:
             if lbl_status:
                 try:
@@ -1416,7 +1482,7 @@ async def hq_stream_loop(device_id: int, license_key: str):
     ]
 
     log_path = os.path.join(os.path.dirname(_LOG_FILE), 'ffmpeg_hq.log')
-    try: hq_log_file = open(log_path, 'w', encoding='utf-8')
+    try: hq_log_file = open(log_path, 'wb')
     except: hq_log_file = subprocess.DEVNULL
 
     try:
@@ -1512,7 +1578,7 @@ async def hq_stream_loop(device_id: int, license_key: str):
         _set_high_res_timer(False)
         try: proc.terminate()
         except: pass
-        logger.info("[HQ] Stream Finalizado")
+        logger.info(f"[HQ] Stream Finalizado. FFmpeg return code: {proc.poll() if 'proc' in locals() else 'N/A'}")
 # ------------- ENVIADOR THREAD-SAFE DE MENSAJES WEBSOCKET -------------
 def send_ws_message_threadsafe(payload):
     global ACTIVE_WEBSOCKET, ASYNC_LOOP
@@ -1668,8 +1734,62 @@ def is_admin():
     except:
         return False
 
+def ensure_and_start_embedded_rustdesk():
+    return  # DESHABILITADO POR COMPLETO
+    import sys, os, subprocess, shutil
+    
+    # 1. Determinar si estamos en PyInstaller
+    if not getattr(sys, 'frozen', False):
+        logger.info("[EMBEDDED-RD] Corriendo en modo dev, omitiendo extraccion")
+        return
+        
+    base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    src_path = os.path.join(base_dir, 'rustdesk.exe')
+    
+    if not os.path.exists(src_path):
+        logger.warning("[EMBEDDED-RD] No se encontro rustdesk.exe embebido")
+        return
+        
+    # Carpeta destino
+    dest_dir = r"C:\ProgramData\ApolloSupport\bin"
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir, exist_ok=True)
+        
+    dest_path = os.path.join(dest_dir, 'rustdesk.exe')
+    
+    # Copiar si no existe o si difiere en tamaño
+    try:
+        if not os.path.exists(dest_path) or os.path.getsize(src_path) != os.path.getsize(dest_path):
+            logger.info("[EMBEDDED-RD] Extrayendo rustdesk.exe...")
+            shutil.copy2(src_path, dest_path)
+    except Exception as e:
+        logger.error("[EMBEDDED-RD] Error extrayendo: %s", e)
+        
+    # 2. Iniciar si no está corriendo
+    try:
+        # Usar tasklist para ver si ya corre y evitar dependencia psutil si falla
+        output = subprocess.check_output('tasklist /FI "IMAGENAME eq rustdesk.exe"', shell=True).decode('utf-8', errors='ignore')
+        if 'rustdesk.exe' in output.lower():
+            logger.info("[EMBEDDED-RD] RustDesk ya esta corriendo")
+            return
+    except Exception as e:
+        logger.warning("[EMBEDDED-RD] No se pudo verificar si corre: %s", e)
+        
+    # Iniciar como proceso silencioso en segundo plano
+    try:
+        logger.info("[EMBEDDED-RD] Iniciando rustdesk.exe en segundo plano...")
+        subprocess.Popen([dest_path, "--service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000) # CREATE_NO_WINDOW
+    except Exception as e:
+        logger.error("[EMBEDDED-RD] Error al iniciar: %s", e)
+
 def main():
     import sys
+    
+    # Asegurar el motor embebido de RustDesk (DESHABILITADO POR COMPLETO)
+    # try:
+    #     ensure_and_start_embedded_rustdesk()
+    # except Exception as e:
+    #     logger.error("[EMBEDDED-RD] Fallo critico en modulo embebido: %s", e)
 
     # â”€â”€ Instancia Ãºnica: solo puede correr UN companion por sesiÃ³n de usuario â”€â”€
     # Si ya hay uno corriendo, este nuevo proceso sale silenciosamente.
@@ -2127,13 +2247,13 @@ def main():
         import io as _io
         import mss as _mss
         from PIL import Image, ImageGrab
-        global LATEST_FRAME, ACTIVE_MONITOR
+        global LATEST_FRAME, ACTIVE_MONITOR, HQ_MODE_ACTIVE
         last_pixel_hash = None
         motion_frames = 0
         frames_captured = 0
         gdi_failures = 0
         prev_screenshot_dr = None  # DIRTY_RECT: frame anterior para comparaciÃ³n
-        _FRAME_BUDGET = 0.033  # ~30 FPS objetivo en captura
+        _FRAME_BUDGET = 0.08  # ~12 FPS objetivo en captura estÃ¡ndar para ahorrar CPU
 
         logger.info("[CAPTURA] Thread de captura de pantalla iniciado")
 
@@ -2147,13 +2267,6 @@ def main():
         except Exception as e:
             logger.warning("[CAPTURA] mss no disponible (%s), usando PIL.ImageGrab como fallback", e)
             use_imagegrab = True
-
-        def _fast_changed(img_bytes: bytes, prev_hash) -> tuple:
-            """Verifica si la imagen cambio muestreando 1000 bytes distribuidos."""
-            step = max(1, len(img_bytes) // 1000)
-            sample = img_bytes[::step][:1000]
-            h = hash(sample)
-            return (h != prev_hash, h)
 
         def _is_black_frame(img: 'Image') -> bool:
             """Detecta si el frame es negro (pantalla apagada/sesion inactiva)."""
@@ -2244,8 +2357,15 @@ def main():
                 return None
 
         while True:
+            # OPTIMIZACIÓN EXTREMA: Si no hay técnicos activos ni modo HQ, pausar la captura
+            # de pantalla local para ahorrar 100% de CPU y RAM.
+            if not HAS_ACTIVE_VIEWER and not HQ_MODE_ACTIVE:
+                time.sleep(1.0)
+                continue
+
             if IS_ENABLED:
                 _t0 = time.perf_counter()
+
                 try:
                     screenshot = None
                     if use_gdi:
@@ -2283,15 +2403,16 @@ def main():
                                 (mw_cap, nh), Image.Resampling.BILINEAR
                             )
 
-                    current_raw = screenshot.tobytes()
-                    # ComparaciÃ³n RÃPIDA por muestra â€” evita MD5 sobre 6MB por frame
-                    changed, last_pixel_hash = _fast_changed(current_raw, last_pixel_hash)
-
-                    if not changed and not FORCE_NEXT_FRAME:
-                        # Calcular sleep dinÃ¡mico para mantener ~25 FPS
-                        elapsed = time.perf_counter() - _t0
-                        time.sleep(max(0.002, _FRAME_BUDGET - elapsed))
-                        continue
+                    diff_bbox = None
+                    if prev_screenshot_dr is not None:
+                        from PIL import ImageChops as _IChops
+                        diff_bbox = _IChops.difference(screenshot, prev_screenshot_dr).getbbox()
+                        
+                        if diff_bbox is None and not FORCE_NEXT_FRAME:
+                            elapsed = time.perf_counter() - _t0
+                            time.sleep(max(0.002, _FRAME_BUDGET - elapsed))
+                            continue
+                            
                     FORCE_NEXT_FRAME = False
 
                     motion_frames = min(motion_frames + 1, 10)
@@ -2310,21 +2431,18 @@ def main():
                     delta_meta   = None
                     encode_img   = screenshot  # por defecto: frame completo
 
-                    if USE_DIRTY_RECT and prev_screenshot_dr is not None:
-                        from PIL import ImageChops as _IChops
-                        diff_bbox = _IChops.difference(screenshot, prev_screenshot_dr).getbbox()
-                        if diff_bbox:
-                            x1, y1, x2, y2 = diff_bbox
-                            fw, fh = screenshot.size
-                            dw, dh = x2 - x1, y2 - y1
-                            # Solo mandar delta si ahorra mÃ¡s del 35% del Ã¡rea
-                            if (dw * dh) < (fw * fh * 0.65):
-                                encode_img = screenshot.crop(diff_bbox)
-                                delta_meta = {"x": x1, "y": y1,
-                                              "w": dw, "h": dh,
-                                              "fw": fw, "fh": fh}
-                                logger.debug("[DR] delta %dx%d @ (%d,%d) â€” %.0f%% del frame",
-                                             dw, dh, x1, y1, 100.0*dw*dh/(fw*fh))
+                    if USE_DIRTY_RECT and diff_bbox:
+                        x1, y1, x2, y2 = diff_bbox
+                        fw, fh = screenshot.size
+                        dw, dh = x2 - x1, y2 - y1
+                        # Solo mandar delta si ahorra más del 35% del área
+                        if (dw * dh) < (fw * fh * 0.65):
+                            encode_img = screenshot.crop(diff_bbox)
+                            delta_meta = {"x": x1, "y": y1,
+                                          "w": dw, "h": dh,
+                                          "fw": fw, "fh": fh}
+                            logger.debug("[DR] delta %dx%d @ (%d,%d) — %.0f%% del frame",
+                                         dw, dh, x1, y1, 100.0*dw*dh/(fw*fh))
 
                     prev_screenshot_dr = screenshot  # Guardar para prÃ³xima comparaciÃ³n
 
@@ -2342,13 +2460,10 @@ def main():
                     encoded_b64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
                     if delta_meta:
-                        # FIX: No re-encodear el frame completo (era doble-encode, peor que antes).
-                        # LATEST_FRAME conserva el ultimo frame completo enviado â€” suficiente
-                        # para el HTTP polling fallback. Solo actualizamos LATEST_FRAME_PACKET.
-                        LATEST_FRAME_PACKET = {"frame": encoded_b64, "delta": delta_meta}
+                        LATEST_FRAME_PACKET = {"frame": encoded_b64, "delta": delta_meta, "id": time.perf_counter()}
                     else:
                         LATEST_FRAME = encoded_b64
-                        LATEST_FRAME_PACKET = {"frame": encoded_b64, "delta": None}
+                        LATEST_FRAME_PACKET = {"frame": encoded_b64, "delta": None, "id": time.perf_counter()}
 
                     # â”€â”€ DIRTY_RECT_END â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -2387,9 +2502,10 @@ def main():
                 motion_frames = 0
                 last_pixel_hash = None
 
-            # Sleep dinÃ¡mico: mantiene ~25 FPS descontando el tiempo de encode
+            # Sleep dinámico: mantiene ~30 FPS (HQ Turbo) o ~12 FPS (Estándar) descontando el tiempo de encode
+            _current_budget = 0.033 if HQ_MODE_ACTIVE else _FRAME_BUDGET
             _elapsed = time.perf_counter() - _t0
-            time.sleep(max(0.004, _FRAME_BUDGET - _elapsed))
+            time.sleep(max(0.002, _current_budget - _elapsed))
 
     threading.Thread(target=capture_screenshot_thread_func, daemon=True).start()
 

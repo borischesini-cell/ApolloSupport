@@ -28,7 +28,7 @@ file_handler = logging.handlers.RotatingFileHandler(
     encoding="utf-8"
 )
 file_handler.setFormatter(log_formatter)
-file_handler.setLevel(logging.WARNING)  # Solo errores en archivo â€” INFO va a consola
+file_handler.setLevel(logging.INFO)  # Cambiado a INFO temporalmente para capturar logs de WebSocket
 
 # Handler de consola (INFO+ para seguimiento en tiempo real)
 console_handler = logging.StreamHandler(sys.stdout)
@@ -59,6 +59,7 @@ from jose import JWTError, jwt
 from datetime import datetime
 import shutil
 import asyncio
+from collections import deque
 import uuid
 from datetime import timedelta
 
@@ -120,8 +121,10 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": f"Internal Server Error: {str(exc)}"}
     )
 
-# ConfiguraciÃ³n Global
-API_URL = "http://localhost:8001/api"
+# Configuración Global
+from dotenv import load_dotenv
+load_dotenv()
+API_URL = os.environ.get("API_URL", "http://localhost:8001/api")
 
 # Asegurar directorios base
 for d in ["temp_files", "uploads", "temp_files/uploads"]:
@@ -142,6 +145,22 @@ async def server_ping_loop(device_id: int):
             success = await manager.send_json_safe(device_id, {"type": "ping"})
             if not success: break
         except Exception: break
+
+
+def _db_cleanup_device_on_idle_viewers(device_id: int):
+    """ Libera el dispositivo en la base de datos si no hay técnicos conectados. """
+    db_clean = SessionLocal()
+    try:
+        dev = db_clean.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+        if dev and dev.current_technician_id is not None:
+            logger.info(f"[CLEANUP] Autoliberando dispositivo '{dev.device_name}' (ID: {device_id}) en DB por inactividad de espectadores.")
+            dev.current_technician_id = None
+            dev.session_start = None
+            db_clean.commit()
+    except Exception as db_err:
+        logger.error(f"[CLEANUP DB ERROR] Error liberando dispositivo {device_id}: {db_err}")
+    finally:
+        db_clean.close()
 
 
 async def periodic_viewer_cleanup():
@@ -170,37 +189,34 @@ async def periodic_viewer_cleanup():
                             if u_id in viewers_dict:
                                 del viewers_dict[u_id]
                         
-                        # Notificar al cliente con la lista actualizada de tÃ©cnicos activos (que puede estar vacÃ­a)
+                    # Notificar al cliente con la lista actualizada de técnicos activos (que puede estar vacía)
+                    # OJO: Si hay viewers por WS, no enviar array vacio, usar un placeholder
+                    final_viewers = list(active_viewers)
+                    has_ws_viewers = device_id in manager.viewer_connections and len(manager.viewer_connections[device_id]) > 0
+                    
+                    if len(final_viewers) == 0 and has_ws_viewers:
+                        final_viewers = ["Soporte (WS)"]
+
+                    if to_delete or has_ws_viewers:
                         await manager.send_json_safe(device_id, {
                             "type": "active_technicians",
-                            "technicians": active_viewers
+                            "technicians": final_viewers
                         })
                         manager.last_viewer_notification[device_id] = now
 
-                    # AutoliberaciÃ³n de PC en DB si no quedan espectadores activos (ni standard ni HQ)
-                    # y estÃ¡ marcada como ocupada
-                    if len(viewers_dict) == 0 and not manager.has_hq_viewers(device_id):
-                        db_clean = SessionLocal()
-                        try:
-                            dev = db_clean.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
-                            if dev and dev.current_technician_id is not None:
-                                logger.info(f"[CLEANUP] Autoliberando dispositivo '{dev.device_name}' (ID: {device_id}) en DB por inactividad de espectadores.")
-                                dev.current_technician_id = None
-                                dev.session_start = None
-                                db_clean.commit()
-                        except Exception as db_err:
-                            logger.error(f"[CLEANUP DB ERROR] Error liberando dispositivo {device_id}: {db_err}")
-                        finally:
-                            db_clean.close()
+                    # Autoliberación de PC en DB si no quedan espectadores activos (ni standard WS, ni HQ WS, ni HTTP polling)
+                    if len(viewers_dict) == 0 and not manager.has_hq_viewers(device_id) and not has_ws_viewers:
+                        await asyncio.to_thread(_db_cleanup_device_on_idle_viewers, device_id)
         except Exception as e:
-            logger.error("[CLEANUP ERROR] Error en limpieza periÃ³dica de espectadores: {e}")
+            logger.error(f"[CLEANUP ERROR] Error en limpieza periÃ³dica de espectadores: {e}")
 
 # Resetear estado online de dispositivos al iniciar el servidor
 @app.on_event("startup")
 def startup_event():
-    # Iniciar tareas asÃ­ncronas periÃ³dicas
+    # Iniciar tareas asíncronas periódicas
     asyncio.get_event_loop().create_task(periodic_viewer_cleanup())
     asyncio.get_event_loop().create_task(periodic_orphan_session_cleanup())
+    asyncio.get_event_loop().create_task(periodic_zombie_cleanup())
 
     db = SessionLocal()
     try:
@@ -249,6 +265,16 @@ def _close_orphaned_sessions(db: Session):
         logger.error("[ORPHAN] Error cerrando sesiones huÃ©rfanas: %s", e)
 
 
+def _db_run_orphan_session_cleanup():
+    db = SessionLocal()
+    try:
+        _close_orphaned_sessions(db)
+    except Exception as e:
+        logger.error("[ORPHAN] Error en ciclo periÃ³dico: %s", e)
+    finally:
+        db.close()
+
+
 async def periodic_orphan_session_cleanup():
     """
     Tarea periÃ³dica que cierra sesiones de soporte huÃ©rfanas cada 5 minutos.
@@ -257,13 +283,39 @@ async def periodic_orphan_session_cleanup():
     logger.info("[ORPHAN] Tarea de limpieza de sesiones huÃ©rfanas iniciada.")
     while True:
         await asyncio.sleep(300)  # Cada 5 minutos
-        db = SessionLocal()
-        try:
-            _close_orphaned_sessions(db)
-        except Exception as e:
-            logger.error("[ORPHAN] Error en ciclo periÃ³dico: %s", e)
-        finally:
-            db.close()
+        await asyncio.to_thread(_db_run_orphan_session_cleanup)
+
+
+def _db_run_zombie_cleanup():
+    db = SessionLocal()
+    try:
+        online_devices = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.is_online == True).all()
+        updated = 0
+        for dev in online_devices:
+            if dev.id not in manager.active_connections:
+                dev.is_online = False
+                dev.current_technician_id = None
+                dev.session_start = None
+                updated += 1
+        if updated > 0:
+            db.commit()
+            logger.info(f"[ZOMBIE-CLEANUP] Corregidos {updated} dispositivos zombie en DB.")
+    except Exception as e:
+        logger.error("[ZOMBIE-CLEANUP] Error en ciclo de limpieza: %s", e)
+    finally:
+        db.close()
+
+
+async def periodic_zombie_cleanup():
+    """
+    Tarea periódica que sincroniza el estado online de la base de datos con las conexiones Websocket activas.
+    Si un dispositivo figura como online en la DB pero NO está en manager.active_connections,
+    lo marca como offline (is_online=False).
+    """
+    logger.info("[ZOMBIE-CLEANUP] Tarea periódica de limpieza de conexiones zombie iniciada.")
+    while True:
+        await asyncio.sleep(30)
+        await asyncio.to_thread(_db_run_zombie_cleanup)
 
 
 # ==========================================
@@ -1044,10 +1096,15 @@ class ConnectionManager:
         self.client_sessions: Dict[int, list] = {}
         # write_locks[device_id] = asyncio.Lock()
         self.write_locks: Dict[int, asyncio.Lock] = {}
+        # frame_buffer per device (last 30 frames)
+        self.frame_buffer: Dict[int, deque] = {}
         # device_viewers[device_id] = {user_id: (user_name, last_seen_datetime)}
         self.device_viewers: Dict[int, Dict[int, tuple]] = {}
         # last_viewer_notification[device_id] = last notification sent datetime
         self.last_viewer_notification: Dict[int, datetime] = {}
+        # Multi-session tracking for Terminal Server scenario
+        self.device_sessions: Dict[int, Dict[int, WebSocket]] = {}
+        self.selected_sessions: Dict[int, int] = {}
         # â”€â”€â”€ VIEWER WEBSOCKETS (estÃ¡ndar) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # viewer_connections[device_id] = {ws_id: WebSocket}
         self.viewer_connections: Dict[int, Dict[str, WebSocket]] = {}
@@ -1073,39 +1130,107 @@ class ConnectionManager:
             except Exception:
                 pass
 
-    async def connect(self, device_id: int, client_id: int, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections[device_id] = websocket
+    async def connect(self, device_id: int, client_id: int, websocket: WebSocket, session_id: int = None):
+        # 1. Registrar en el diccionario de sesiones
+        if device_id not in self.device_sessions:
+            self.device_sessions[device_id] = {}
+        
+        if session_id is not None:
+            # Si esta sesion ya tenia conexion activa, la cerramos limpiamente para evitar duplicidad en la misma sesion
+            if session_id in self.device_sessions[device_id]:
+                old_ws = self.device_sessions[device_id][session_id]
+                try:
+                    logger.warning(f"[WS-CONFLICT] Dispositivo {device_id} Sesion {session_id} ya tenia conexion activa. Cerrando la vieja.")
+                    await old_ws.close(code=4009)
+                except Exception:
+                    pass
+            self.device_sessions[device_id][session_id] = websocket
+            
+            # Si no hay ninguna sesion seleccionada para este dispositivo, esta sesion inicial sera la seleccionada
+            if device_id not in self.selected_sessions:
+                self.selected_sessions[device_id] = session_id
+        else:
+            # Fallback si no tiene session_id (agentes viejos)
+            # Evitar colisión de múltiples agentes en el mismo ID de dispositivo
+            if device_id in self.active_connections:
+                old_ws = self.active_connections[device_id]
+                try:
+                    logger.warning(f"[WS-CONFLICT] Dispositivo {device_id} ya tenia conexion activa (sin session_id). Cerrando la vieja.")
+                    await old_ws.close(code=4009)
+                except Exception:
+                    pass
+        
+        # 2. La conexion "activa" principal (la que recibe comandos y de la que aceptamos frames)
+        # es la de la sesion seleccionada (o la conexion de fallback)
+        current_selected = self.selected_sessions.get(device_id)
+        if current_selected is not None and current_selected in self.device_sessions[device_id]:
+            self.active_connections[device_id] = self.device_sessions[device_id][current_selected]
+        else:
+            self.active_connections[device_id] = websocket
+            
         if client_id not in self.active_clients:
             self.active_clients[client_id] = []
         if device_id not in self.active_clients[client_id]:
             self.active_clients[client_id].append(device_id)
 
-    def disconnect(self, device_id: int, client_id: int):
-        if device_id in self.active_connections:
-            del self.active_connections[device_id]
+    def disconnect(self, device_id: int, client_id: int, websocket: WebSocket = None):
+        # Encontrar y remover de device_sessions
+        session_to_remove = None
+        if device_id in self.device_sessions:
+            for s_id, ws in list(self.device_sessions[device_id].items()):
+                if ws == websocket:
+                    session_to_remove = s_id
+                    self.device_sessions[device_id].pop(s_id, None)
+                    logger.info(f"[WS-DISCONNECT] Removiendo conexion de sesion {s_id} para device {device_id}")
+                    break
+                    
+            if not self.device_sessions[device_id]:
+                self.device_sessions.pop(device_id, None)
+                self.selected_sessions.pop(device_id, None)
+            elif session_to_remove == self.selected_sessions.get(device_id):
+                # Si se desconectó la sesión activa, seleccionar otra sesión disponible
+                any_session = next(iter(self.device_sessions[device_id].keys()))
+                self.selected_sessions[device_id] = any_session
+                logger.info(f"[WS-SWITCH] Sesion seleccionada cambio a {any_session} tras desconexion de la activa")
+        
+        # Si ya no quedan conexiones en absoluto para este dispositivo, limpiar active_connections
+        if device_id not in self.device_sessions or not self.device_sessions[device_id]:
+            if device_id in self.active_connections:
+                del self.active_connections[device_id]
+        else:
+            # Si quedan sesiones, actualizar active_connections con la seleccionada
+            sel_sess = self.selected_sessions.get(device_id)
+            if sel_sess in self.device_sessions[device_id]:
+                self.active_connections[device_id] = self.device_sessions[device_id][sel_sess]
+
         if client_id in self.active_clients:
-            if device_id in self.active_clients[client_id]:
-                self.active_clients[client_id].remove(device_id)
-        if device_id in self.client_frames:
-            del self.client_frames[device_id]
-        if device_id in self.session_info:
-            del self.session_info[device_id]
-        if device_id in self.client_telemetry:
-            del self.client_telemetry[device_id]
-        if device_id in self.client_alerts:
-            del self.client_alerts[device_id]
-        if device_id in self.client_clipboard:
-            del self.client_clipboard[device_id]
-        if device_id in self.write_locks:
-            del self.write_locks[device_id]
-        if device_id in self.device_viewers:
-            del self.device_viewers[device_id]
-        if device_id in self.last_viewer_notification:
-            del self.last_viewer_notification[device_id]
+            # Solo remover del panel si no queda NINGUNA sesion activa para este dispositivo
+            if device_id not in self.device_sessions or not self.device_sessions[device_id]:
+                if device_id not in self.active_clients[client_id]:
+                    self.active_clients[client_id].remove(device_id)
+                    
+        # Limpiar otros buffers solo si se perdieron todas las conexiones de este device
+        if device_id not in self.device_sessions or not self.device_sessions[device_id]:
+            if device_id in self.client_frames:
+                del self.client_frames[device_id]
+            if device_id in self.session_info:
+                del self.session_info[device_id]
+            if device_id in self.client_telemetry:
+                del self.client_telemetry[device_id]
+            if device_id in self.client_alerts:
+                del self.client_alerts[device_id]
+            if device_id in self.client_clipboard:
+                del self.client_clipboard[device_id]
+            if device_id in self.write_locks:
+                del self.write_locks[device_id]
+            if device_id in self.device_viewers:
+                del self.device_viewers[device_id]
+            if device_id in self.last_viewer_notification:
+                del self.last_viewer_notification[device_id]
+
 
     async def send_json_safe(self, device_id: int, data: dict) -> bool:
-        """ EnvÃ­a un mensaje JSON a un dispositivo de forma segura y secuencial (evita colisiones concurrentes). """
+        """ Envía un mensaje JSON a un dispositivo de forma segura y secuencial (evita colisiones concurrentes). """
         if device_id not in self.active_connections:
             return False
         
@@ -1121,7 +1246,7 @@ class ConnectionManager:
                 return False
 
     async def send_command(self, client_id: int, command: str):
-        """ EnvÃ­a un comando arbitrario al agente Centinela vÃ­a WebSocket de forma segura. """
+        """ Envía un comando arbitrario al agente Centinela vía WebSocket de forma segura. """
         return await self.send_json_safe(client_id, {
             "type": "run_command",
             "command": command
@@ -1129,20 +1254,30 @@ class ConnectionManager:
 
     async def push_frame_to_viewers(self, device_id: int, frame_data: str, delta: dict = None):
         """
-        EnvÃ­a el frame reciÃ©n llegado del agente a TODOS los tÃ©cnicos que tienen
+        Envía el frame recién llegado del agente a TODOS los técnicos que tienen
         abierto un WebSocket de vista en tiempo real para este dispositivo.
         Opera de forma no-bloqueante: si un viewer falla, se elimina silenciosamente.
-        DIRTY_RECT: si delta estÃ¡ presente, se reenvÃ­a al viewer para composiciÃ³n.
+        DIRTY_RECT: si delta está presente, se reenvía al viewer para composición.
         """
         if device_id not in self.viewer_connections:
             return
 
-        # DIRTY_RECT_START: incluir delta en payload si el agente lo enviÃ³
+        # Log before sending frame to viewers
+        logger.info("[FRAME SEND] device_id=%d viewers=%d delta=%s", device_id, len(self.viewer_connections.get(device_id, {})), bool(delta))
+
+        # DIRTY_RECT_START: incluir delta en payload si el agente lo envió
         payload = {"type": "frame", "frame": frame_data}
         if delta:
             payload["delta"] = delta
         # DIRTY_RECT_END
         dead_viewers = []
+
+        # Ensure circular buffer exists for this device
+        if device_id not in self.frame_buffer:
+            self.frame_buffer[device_id] = deque(maxlen=30)
+        # Store the current frame in the buffer
+        self.frame_buffer[device_id].append(frame_data)
+        logger.debug("[BUFFER] device_id=%d buffer_len=%d", device_id, len(self.frame_buffer[device_id]))
 
         for ws_id, ws in list(self.viewer_connections[device_id].items()):
             lock = self.viewer_write_locks.get(ws_id)
@@ -1156,7 +1291,11 @@ class ConnectionManager:
                 dead_viewers.append(ws_id)
 
         for ws_id in dead_viewers:
-            self.viewer_connections[device_id].pop(ws_id, None)
+            logger.info("[VIEWER CLEANUP] Removing dead viewer %s from device %d", ws_id, device_id)
+            if device_id in self.viewer_connections:
+                self.viewer_connections[device_id].pop(ws_id, None)
+                if not self.viewer_connections[device_id]:
+                    self.viewer_connections.pop(device_id, None)
             self.viewer_write_locks.pop(ws_id, None)
             logger.debug("[VIEWER] Viewer %s desconectado de device %d", ws_id, device_id)
 
@@ -1173,7 +1312,7 @@ class ConnectionManager:
             if not self.viewer_connections[device_id]:
                 del self.viewer_connections[device_id]
 
-    # â”€â”€ HQ VIEWER MANAGEMENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ——— HQ VIEWER MANAGEMENT ——————————————————————————————————————————————————————
     def add_hq_viewer(self, device_id: int, ws_id: str, ws: WebSocket):
         if device_id not in self.hq_viewer_connections:
             self.hq_viewer_connections[device_id] = {}
@@ -1190,10 +1329,23 @@ class ConnectionManager:
 
     async def push_hq_chunk_to_viewers(self, device_id: int, chunk: bytes):
         """Forward binary H.264/fMP4 chunk del agente a todos los viewers HQ.
-        Opera 100% en binario â€” sin base64, sin JSON. Cero overhead.
+        Opera 100% en binario — sin base64, sin JSON. Cero overhead.
         """
+        if not hasattr(self, "_chunk_counts"):
+            self._chunk_counts = {}
+        self._chunk_counts[device_id] = self._chunk_counts.get(device_id, 0) + 1
+
         if device_id not in self.hq_viewer_connections:
+            if self._chunk_counts[device_id] % 100 == 1:
+                backend_remote_log(device_id, f"[BACKEND-TRANSMISIÓN] Recibiendo video H.264 (chunk #{self._chunk_counts[device_id]}, {len(chunk)} bytes) del agente pero ignorándolo: NO hay visores conectados en este WebSocket", "WARNING")
             return
+        
+        viewers_count = len(self.hq_viewer_connections[device_id])
+        logger.info("[HQ-FORWARD] Reenviando chunk de %d bytes del agente %d a %d viewers", len(chunk), device_id, viewers_count)
+        
+        if self._chunk_counts[device_id] % 100 == 1:
+            backend_remote_log(device_id, f"[BACKEND-TRANSMISIÓN] Reenviando chunk de video H.264 #{self._chunk_counts[device_id]} ({len(chunk)} bytes) a {viewers_count} visor(es) conectado(s)", "INFO")
+        
         dead = []
         for ws_id, ws in list(self.hq_viewer_connections[device_id].items()):
             lock = self.hq_viewer_write_locks.get(ws_id)
@@ -1203,7 +1355,8 @@ class ConnectionManager:
             try:
                 async with lock:
                     await ws.send_bytes(chunk)
-            except Exception:
+            except Exception as e:
+                logger.error("[HQ-FORWARD-ERROR] Error enviando bytes a viewer %s: %s", ws_id, e)
                 dead.append(ws_id)
         for ws_id in dead:
             self.hq_viewer_connections[device_id].pop(ws_id, None)
@@ -1216,43 +1369,41 @@ manager = ConnectionManager()
 
 @app.websocket("/api/ws/viewer/{device_id}")
 async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Query("")):
-    """
-    WebSocket de PUSH de video para los navegadores de los tÃ©cnicos.
-    - El backend empuja frames en cuanto los recibe del agente (cero polling).
-    - El tÃ©cnico puede enviar mensajes de heartbeat para mantener la conexiÃ³n viva.
-    - Usa el JWT por query param porque los navegadores no permiten headers en WS nativos.
-    """
-    # Validar token JWT con log de error detallado
+    await websocket.accept()
+    logger.info(f"[WS-STABLE] Conexión establecida para device {device_id}. Validando...")
+
+    # Validación diferida
     try:
-        # Agregamos 60s de margen (leeway) por si el reloj del server y cliente estan desfasados
+        if not token:
+            await websocket.send_json({"type": "error", "message": "Token ausente"})
+            await websocket.close(code=4001); return
+            
         payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM], options={"leeway": 60})
         email = payload.get("sub")
         if not email:
-            logger.warning(f"[WS] Viewer rechazo conexión de device {device_id}: token sin 'sub'")
-            await websocket.close(code=4001)
-            return
+            await websocket.send_json({"type": "error", "message": "Token inválido"})
+            await websocket.close(code=4001); return
     except JWTError as e:
-        logger.warning(f"[WS] Viewer rechazo conexión de device {device_id} por JWTError: {e}")
-        await websocket.close(code=4001)
-        return
+        logger.warning(f"[WS] Rechazo por JWT: {e}")
+        await websocket.send_json({"type": "error", "message": f"Sesión expirada: {e}"})
+        await websocket.close(code=4001); return
 
-    await websocket.accept()
     ws_id = str(uuid.uuid4())
     manager.add_viewer(device_id, ws_id, websocket)
 
-    # Notificar al agente que hay un tÃ©cnico mirando â†’ activa HAS_ACTIVE_VIEWER en el agente
-    # Sin esto, el agente nuevo nunca envÃ­a frames (espera este mensaje para empezar)
+    # Notificar al agente que hay un técnico mirando → activa HAS_ACTIVE_VIEWER en el agente
+    # Sin esto, el agente nuevo nunca envía frames (espera este mensaje para empezar)
     await manager.send_json_safe(device_id, {
         "type": "technician_joined",
         "name": email
     })
-    # TambiÃ©n actualizar active_technicians para compatibilidad con agentes viejos
+    # También actualizar active_technicians para compatibilidad con agentes viejos
     await manager.send_json_safe(device_id, {
         "type": "active_technicians",
         "technicians": [email]
     })
 
-    # Enviar el Ãºltimo frame disponible inmediatamente al conectar (no esperar al prÃ³ximo)
+    # Enviar el último frame disponible inmediatamente al conectar (no esperar al próximo)
     last_frame = manager.client_frames.get(device_id)
     if last_frame:
         try:
@@ -1281,10 +1432,26 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
                         "set_monitor", "refresh_frame", "mouse_click",
                         "mouse_move", "mouse_scroll", "key_press",
                         "key_down", "key_up", "write_text", "set_clipboard",
-                        "set_stream_params",
+                        "set_stream_params", "start_hq", "stop_hq"
                     }
                     if cmd_type in FORWARDED_CMDS:
-                        await manager.send_json_safe(device_id, cmd)
+                        if cmd_type == "switch_session":
+                            target_session_id = int(cmd.get("session_id", -1))
+                            if target_session_id != -1 and device_id in manager.device_sessions:
+                                if target_session_id in manager.device_sessions[device_id]:
+                                    # Cambio de sesion interno instantaneo
+                                    manager.selected_sessions[device_id] = target_session_id
+                                    manager.active_connections[device_id] = manager.device_sessions[device_id][target_session_id]
+                                    logger.info(f"[WS-SWITCH] Servidor cambio sesion activa de device {device_id} a {target_session_id} internamente")
+                                    # Pedir refresh frame
+                                    await manager.send_json_safe(device_id, {"type": "refresh_frame"})
+                                else:
+                                    logger.info(f"[WS-SWITCH] Sesion {target_session_id} no conectada aun. Enviando signal al companion activo.")
+                                    await manager.send_json_safe(device_id, cmd)
+                            else:
+                                await manager.send_json_safe(device_id, cmd)
+                        else:
+                            await manager.send_json_safe(device_id, cmd)
                 except Exception:
                     pass
             except asyncio.TimeoutError:
@@ -1299,7 +1466,7 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
         logger.debug("[VIEWER] Viewer WS cerrado: %s", e)
     finally:
         manager.remove_viewer(device_id, ws_id)
-        # Si ya no queda ningÃºn viewer mirando, notificar al agente para que deje de capturar
+        # Si ya no queda ningún viewer mirando, notificar al agente para que deje de capturar
         remaining = len(manager.viewer_connections.get(device_id, {}))
         if remaining == 0:
             await manager.send_json_safe(device_id, {
@@ -1308,33 +1475,40 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
             })
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# VIEWER HQ WebSocket â€” Alto Rendimiento (H.264 binario va MSE)
-# Completamente independiente del sistema estÃ¡ndar. No toca nada existente.
-# El agente envÃ­a chunks binarios H.264/fMP4 que se forwardean aquÃ­ sin modificaciÃ³n.
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ——————————————————————————————————————————————————————————————————————————————
+# VIEWER HQ WebSocket — Alto Rendimiento (H.264 binario va MSE)
+# Completamente independiente del sistema estándar. No toca nada existente.
+# El agente envía chunks binarios H.264/fMP4 que se forwardean aquí sin modificación.
+# ——————————————————————————————————————————————————————————————————————————————
 @app.websocket("/api/ws/viewer/{device_id}/hq")
 async def websocket_viewer_hq(websocket: WebSocket, device_id: int, token: str = Query("")):
     """WebSocket de PUSH de video H.264 (Alto Rendimiento).
     El browser usa MediaSource Extensions para decode hardware en tiempo real.
-    El agente envÃ­a binary fMP4 chunks vÃ­a su WS normal; el backend los forwarda aquÃ­.
+    El agente envía binary fMP4 chunks vía su WS normal; el backend los forwarda aquí.
     """
+    logger.info(f"[WS-HANDSHAKE] Intento de conexion VIEWER-HQ para device {device_id}")
+    backend_remote_log(device_id, "[WS-CONEXIÓN] Solicitud de WebSocket HQ entrante del visor", "INFO")
+    await websocket.accept()
+
     try:
         # 60s leeway para evitar rechazos por clock-drift
         payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM], options={"leeway": 60})
         if not payload.get("sub"):
             logger.warning(f"[HQ] Viewer HQ rechazo conexión de device {device_id}: token sin 'sub'")
+            backend_remote_log(device_id, "[WS-CONEXIÓN] Rechazada conexión VIEWER-HQ: Token sin claim 'sub'", "ERROR")
             await websocket.close(code=4001); return
     except JWTError as e:
         logger.warning(f"[HQ] Viewer HQ rechazo conexión de device {device_id} por JWTError: {e}")
+        backend_remote_log(device_id, f"[WS-CONEXIÓN] Rechazada conexión VIEWER-HQ: Error de token ({e})", "ERROR")
         await websocket.close(code=4001); return
 
-    await websocket.accept()
     ws_id = str(uuid.uuid4())
     manager.add_hq_viewer(device_id, ws_id, websocket)
     logger.info("[HQ] Viewer HQ conectado: device=%d ws=%s", device_id, ws_id)
+    backend_remote_log(device_id, f"[WS-CONEXIÓN] Visor HQ conectado con éxito (ws_id={ws_id})", "INFO")
 
     # Notificar al agente que hay un viewer HQ (para que inicie el stream ffmpeg)
+    backend_remote_log(device_id, "[COMANDO] Enviando solicitud 'start_hq' al agente a través del WebSocket de control", "INFO")
     await manager.send_json_safe(device_id, {"type": "start_hq", "device_id": device_id})
 
     try:
@@ -1355,131 +1529,342 @@ async def websocket_viewer_hq(websocket: WebSocket, device_id: int, token: str =
     finally:
         manager.remove_hq_viewer(device_id, ws_id)
         logger.info("[HQ] Viewer HQ desconectado: device=%d", device_id)
+        backend_remote_log(device_id, f"[WS-CONEXIÓN] Visor HQ desconectado (ws_id={ws_id})", "INFO")
         # Si no quedan viewers HQ, decirle al agente que detenga ffmpeg
         if not manager.has_hq_viewers(device_id):
+            backend_remote_log(device_id, "[COMANDO] Enviando 'stop_hq' al agente porque no quedan visores activos", "INFO")
             await manager.send_json_safe(device_id, {"type": "stop_hq"})
 
 
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# AGENTE HQ WebSocket â€” recibe chunks binarios H.264 del agente (endpoint separado)
-# El agente abre UNA segunda conexiÃ³n WS aquÃ­ cuando HQ se activa.
+# ——————————————————————————————————————————————————————————————————————————————
+# AGENTE HQ WebSocket — recibe chunks binarios H.264 del agente (endpoint separado)
+# El agente abre UNA segunda conexión WS aquí cuando HQ se activa.
 # Sin tocar /api/ws/centinela/{id} que queda 100% intacto.
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Se eliminÃ³ la ruta separada de HQ para evitar bloqueos de NGINX
+# ——————————————————————————————————————————————————————————————————————————————
+# Se eliminó la ruta separada de HQ para evitar bloqueos de NGINX
 
 
-@app.websocket("/api/ws/centinela/{client_id}")
-async def websocket_centinela(websocket: WebSocket, client_id: int, device_name: str = "Desconocido", license_key: str = Query(""), hq: str = Query(None), device_id: int = Query(None)):
-    db_init = SessionLocal()
+# ==========================================
+# ROBUST THREAD-SAFE DB OPERATIONS FOR WEBSOCKET
+# ==========================================
+
+def handle_centinela_handshake(client_id_param: int, device_name: str, license_key: str, hq: str, device_id_param: int, alt_id: str = None) -> dict:
+    """
+    Realiza las consultas y registros en base de datos para la conexión del agente de forma segura y en su propio hilo.
+    """
+    db = SessionLocal()
     try:
         if hq == "1":
-            target_device_id = device_id or client_id
-            try:
-                device = db_init.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == target_device_id).first()
-                if not device:
-                    await websocket.close(code=4001)
-                    return
-                if license_key:
-                    lic = db_init.query(models.License).filter(models.License.license_key == license_key).first()
-                    if not lic or (device.client_id is not None and device.client_id != lic.client_id):
-                        await websocket.close(code=4001)
-                        return
-            except Exception: pass
-            finally:
-                db_init.close()
-                db_init = None
+            target_device_id = device_id_param or client_id_param
+            device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == target_device_id).first()
+            if not device:
+                logger.warning("[HQ-AUTH] Rechazo HQ: device_id=%s no encontrado en DB", target_device_id)
+                return {"status": "close", "code": 4001}
+            if license_key:
+                lic = db.query(models.License).filter(models.License.license_key == license_key).first()
+                # Solo rechazar si la licencia NO existe en absoluto.
+                # No rechazar por mismatch de client_id: puede ocurrir en dispositivos
+                # pendientes de asignación o recién reasignados (device.client_id transiente).
+                if not lic:
+                    logger.warning("[HQ-AUTH] Rechazo HQ: license_key=%s no existe en DB", license_key)
+                    return {"status": "close", "code": 4001}
+            logger.info("[HQ-AUTH] Agente HQ autorizado: device_id=%s", target_device_id)
+            return {"status": "ok", "device_id": target_device_id, "client_id": device.client_id}
 
-            await websocket.accept()
-            logger.info("[HQ-AGENT] Agente HQ conectado: device=%d", target_device_id)
-            try:
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
-                        if chunk:
-                            asyncio.create_task(manager.push_hq_chunk_to_viewers(target_device_id, chunk))
-                    except asyncio.TimeoutError:
-                        try:
-                            await websocket.send_text("ping")
-                        except Exception:
-                            break
-            except WebSocketDisconnect:
-                pass
-            except Exception as e:
-                logger.debug("[HQ-AGENT] Cerrado: %s", e)
-            finally:
-                logger.info("[HQ-AGENT] Agente HQ desconectado: device=%d", target_device_id)
-            return
-
-        # --- Flujo EstÃ¡ndar (No HQ) ---
-        logger.info("[WS] Nueva conexion entrante client_id=%s, device=%s", client_id, device_name)
-        
+        # --- Flujo Estándar (No HQ) ---
         is_pending = False
         lic = None
         if not license_key:
             is_pending = True
         else:
-            lic = db_init.query(models.License).filter(models.License.license_key == license_key).first()
+            lic = db.query(models.License).filter(models.License.license_key == license_key).first()
             if not lic or not lic.is_active or (lic.expiry_date and lic.expiry_date < datetime.utcnow()):
                 is_pending = True
 
         if not is_pending and lic:
-            client_id = lic.client_id
+            resolved_client_id = lic.client_id
             # Validar cupo
-            devices_count = db_init.query(models.CentinelaDevice).filter(models.CentinelaDevice.client_id == lic.client_id).count()
-            existing_device = db_init.query(models.CentinelaDevice).filter(
+            devices_count = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.client_id == lic.client_id).count()
+            existing_device = db.query(models.CentinelaDevice).filter(
                 models.CentinelaDevice.client_id == lic.client_id, 
                 models.CentinelaDevice.device_name == device_name
             ).first()
             
             if not existing_device and devices_count >= lic.max_devices:
-                await websocket.accept()
-                await websocket.send_text(json.dumps({"type": "error", "message": "LÃ­mite de dispositivos excedido"}))
-                await websocket.close(code=1008)
-                return
+                return {"status": "error", "message": "Límite de dispositivos excedido", "code": 1008}
         else:
-            client_id = None
+            resolved_client_id = None
 
         # Buscar o registrar
         if is_pending:
-            # Si es pendiente, usamos el client_id (que es el ID aleatorio del agente) 
-            # como discriminador secundario para evitar colisiones por nombre de PC duplicado.
-            device = db_init.query(models.CentinelaDevice).filter(
+            device = db.query(models.CentinelaDevice).filter(
                 models.CentinelaDevice.device_name == device_name,
-                (models.CentinelaDevice.client_id == client_id) | (models.CentinelaDevice.client_id == None)
+                (models.CentinelaDevice.client_id == resolved_client_id) | (models.CentinelaDevice.client_id == None)
             ).order_by(models.CentinelaDevice.id.desc()).first()
         else:
-            device = db_init.query(models.CentinelaDevice).filter(
-                models.CentinelaDevice.client_id == client_id,
+            device = db.query(models.CentinelaDevice).filter(
+                models.CentinelaDevice.client_id == resolved_client_id,
                 models.CentinelaDevice.device_name == device_name
             ).first()
 
         if not device:
-            device = models.CentinelaDevice(client_id=client_id, device_name=device_name, is_online=True)
-            db_init.add(device)
-            db_init.commit()
-            db_init.refresh(device)
+            device = models.CentinelaDevice(client_id=resolved_client_id, device_name=device_name, is_online=True, alt_remote_id=alt_id)
+            db.add(device)
+            db.commit()
+            db.refresh(device)
         else:
             device.is_online = True
             device.last_seen = datetime.utcnow()
-            db_init.commit()
+            if alt_id:
+                device.alt_remote_id = alt_id
+            db.commit()
 
-        device_id = device.id
+        return {"status": "ok", "device_id": device.id, "client_id": resolved_client_id}
     except Exception as e:
-        logger.error("[WS-INIT] Error: %s", e)
-        return
+        logger.error("[WS-INIT-DB] Error: %s", e)
+        return {"status": "exception", "error": str(e)}
     finally:
-        if db_init is not None:
-            try:
-                db_init.close()
-            except Exception:
-                pass
+        db.close()
+
+
+def save_chat_message(device_id: int, message: str):
+    db = SessionLocal()
+    try:
+        dev = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+        new_chat = models.RemoteChat(
+            device_id=device_id,
+            technician_id=dev.current_technician_id if dev else None,
+            message=message,
+            sender_type='client'
+        )
+        db.add(new_chat)
+        db.commit()
+        logger.info("[CHAT] Mensaje recibido y guardado en DB del cliente")
+    except Exception as e:
+        logger.error(f"[DB] Error guardando chat: {e}")
+    finally:
+        db.close()
+
+
+def save_remote_log(device_id: int, message: str, level: str):
+    db = SessionLocal()
+    try:
+        new_log = models.RemoteLog(
+            device_id=device_id,
+            source="agent",
+            level=level,
+            message=message
+        )
+        db.add(new_log)
+        db.commit()
+        logger.info(f"[DB LOG PC-{device_id}]: {message}")
+    except Exception as e:
+        logger.error(f"Error guardando log en DB: {e}")
+    finally:
+        db.close()
+
+
+def backend_remote_log(device_id: int, message: str, level: str = "INFO"):
+    db = SessionLocal()
+    try:
+        new_log = models.RemoteLog(
+            device_id=device_id,
+            source="backend",
+            level=level,
+            message=message
+        )
+        db.add(new_log)
+        db.commit()
+        logger.info(f"[BACKEND DB LOG PC-{device_id}]: {message}")
+    except Exception as e:
+        logger.error(f"Error guardando backend log en DB: {e}")
+    finally:
+        db.close()
+
+
+def save_device_telemetry(device_id: int, telemetry: dict):
+    db = SessionLocal()
+    try:
+        dev = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+        if dev:
+            if "remote_password" in telemetry:
+                dev.remote_password = telemetry["remote_password"]
+            if "last_erp_update" in telemetry:
+                val = telemetry["last_erp_update"]
+                if isinstance(val, dict):
+                    import json
+                    dev.last_erp_update = json.dumps(val)
+                else:
+                    dev.last_erp_update = str(val)
+            db.commit()
+    except Exception as db_err:
+        logger.error(f"[DB] Error guardando telemetria: {db_err}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def save_windows_credentials(device_id: int, win_user: str, win_pass: str):
+    db = SessionLocal()
+    try:
+        dev = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+        if dev:
+            cred_info = f"--- CREDENCIALES DE WINDOWS REGISTRADAS ---\nUsuario: {win_user or 'No reportado'}\nClave: {win_pass or 'Sin clave'}\nFecha: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n--------------------------------------------"
+            current_notes = dev.notes or ""
+            if "--- CREDENCIALES DE WINDOWS REGISTRADAS ---" in current_notes:
+                lines = current_notes.split("\n")
+                clean_lines = []
+                skip = False
+                for line in lines:
+                    if "--- CREDENCIALES DE WINDOWS REGISTRADAS ---" in line:
+                        skip = True
+                    elif "--------------------------------------------" in line and skip:
+                        skip = False
+                        continue
+                    if not skip:
+                        clean_lines.append(line)
+                current_notes = "\n".join(clean_lines).strip()
+            dev.notes = (cred_info + "\n" + current_notes).strip()
+            db.commit()
+    except Exception as db_err:
+        logger.error(f"[DB] Error guardando credenciales de Windows: {db_err}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def save_alerts_and_get_users(client_id: int, device_name: str, telemetry: dict) -> tuple[list[str], list[str]]:
+    alerts = []
+    tokens = []
+    db = SessionLocal()
+    try:
+        if telemetry.get("cpu", 0) > 85:
+            msg = f"CPU Crítico ({device_name}): {telemetry['cpu']}%"
+            alerts.append(msg)
+            db.add(models.Alert(client_id=client_id, mensaje=msg, severidad="critica"))
+        if telemetry.get("ram", 0) > 90:
+            msg = f"RAM Saturada ({device_name}): {telemetry['ram']}%"
+            alerts.append(msg)
+            db.add(models.Alert(client_id=client_id, mensaje=msg, severidad="critica"))
+
+        if alerts:
+            db.commit()
+            users_with_token = db.query(models.User).filter(models.User.expo_push_token != None).all()
+            tokens = [u.expo_push_token for u in users_with_token]
+    except Exception as db_err:
+        logger.error(f"[DB] Error guardando alertas: {db_err}")
+        db.rollback()
+    finally:
+        db.close()
+    return alerts, tokens
+
+
+def update_last_seen(device_id: int):
+    db = SessionLocal()
+    try:
+        dev = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+        if dev:
+            dev.last_seen = datetime.utcnow()
+            db.commit()
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+def set_device_offline(device_id: int):
+    db = SessionLocal()
+    try:
+        dev = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+        if dev:
+            dev.is_online = False
+            dev.current_technician_id = None
+            dev.session_start = None
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+@app.websocket("/api/ws/centinela/{client_id}")
+async def websocket_centinela(websocket: WebSocket, client_id: int, device_name: str = "Desconocido", license_key: str = Query(""), hq: str = Query(None), device_id: int = Query(None), alt_id: str = Query(None), session_id: int = Query(None)):
+    await websocket.accept()
+    logger.info(f"[WS-HANDSHAKE] Intento de conexion AGENTE device_id={device_id} name={device_name} alt_id={alt_id} session_id={session_id}")
+    
+    # Delegar la lógica pesada de la base de datos del handshake a un hilo secundario
+    res = await asyncio.to_thread(handle_centinela_handshake, client_id, device_name, license_key, hq, device_id, alt_id)
+    
+    if res["status"] == "close":
+        await websocket.close(code=res["code"])
+        return
+    elif res["status"] == "error":
+        await websocket.send_text(json.dumps({"type": "error", "message": res["message"]}))
+        await websocket.close(code=res["code"])
+        return
+    elif res["status"] == "exception":
+        await websocket.close(code=1011) # Error interno del servidor
+        return
+        
+    device_id = res["device_id"]
+    resolved_client_id = res["client_id"]
+    
+    if hq == "1":
+        logger.info("[HQ-AGENT] Agente HQ conectado: device=%d", device_id)
+        backend_remote_log(device_id, "[WS-CONEXIÓN] Agente remoto se conectó con éxito al WebSocket de alta velocidad (HQ)", "INFO")
+        try:
+            total_chunks = 0
+            total_bytes = 0
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(websocket.receive_bytes(), timeout=30.0)
+                    if chunk:
+                        total_chunks += 1
+                        total_bytes += len(chunk)
+                        if total_chunks == 1:
+                            backend_remote_log(device_id, f"[TRÁFICO] Recibido primer chunk binario del agente HQ de {len(chunk)} bytes", "INFO")
+                        if total_chunks % 50 == 0:
+                            backend_remote_log(device_id, f"[TRÁFICO] Recibidos {total_chunks} chunks binarios (total: {total_bytes} bytes) desde el agente", "INFO")
+                        
+                        if total_chunks % 50 == 0 or total_chunks <= 5: # log first few and every 50th chunk
+                            logger.info("[HQ-AGENT] Recibido chunk #%d de %d bytes (total: %d bytes) del device %d", total_chunks, len(chunk), total_bytes, device_id)
+                        asyncio.create_task(manager.push_hq_chunk_to_viewers(device_id, chunk))
+                except asyncio.TimeoutError:
+                    try:
+                        logger.debug("[HQ-AGENT] Tiempo de espera inactivo. Enviando ping al agente %d", device_id)
+                        await websocket.send_text("ping")
+                    except Exception:
+                        break
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.debug("[HQ-AGENT] Cerrado: %s", e)
+            backend_remote_log(device_id, f"[WS-CONEXIÓN] Error en WebSocket HQ del agente: {e}", "ERROR")
+        finally:
+            logger.info("[HQ-AGENT] Agente HQ desconectado: device=%d", device_id)
+            backend_remote_log(device_id, "[WS-CONEXIÓN] Agente HQ desconectado del WebSocket de alta velocidad", "WARNING")
+        return
+
+    # --- Flujo Estándar (No HQ) ---
+    logger.info("[WS] Nueva conexion entrante client_id=%s, device=%s", resolved_client_id, device_name)
     
     try:
-        # Loop principal sin DB persistente
+        # Loop principal sin DB en el hilo principal
         ping_task = asyncio.create_task(server_ping_loop(device_id))
-        await manager.connect(device_id, client_id, websocket)
+        await manager.connect(device_id, resolved_client_id, websocket, session_id=session_id)
+
+        # Enviar mensaje de bienvenida con el device_id real y client_id a la conexión
+        try:
+            await websocket.send_json({
+                "type": "welcome",
+                "device_id": device_id,
+                "client_id": resolved_client_id
+            })
+            logger.info("[WS-WELCOME] Mensaje de bienvenida enviado al agente: device_id=%s, client_id=%s", device_id, resolved_client_id)
+        except Exception as welcome_err:
+            logger.error("[WS-WELCOME] Error al enviar mensaje de bienvenida: %s", welcome_err)
 
         try:
             while True:
@@ -1490,37 +1875,39 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                     logger.warning("[HEARTBEAT] Sin senales del dispositivo. Forzando desconexion.")
                     raise WebSocketDisconnect()
 
-
                 try:
+                    is_active_session = True
+                    if device_id in manager.selected_sessions:
+                        active_ws = manager.device_sessions.get(device_id, {}).get(manager.selected_sessions[device_id])
+                        if active_ws and active_ws != websocket:
+                            is_active_session = False
+
                     if data["type"] in ["screen_frame", "video_frame"]:
-                        frame_data = data.get("image") or data.get("data")
-                        # DIRTY_RECT_START: extraer delta si el agente lo incluyÃ³
-                        delta = data.get("delta")  # None si es frame completo
-                        # DIRTY_RECT_END
-                        # Guardar en RAM como antes (fallback para el endpoint HTTP)
-                        # NOTA: siempre guardamos el frame completo para HTTP polling
-                        if not delta:  # Solo sobreescribir cache con frames completos
-                            manager.client_frames[device_id] = frame_data
-                        # âœ” PUSH INMEDIATO a todos los viewers WS conectados
-                        asyncio.create_task(manager.push_frame_to_viewers(device_id, frame_data, delta))
+                        if is_active_session:
+                            frame_data = data.get("image") or data.get("data")
+                            delta = data.get("delta")  # None si es frame completo
+                            if not delta:  # Solo sobreescribir cache con frames completos
+                                manager.client_frames[device_id] = frame_data
+                            # PUSH INMEDIATO a todos los viewers WS conectados
+                            asyncio.create_task(manager.push_frame_to_viewers(device_id, frame_data, delta))
 
                     elif data["type"] == "chat_message":
                         msg = data.get("message")
-                        db_loop = SessionLocal()
-                        try:
-                            # Buscar el device actual para obtener tÃ©cnico y chat
-                            dev = db_loop.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
-                            new_chat = models.RemoteChat(
-                                device_id=device_id,
-                                technician_id=dev.current_technician_id if dev else None,
-                                message=msg,
-                                sender_type='client'
-                            )
-                            db_loop.add(new_chat)
-                            db_loop.commit()
-                            logger.info("[CHAT] Mensaje recibido del cliente")
-                        finally:
-                            db_loop.close()
+                        # Offload DB call a hilo secundario
+                        asyncio.create_task(asyncio.to_thread(save_chat_message, device_id, msg))
+
+                    elif data["type"] == "remote_log":
+                        log_msg = data.get("msg", "")
+                        level = data.get("level", "DEBUG")
+                        
+                        active_agents = len(manager.active_connections) if hasattr(manager, 'active_connections') else 0
+                        active_viewers = len(manager.viewer_connections) if hasattr(manager, 'viewer_connections') else 0
+                        
+                        backend_info = f" | [BACKEND STATS]: Agentes Activos={active_agents}, Tecnicos Activos={active_viewers}"
+                        final_msg = f"{log_msg}{backend_info}"
+                        
+                        # Offload DB call a hilo secundario
+                        asyncio.create_task(asyncio.to_thread(save_remote_log, device_id, final_msg, level))
 
                     elif data["type"] == "clipboard_sync":
                         text = data.get("text", "")
@@ -1528,7 +1915,6 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                         logger.debug("[CLIPBOARD] Datos recibidos")
 
                     elif data["type"] == "session_list":
-                        # Agente reporta sesiones de Windows activas
                         sessions = data.get("sessions", [])
                         manager.client_sessions[device_id] = sessions
                         # Forwardear a todos los viewers conectados
@@ -1542,96 +1928,31 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                         telemetry = data["data"]
                         manager.client_telemetry[device_id] = telemetry
 
-                        # --- ACTUALIZAR CONTRASEÃ‘A DE SOPORTE Y ULTIMA ACTUALIZACION ERP EN DB ---
+                        # --- ACTUALIZAR CONTRASEÑA DE SOPORTE Y ULTIMA ACTUALIZACION ERP EN DB ---
                         if "remote_password" in telemetry or "last_erp_update" in telemetry:
-                            db_pass = SessionLocal()
-                            try:
-                                dev = db_pass.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
-                                if dev:
-                                    if "remote_password" in telemetry:
-                                        dev.remote_password = telemetry["remote_password"]
-                                    if "last_erp_update" in telemetry:
-                                        val = telemetry["last_erp_update"]
-                                        if isinstance(val, dict):
-                                            import json
-                                            dev.last_erp_update = json.dumps(val)
-                                        else:
-                                            dev.last_erp_update = str(val)
-                                    db_pass.commit()
-                            except Exception as db_err:
-                                logger.error("[DB] Error guardando en base de datos")
-                                db_pass.rollback()
-                            finally:
-                                db_pass.close()
+                            asyncio.create_task(asyncio.to_thread(save_device_telemetry, device_id, telemetry))
 
-                        # --- ACTUALIZAR USUARIO/PASSWORD DE WINDOWS REPORTADO POR EL AGENTE ---
+                        # --- ACTUALIZAR USUARIO/PASSWORD DE WINDOWS ---
                         win_user = telemetry.get("windows_user") or telemetry.get("windows_username") or telemetry.get("win_user")
                         win_pass = telemetry.get("windows_password") or telemetry.get("windows_pass") or telemetry.get("win_pass")
-
                         if win_user or win_pass:
-                            db_win = SessionLocal()
-                            try:
-                                dev = db_win.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
-                                if dev:
-                                    cred_info = f"--- CREDENCIALES DE WINDOWS REGISTRADAS ---\nUsuario: {win_user or 'No reportado'}\nClave: {win_pass or 'Sin clave'}\nFecha: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n--------------------------------------------"
-                                    current_notes = dev.notes or ""
-                                    if "--- CREDENCIALES DE WINDOWS REGISTRADAS ---" in current_notes:
-                                        lines = current_notes.split("\n")
-                                        clean_lines = []
-                                        skip = False
-                                        for line in lines:
-                                            if "--- CREDENCIALES DE WINDOWS REGISTRADAS ---" in line:
-                                                skip = True
-                                            elif "--------------------------------------------" in line and skip:
-                                                skip = False
-                                                continue
-                                            if not skip:
-                                                clean_lines.append(line)
-                                        current_notes = "\n".join(clean_lines).strip()
-                                    dev.notes = (cred_info + "\n" + current_notes).strip()
-                                    db_win.commit()
-                            except Exception as db_err:
-                                logger.error("[DB] Error guardando en base de datos")
-                                db_win.rollback()
-                            finally:
-                                db_win.close()
+                            asyncio.create_task(asyncio.to_thread(save_windows_credentials, device_id, win_user, win_pass))
 
                         # --- PROACTIVE ALERT LOGIC ---
-                        alerts = []
-                        db_alert = SessionLocal()
-                        try:
-                            if telemetry.get("cpu", 0) > 85:
-                                msg = f"CPU CrÃ­tico ({device_name}): {telemetry['cpu']}%"
-                                alerts.append(msg)
-                                db_alert.add(models.Alert(client_id=client_id, mensaje=msg, severidad="critica"))
-                            if telemetry.get("ram", 0) > 90:
-                                msg = f"RAM Saturada ({device_name}): {telemetry['ram']}%"
-                                alerts.append(msg)
-                                db_alert.add(models.Alert(client_id=client_id, mensaje=msg, severidad="critica"))
+                        async def handle_alerts():
+                            alerts, tokens = await asyncio.to_thread(save_alerts_and_get_users, resolved_client_id, device_name, telemetry)
+                            for token in tokens:
+                                asyncio.create_task(send_push_notification(token, f"ALERTA {device_name}", "\n".join(alerts)))
+                            manager.client_alerts[device_id] = alerts
 
-                            if alerts:
-                                db_alert.commit()
-                                users_with_token = db_alert.query(models.User).filter(models.User.expo_push_token != None).all()
-                                for u in users_with_token:
-                                    asyncio.create_task(send_push_notification(u.expo_push_token, f"ALERTA {device_name}", "\n".join(alerts)))
-                        finally:
-                            db_alert.close()
-
-                        manager.client_alerts[device_id] = alerts
+                        asyncio.create_task(handle_alerts())
 
                     elif data["type"] in ["file_list", "file_content", "dir_list"]:
                         manager.client_files[device_id] = data
 
                     elif data["type"] in ["pong", "ping_ack"]:
-                        # Heartbeat: el agente respondiÃ³ al ping del servidor, estÃ¡ vivo
-                        db_pong = SessionLocal()
-                        try:
-                            dev = db_pong.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
-                            if dev:
-                                dev.last_seen = datetime.utcnow()
-                                db_pong.commit()
-                        finally:
-                            db_pong.close()
+                        # Heartbeat: el agente respondió al ping, actualizar last_seen de forma no bloqueante
+                        asyncio.create_task(asyncio.to_thread(update_last_seen, device_id))
 
                 except WebSocketDisconnect:
                     raise
@@ -1642,7 +1963,6 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                         device_name,
                         msg_err,
                     )
-                    # No romper el loop por errores en mensajes individuales
         finally:
             ping_task.cancel()
 
@@ -1651,21 +1971,10 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
     except Exception as e:
         logger.error(f"Error WS: {e}")
     finally:
-        # Poner offline en DB y liberar tÃ©cnico
+        # Poner offline en DB de forma asíncrona no bloqueante
+        await asyncio.to_thread(set_device_offline, device_id)
+        manager.disconnect(device_id, resolved_client_id, websocket=websocket)
 
-            db_offline = SessionLocal()
-            try:
-                dev = db_offline.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
-                if dev:
-                    dev.is_online = False
-                    dev.current_technician_id = None
-                    dev.session_start = None
-                    db_offline.commit()
-            except Exception:
-                db_offline.rollback()
-            finally:
-                db_offline.close()
-            manager.disconnect(device_id, client_id)
 
 
 
@@ -1703,9 +2012,6 @@ async def get_centinela_frame(device_id: int, current_user: models.User = Depend
         manager.last_viewer_notification[device_id] = now
         
     frame = manager.client_frames.get(device_id)
-    if not frame:
-        raise HTTPException(status_code=404, detail="Frame no disponible aÃºn.")
-        
     return {"frame": frame}
 
 @app.get("/api/centinelas/alertas", tags=["Centinela"])
@@ -2292,8 +2598,90 @@ async def update_device_settings(device_id: int, data: dict, db: Session = Depen
 
 @app.get("/api/clients/{client_id}/audit-logs", response_model=List[schemas.AccessLogOut], tags=["Clientes"])
 def get_client_audit_logs(client_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Obtiene el historial de intervenciones tÃ©cnicas para un cliente. """
+    """ Obtiene el historial de intervenciones técnicas para un cliente. """
     return db.query(models.AccessLog).filter(models.AccessLog.client_id == client_id).order_by(models.AccessLog.fecha_creacion.desc()).all()
+
+
+@app.post("/api/centinelas/logs/frontend", tags=["Centinela"])
+def log_frontend_event(device_id: int, message: str, level: str = "INFO", db: Session = Depends(get_db)):
+    new_log = models.RemoteLog(
+        device_id=device_id,
+        source="frontend",
+        level=level,
+        message=message
+    )
+    db.add(new_log)
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.get("/api/centinelas/logs", response_model=List[schemas.RemoteLogOut], tags=["Centinela"])
+def get_centinela_logs(
+    device_id: Optional[int] = Query(None),
+    source: Optional[str] = Query(None),
+    level: Optional[str] = Query(None),
+    limit: int = Query(100),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """ Obtiene la bitácora de logs de telemetría de todos los dispositivos o filtrado por dispositivo. """
+    query = db.query(
+        models.RemoteLog.id,
+        models.RemoteLog.device_id,
+        models.RemoteLog.source,
+        models.RemoteLog.level,
+        models.RemoteLog.message,
+        models.RemoteLog.timestamp,
+        models.CentinelaDevice.device_name.label("device_name")
+    ).outerjoin(
+        models.CentinelaDevice, models.RemoteLog.device_id == models.CentinelaDevice.id
+    )
+
+    if device_id is not None:
+        query = query.filter(models.RemoteLog.device_id == device_id)
+    if source:
+        query = query.filter(models.RemoteLog.source == source)
+    if level:
+        query = query.filter(models.RemoteLog.level == level)
+
+    results = query.order_by(models.RemoteLog.id.desc()).limit(limit).all()
+    
+    return [
+        {
+            "id": r.id,
+            "device_id": r.device_id,
+            "source": r.source,
+            "level": r.level,
+            "message": r.message,
+            "timestamp": r.timestamp,
+            "device_name": r.device_name if r.device_id else "Servidor Backend"
+        }
+        for r in results
+    ]
+
+
+@app.post("/api/centinelas/logs/clear", tags=["Centinela"])
+def clear_centinela_logs(
+    device_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """ Permite limpiar la bitácora de logs. Si se pasa device_id, solo limpia ese dispositivo. """
+    try:
+        query = db.query(models.RemoteLog)
+        if device_id is not None:
+            query = query.filter(models.RemoteLog.device_id == device_id)
+            msg = f"Logs eliminados para el dispositivo ID {device_id}."
+        else:
+            msg = "Bitácora completa de logs eliminada."
+        
+        query.delete(synchronize_session=False)
+        db.commit()
+        return {"status": "success", "message": msg}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al limpiar logs: {str(e)}")
+
 
 
 

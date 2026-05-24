@@ -53,6 +53,7 @@ class CentinelaDeviceBase(BaseModel):
     client_id: Optional[int] = None
     device_name: str
     remote_password: Optional[str] = None
+    alt_remote_id: Optional[str] = None
 
 class ProposedClientOut(BaseModel):
     id: int
@@ -293,3 +294,21 @@ class SupportSessionOut(SupportSessionBase):
 
     class Config:
         from_attributes = True
+
+# =======================
+# ESQUEMAS PARA REMOTE LOGS (TELEMETRIA LOGS)
+# =======================
+class RemoteLogBase(BaseModel):
+    device_id: Optional[int] = None
+    source: str  # 'agent' o 'backend'
+    level: str = "INFO"
+    message: str
+
+class RemoteLogOut(RemoteLogBase):
+    id: int
+    timestamp: datetime
+    device_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
