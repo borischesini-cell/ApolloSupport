@@ -2506,15 +2506,16 @@ export default function App() {
             {/* Indicador de calidad de conexión en tiempo real */}
             {(session.is_online || frame) && (
               <span className={`text-[9px] sm:text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1.5 border font-mono ${
-                connectionQuality === 'excellent' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+                (connectionFps <= 2 || connectionQuality === 'excellent') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
                 connectionQuality === 'good'      ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
                                                     'bg-red-500/10 text-red-400 border-red-500/20 animate-pulse'
               }`} title={`Calidad: ${connectionQuality} | ${connectionFps} FPS (objetivo trabajo ≥${REMOTE_STREAM_WORKABLE_FPS})`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${
-                  connectionQuality === 'excellent' ? 'bg-emerald-400' :
+                  (connectionFps <= 2 || connectionQuality === 'excellent') ? 'bg-emerald-400' :
                   connectionQuality === 'good'      ? 'bg-amber-400' : 'bg-red-400 animate-ping'
                 }`} />
-                {connectionFps} FPS · {
+                {connectionFps <= 2 ? 'Estable' : `${connectionFps} FPS`} · {
+                  connectionFps <= 2 ? 'Óptima' :
                   connectionQuality === 'excellent' ? 'Cómoda' :
                   connectionQuality === 'good'      ? 'Mínima útil' : 'Bajo mínimo'
                 }

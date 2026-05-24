@@ -2259,8 +2259,7 @@ def main():
 
         # Inicializar mss UNA sola vez fuera del loop.
         sct = None
-        use_imagegrab = False
-        use_gdi = False
+        use_gdi = True
         try:
             sct = _mss.mss()
             logger.info("[CAPTURA] mss inicializado OK (%d monitores detectados)", len(sct.monitors) - 1)
