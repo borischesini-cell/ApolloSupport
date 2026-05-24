@@ -2372,23 +2372,24 @@ def main():
                         if screenshot is None:
                             gdi_failures += 1
                             if gdi_failures % 30 == 1:
-                                logger.error("[CAPTURA] GDI falla persistentemente")
-                            time.sleep(1.0)
-                            continue
-                    elif use_imagegrab or sct is None:
-                        screenshot = ImageGrab.grab()
-                    else:
-                        monitor_idx = ACTIVE_MONITOR
-                        if monitor_idx >= len(sct.monitors):
-                            monitor_idx = 1
-                        monitor = sct.monitors[monitor_idx]
-                        sct_img = sct.grab(monitor)
-                        screenshot = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                        # Fallback si la captura es negra (ventana minimizada / RDP inactivo)
-                        if _is_black_frame(screenshot):
-                            alt = _capture_printwindow_fallback()
-                            if alt and not _is_black_frame(alt):
-                                screenshot = alt
+                                logger.warning("[CAPTURA] GDI no disponible en esta sesion, usando mss/ImageGrab")
+                            use_gdi = False
+
+                    if not use_gdi:
+                        if use_imagegrab or sct is None:
+                            screenshot = ImageGrab.grab()
+                        else:
+                            monitor_idx = ACTIVE_MONITOR
+                            if monitor_idx >= len(sct.monitors):
+                                monitor_idx = 1
+                            monitor = sct.monitors[monitor_idx]
+                            sct_img = sct.grab(monitor)
+                            screenshot = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                            # Fallback si la captura es negra (ventana minimizada / RDP inactivo)
+                            if _is_black_frame(screenshot):
+                                alt = _capture_printwindow_fallback()
+                                if alt and not _is_black_frame(alt):
+                                    screenshot = alt
 
                     with STREAM_OPTS_LOCK:
                         mw_cap = STREAM_OPTS["max_width"]
