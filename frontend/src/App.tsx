@@ -875,41 +875,13 @@ export default function App() {
 
   useEffect(() => {
     if (!wsViewerConnected || !viewerStreamDeviceId || streamPreset !== 'auto' || hqEnabled) return;
+    // Arrancar siempre en calidad máxima y NO bajar nunca automáticamente.
+    // El autoajuste agresivo causaba set_stream_params constantes que interrumpían el flujo.
     streamAutoTierRef.current = 3;
     streamLowFpsStreakRef.current = 0;
     streamHighFpsStreakRef.current = 0;
     sendStreamTier(3);
-    const id = window.setInterval(() => {
-      const fps = connectionFpsRef.current;
-      let t = streamAutoTierRef.current;
-      if (fps < REMOTE_STREAM_WORKABLE_FPS) {
-        streamLowFpsStreakRef.current += 1;
-        streamHighFpsStreakRef.current = 0;
-        const urgent = fps <= 3;
-        const needDown =
-          urgent ? streamLowFpsStreakRef.current >= 1 : streamLowFpsStreakRef.current >= 2;
-        if (needDown && t > 0) {
-          t -= 1;
-          streamLowFpsStreakRef.current = 0;
-        }
-      } else {
-        streamLowFpsStreakRef.current = 0;
-        if (fps >= REMOTE_STREAM_COMFORTABLE_FPS) {
-          streamHighFpsStreakRef.current += 1;
-          if (streamHighFpsStreakRef.current >= 3 && t < 3) {
-            t += 1;
-            streamHighFpsStreakRef.current = 0;
-          }
-        } else {
-          streamHighFpsStreakRef.current = 0;
-        }
-      }
-      if (t !== streamAutoTierRef.current) {
-        streamAutoTierRef.current = t;
-        sendStreamTier(t);
-      }
-    }, 2000);
-    return () => window.clearInterval(id);
+    // No hay intervalo de ajuste automático — el usuario puede cambiar manualmente con el selector.
   }, [wsViewerConnected, viewerStreamDeviceId, streamPreset, hqEnabled, sendStreamTier]);
 
   /* Stream quality selector (compact, reused in header + fullscreen bar) */
@@ -2506,18 +2478,19 @@ export default function App() {
             {/* Indicador de calidad de conexión en tiempo real */}
             {(session.is_online || frame) && (
               <span className={`text-[9px] sm:text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1.5 border font-mono ${
-                (connectionFps <= 2 || connectionQuality === 'excellent') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+                wsViewerConnected && connectionFps === 0 ? 'bg-slate-500/10 text-slate-400 border-slate-500/20' :
+                connectionQuality === 'excellent' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
                 connectionQuality === 'good'      ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
                                                     'bg-red-500/10 text-red-400 border-red-500/20 animate-pulse'
-              }`} title={`Calidad: ${connectionQuality} | ${connectionFps} FPS (objetivo trabajo ≥${REMOTE_STREAM_WORKABLE_FPS})`}>
+              }`} title={`Calidad: ${connectionQuality} | ${connectionFps} FPS`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${
-                  (connectionFps <= 2 || connectionQuality === 'excellent') ? 'bg-emerald-400' :
+                  wsViewerConnected && connectionFps === 0 ? 'bg-slate-400 animate-pulse' :
+                  connectionQuality === 'excellent' ? 'bg-emerald-400' :
                   connectionQuality === 'good'      ? 'bg-amber-400' : 'bg-red-400 animate-ping'
                 }`} />
-                {connectionFps <= 2 ? 'Estable' : `${connectionFps} FPS`} · {
-                  connectionFps <= 2 ? 'Óptima' :
-                  connectionQuality === 'excellent' ? 'Cómoda' :
-                  connectionQuality === 'good'      ? 'Mínima útil' : 'Bajo mínimo'
+                {wsViewerConnected && connectionFps === 0 ? 'Espera' :
+                 connectionQuality === 'excellent' ? `${connectionFps} FPS · Cómoda` :
+                 connectionQuality === 'good'      ? `${connectionFps} FPS · Útil` : `${connectionFps} FPS · Bajo`
                 }
               </span>
             )}
