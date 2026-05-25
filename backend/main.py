@@ -1885,6 +1885,17 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                             is_active_session = False
 
                     if data["type"] in ["screen_frame", "video_frame"]:
+                        # AUTO-PROMOCIÓN: si el frame viene de una sesion no-activa,
+                        # la promovemos inmediatamente. La sesion que envía frames ES la correcta.
+                        if not is_active_session:
+                            for s_id, ws in manager.device_sessions.get(device_id, {}).items():
+                                if ws == websocket:
+                                    manager.selected_sessions[device_id] = s_id
+                                    manager.active_connections[device_id] = ws
+                                    is_active_session = True
+                                    logger.info(f"[WS-AUTOPROMOTE] Sesion {s_id} promovida: es la que envía frames (device {device_id})")
+                                    break
+
                         if is_active_session:
                             frame_data = data.get("image") or data.get("data")
                             delta = data.get("delta")  # None si es frame completo
@@ -1892,6 +1903,7 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                                 manager.client_frames[device_id] = frame_data
                             # PUSH INMEDIATO a todos los viewers WS conectados
                             asyncio.create_task(manager.push_frame_to_viewers(device_id, frame_data, delta))
+
 
                     elif data["type"] == "chat_message":
                         msg = data.get("message")
