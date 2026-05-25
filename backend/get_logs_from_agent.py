@@ -20,7 +20,7 @@ try:
     access_token = auth.create_access_token(data={"sub": user.email, "rol": user.rol})
     print(f"Token generated successfully.")
     
-    device_id = 765
+    device_id = 773
     log_paths = [
         r"C:\ProgramData\ApolloSupport\centinela_config.json",
         r"C:\ProgramData\ApolloSupport\ffmpeg_hq.log",

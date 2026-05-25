@@ -1146,9 +1146,11 @@ class ConnectionManager:
                     pass
             self.device_sessions[device_id][session_id] = websocket
             
-            # Si no hay ninguna sesion seleccionada para este dispositivo, esta sesion inicial sera la seleccionada
-            if device_id not in self.selected_sessions:
+            # Autopromoción: Si no hay ninguna seleccionada, o si la seleccionada es Session 0 (servicio sin GUI) y conecta una sesión interactiva (>0), la seleccionamos como activa.
+            current_selected = self.selected_sessions.get(device_id)
+            if (device_id not in self.selected_sessions) or (current_selected == 0 and session_id != 0 and session_id is not None):
                 self.selected_sessions[device_id] = session_id
+                logger.info(f"[WS-PROMOTION] Promoviendo sesion {session_id} como activa frente a {current_selected}")
         else:
             # Fallback si no tiene session_id (agentes viejos)
             # Evitar colisión de múltiples agentes en el mismo ID de dispositivo
@@ -2004,6 +2006,12 @@ async def get_centinela_frame(device_id: int, current_user: models.User = Depend
                 active_viewers.append(u_name)
         for u_id in to_delete:
             del manager.device_viewers[device_id][u_id]
+
+        # Evitar pausar captura si hay viewers activos vía WebSockets (normal o HQ)
+        has_ws_viewers = (device_id in manager.viewer_connections and len(manager.viewer_connections[device_id]) > 0) or \
+                         (device_id in manager.hq_viewer_connections and len(manager.hq_viewer_connections[device_id]) > 0)
+        if has_ws_viewers:
+            active_viewers.append("Soporte Web (WS)")
             
         await manager.send_json_safe(device_id, {
             "type": "active_technicians",
