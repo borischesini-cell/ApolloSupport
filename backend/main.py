@@ -173,8 +173,8 @@ async def periodic_viewer_cleanup():
             
             # Limpiar espectadores inactivos para todos los dispositivos activos
             for device_id in list(manager.active_connections.keys()):
-                if device_id in manager.device_viewers:
-                    viewers_dict = manager.device_viewers[device_id]
+                if True:
+                    viewers_dict = manager.device_viewers.setdefault(device_id, {})
                     to_delete = []
                     active_viewers = []
                     
@@ -192,10 +192,10 @@ async def periodic_viewer_cleanup():
                     # Notificar al cliente con la lista actualizada de técnicos activos (que puede estar vacía)
                     # OJO: Si hay viewers por WS, no enviar array vacio, usar un placeholder
                     final_viewers = list(active_viewers)
-                    has_ws_viewers = device_id in manager.viewer_connections and len(manager.viewer_connections[device_id]) > 0
+                    has_ws_viewers = (device_id in manager.viewer_connections and len(manager.viewer_connections[device_id]) > 0) or manager.has_hq_viewers(device_id)
                     
                     if len(final_viewers) == 0 and has_ws_viewers:
-                        final_viewers = ["Soporte (WS)"]
+                        final_viewers = ["Soporte Web (WS)"]
 
                     if to_delete or has_ws_viewers:
                         await manager.send_json_safe(device_id, {
@@ -205,7 +205,7 @@ async def periodic_viewer_cleanup():
                         manager.last_viewer_notification[device_id] = now
 
                     # Autoliberación de PC en DB si no quedan espectadores activos (ni standard WS, ni HQ WS, ni HTTP polling)
-                    if len(viewers_dict) == 0 and not manager.has_hq_viewers(device_id) and not has_ws_viewers:
+                    if len(viewers_dict) == 0 and not has_ws_viewers:
                         await asyncio.to_thread(_db_cleanup_device_on_idle_viewers, device_id)
         except Exception as e:
             logger.error(f"[CLEANUP ERROR] Error en limpieza periÃ³dica de espectadores: {e}")
@@ -1337,23 +1337,24 @@ class ConnectionManager:
             self._chunk_counts = {}
         self._chunk_counts[device_id] = self._chunk_counts.get(device_id, 0) + 1
 
-        if device_id not in self.hq_viewer_connections:
+        if device_id not in self.viewer_connections:
             if self._chunk_counts[device_id] % 100 == 1:
                 backend_remote_log(device_id, f"[BACKEND-TRANSMISIÓN] Recibiendo video H.264 (chunk #{self._chunk_counts[device_id]}, {len(chunk)} bytes) del agente pero ignorándolo: NO hay visores conectados en este WebSocket", "WARNING")
             return
         
-        viewers_count = len(self.hq_viewer_connections[device_id])
+        viewers_count = len(self.viewer_connections[device_id])
         logger.info("[HQ-FORWARD] Reenviando chunk de %d bytes del agente %d a %d viewers", len(chunk), device_id, viewers_count)
         
         if self._chunk_counts[device_id] % 100 == 1:
             backend_remote_log(device_id, f"[BACKEND-TRANSMISIÓN] Reenviando chunk de video H.264 #{self._chunk_counts[device_id]} ({len(chunk)} bytes) a {viewers_count} visor(es) conectado(s)", "INFO")
         
         dead = []
-        for ws_id, ws in list(self.hq_viewer_connections[device_id].items()):
-            lock = self.hq_viewer_write_locks.get(ws_id)
+        for ws_id, ws in list(self.viewer_connections[device_id].items()):
+            # Use viewer_write_locks to avoid concurrent JSON and binary writes
+            lock = self.viewer_write_locks.get(ws_id)
             if lock is None:
                 lock = asyncio.Lock()
-                self.hq_viewer_write_locks[ws_id] = lock
+                self.viewer_write_locks[ws_id] = lock
             try:
                 async with lock:
                     await ws.send_bytes(chunk)
@@ -1361,8 +1362,8 @@ class ConnectionManager:
                 logger.error("[HQ-FORWARD-ERROR] Error enviando bytes a viewer %s: %s", ws_id, e)
                 dead.append(ws_id)
         for ws_id in dead:
-            self.hq_viewer_connections[device_id].pop(ws_id, None)
-            self.hq_viewer_write_locks.pop(ws_id, None)
+            self.viewer_connections[device_id].pop(ws_id, None)
+            self.viewer_write_locks.pop(ws_id, None)
             logger.info("[VIEWER] Viewer HQ %s desconectado de device %d", ws_id, device_id)
 
 
@@ -1867,6 +1868,28 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
             logger.info("[WS-WELCOME] Mensaje de bienvenida enviado al agente: device_id=%s, client_id=%s", device_id, resolved_client_id)
         except Exception as welcome_err:
             logger.error("[WS-WELCOME] Error al enviar mensaje de bienvenida: %s", welcome_err)
+
+        # Notificar al agente inmediatamente si hay viewers conectados
+        try:
+            active_viewers = []
+            if device_id in manager.viewer_connections and len(manager.viewer_connections[device_id]) > 0:
+                active_viewers.append("Soporte (WS)")
+            if device_id in manager.device_viewers:
+                now = datetime.utcnow()
+                for u_id, (u_name, last_seen) in manager.device_viewers[device_id].items():
+                    if (now - last_seen).total_seconds() <= 8.0:
+                        if u_name not in active_viewers:
+                            active_viewers.append(u_name)
+            
+            if active_viewers:
+                await websocket.send_json({
+                    "type": "active_technicians",
+                    "technicians": active_viewers
+                })
+                logger.info("[WS-WELCOME] Agente notificado de viewers activos inmediatamente: %s", active_viewers)
+        except Exception as welcome_notify_err:
+            logger.error("[WS-WELCOME] Error al notificar al agente de viewers activos: %s", welcome_notify_err)
+
 
         try:
             while True:

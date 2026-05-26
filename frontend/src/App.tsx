@@ -13,6 +13,7 @@ import {
   getCentinelaLogs, clearCentinelaLogs,
 } from './api';
 import Login from './Login';
+import JMuxer from 'jmuxer';
 
 const triggerPushNotification = (title: string, body: string, url: string = '/') => {
   if ('Notification' in window && Notification.permission === 'granted') {
@@ -806,6 +807,34 @@ export default function App() {
       applyFrame(base64, delta);
       setWsViewerConnected(true);
     },
+    onHqChunk: (chunk) => {
+      setWsViewerConnected(true);
+      if (jmuxerRef.current) {
+          const newData = new Uint8Array(chunk);
+          if (hqBufferRef.current.length === 0) {
+              hqBufferRef.current = newData;
+          } else {
+              const combined = new Uint8Array(hqBufferRef.current.length + newData.length);
+              combined.set(hqBufferRef.current);
+              combined.set(newData, hqBufferRef.current.length);
+              hqBufferRef.current = combined;
+          }
+
+          let lastStartCodeIdx = -1;
+          for (let i = hqBufferRef.current.length - 4; i >= 0; i--) {
+              if (hqBufferRef.current[i] === 0 && hqBufferRef.current[i+1] === 0 && hqBufferRef.current[i+2] === 0 && hqBufferRef.current[i+3] === 1) {
+                  lastStartCodeIdx = i;
+                  break;
+              }
+          }
+
+          if (lastStartCodeIdx > 0) {
+              const completeNalus = hqBufferRef.current.slice(0, lastStartCodeIdx);
+              hqBufferRef.current = hqBufferRef.current.slice(lastStartCodeIdx);
+              jmuxerRef.current.feed({ video: completeNalus });
+          }
+      }
+    },
     onQuality: (fps, quality) => {
       setConnectionFps(fps);
       setConnectionQuality(quality);
@@ -834,6 +863,32 @@ export default function App() {
     (hqStorageKey && localStorage.getItem(hqStorageKey) === 'true') ? 'open' : 'off'
   );
   const [hqReconnectAttempt, setHqReconnectAttempt] = useState(0);
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const jmuxerRef = useRef<any>(null);
+  const hqBufferRef = useRef<Uint8Array>(new Uint8Array(0));
+
+  useEffect(() => {
+    if (hqEnabled && hqState === 'open' && videoRef.current && !jmuxerRef.current) {
+      console.log('[JMUXER NALU START] Inicializando decodificador robusto H.264...');
+      hqBufferRef.current = new Uint8Array(0);
+      jmuxerRef.current = new JMuxer({
+          node: videoRef.current,
+          mode: 'video',
+          flushingTime: 10,
+          fps: 24,
+          debug: false,
+          onError: (data: any) => console.error('[JMUXER] Error:', data)
+      });
+      videoRef.current.play().catch(() => {});
+      
+    } else if (!hqEnabled && jmuxerRef.current) {
+      console.log('[JMUXER NALU STOP] Destruyendo decodificador.');
+      jmuxerRef.current.destroy();
+      jmuxerRef.current = null;
+      hqBufferRef.current = new Uint8Array(0);
+    }
+  }, [hqEnabled, hqState]);
   // ────────────────────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -962,8 +1017,13 @@ export default function App() {
     };
   }, [hqDeviceId, logFrontendToBackend]);
 
-  // MSE and useHqViewerWebSocket have been removed in favor of MJPEG Turbo
-  // via the standard viewer websocket.
+  useEffect(() => {
+    // Si la página se recargó y hqEnabled quedó en true por localStorage,
+    // debemos avisarle al servidor apenas conectemos el WS para que empiece a mandar H.264
+    if (wsViewerConnected && hqEnabled) {
+      sendViewerCommand({ type: 'start_hq' });
+    }
+  }, [wsViewerConnected, hqEnabled, sendViewerCommand]);
 
   const toggleHqMode = () => {
     const next = !hqEnabled;
@@ -1897,6 +1957,9 @@ export default function App() {
     } else if (target instanceof HTMLCanvasElement) {
       originalWidth = target.width;
       originalHeight = target.height;
+    } else if (target instanceof HTMLVideoElement) {
+      originalWidth = target.videoWidth;
+      originalHeight = target.videoHeight;
     }
 
     if (!originalWidth || !originalHeight) return null;
@@ -2693,7 +2756,7 @@ export default function App() {
             onMouseMove={isViewerFullscreen ? resetToolbarTimer : undefined}
             style={{ cursor: isViewerFullscreen ? (toolbarVisible ? 'default' : 'none') : 'default' }}
           >
-            {(frame || latestLiveFrameRef.current || wsViewerConnected) ? (
+            {(hqEnabled || frame || latestLiveFrameRef.current || wsViewerConnected) ? (
               <div className="relative w-full h-full flex items-center justify-center">
                 <canvas
                   ref={setLiveCanvasRef}
@@ -2702,11 +2765,21 @@ export default function App() {
                   onDoubleClick={(e) => handleImageInteraction(e, session.id, 'double')}
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
                   onWheel={(e) => handleImageWheel(e, session.id)}
-                  style={{ display: 'block' }}
+                  style={{ display: hqState === 'open' ? 'none' : 'block' }}
                   className={`w-full h-full object-contain cursor-default select-none transition-all duration-500 ${(!session.is_online && !frame) ? 'filter blur-[4px] brightness-[0.35] grayscale contrast-75' : ''}`}
                 />
-
-                {/* Video HQ MSE removido en favor de MJPEG sobre WebSocket estandar */}
+                
+                <video
+                  ref={videoRef}
+                  autoPlay muted playsInline
+                  onMouseDown={(e) => handleMouseDown(e, session.id)}
+                  onMouseUp={(e) => handleMouseUp(e, session.id)}
+                  onDoubleClick={(e) => handleImageInteraction(e, session.id, 'double')}
+                  onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                  onWheel={(e) => handleImageWheel(e, session.id)}
+                  style={{ display: hqState === 'open' ? 'block' : 'none' }}
+                  className="w-full h-full object-contain"
+                />
 
                 {/* Overlay Estético de Conexión Perdida (NUEVO) */}
                 {(!session.is_online && !frame) && (

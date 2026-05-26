@@ -69,12 +69,13 @@ interface ViewerWsOptions {
   onFrame: (base64: string, delta?: DeltaMeta) => void;
   onQuality?: (fps: number, quality: ConnectionQuality) => void;
   onMessage?: (msg: Record<string, unknown>) => void;  // para session_list, login_result, etc.
+  onHqChunk?: (chunk: ArrayBuffer) => void; // Manejador de chunks binarios H.264
   /** Se llama al cerrar el socket (antes de reintentar). Reactiva polling HTTP si el WS no entrega. */
   onClose?: () => void;
 }
 
 
-export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMessage, onClose }: ViewerWsOptions) {
+export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMessage, onClose, onHqChunk }: ViewerWsOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -119,8 +120,34 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
       }, 10000);
     };
 
-    ws.onmessage = (event) => {
+    ws.onmessage = async (event) => {
       if (!mountedRef.current) return;
+      
+      // Manejar chunks binarios de HQ (H.264)
+      if (event.data instanceof Blob) {
+        console.log('[WS] Recibido BLOB binario. Tamaño:', event.data.size, 'onHqChunk:', !!onHqChunk);
+        if (onHqChunk) {
+            onHqChunk(await event.data.arrayBuffer());
+            
+            // Reusar el calculador de FPS para HQ
+            const now = performance.now();
+            frameTimestampsRef.current.push(now);
+            const twoSecsAgo = now - 2000;
+            frameTimestampsRef.current = frameTimestampsRef.current.filter(t => t > twoSecsAgo);
+            
+            if (!lastQualityUpdateRef.current || now - lastQualityUpdateRef.current >= 2000) {
+              const fps = Math.round(frameTimestampsRef.current.length / 2);
+              onQuality?.(fps, connectionQualityFromFps(fps));
+              lastQualityUpdateRef.current = now;
+            }
+        }
+        return;
+      }
+      
+      if (typeof event.data !== 'string') {
+        console.log('[WS] Recibido dato desconocido no-string y no-blob:', typeof event.data, event.data);
+      }
+
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'frame' && data.frame) {

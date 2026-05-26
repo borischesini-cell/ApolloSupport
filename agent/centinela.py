@@ -267,12 +267,13 @@ LATEST_FRAME_PACKET = None  # dict {"frame": b64, "delta": {x,y,w,h,fw,fh} | Non
 # ROLLBACK: el modo HQ solo se activa cuando el backend envÃ­a "start_hq".
 #           Si el backend no lo envÃ­a, este cÃ³digo nunca se ejecuta.
 HQ_MODE_ACTIVE   = False
+HQ_TASK          = None
 HQ_FFMPEG_PROC   = None   # subprocess del ffmpeg en curso
 # Stream JPEG/WebP vía WebSocket: el técnico ajusta desde el visor (set_stream_params).
 # max_width 0 = resolución nativa del monitor (máxima calidad por defecto).
 STREAM_OPTS_LOCK = threading.Lock()
 STREAM_OPTS = {
-    "max_width": int(os.environ.get("APOLLO_JSON_STREAM_MAX_WIDTH", "0")),
+    "max_width": int(os.environ.get("APOLLO_JSON_STREAM_MAX_WIDTH", "1366")),
     "webp_still": int(os.environ.get("APOLLO_WEBP_STILL", "82")),
     "webp_motion": int(os.environ.get("APOLLO_WEBP_MOTION", "58")),
 }
@@ -638,7 +639,8 @@ def get_system_info_extended() -> dict:
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1).InstalledOn.ToString('yyyy-MM-dd')"],
-                capture_output=True, text=True, timeout=8
+                capture_output=True, text=True, timeout=8,
+                creationflags=0x08000000 if os.name == 'nt' else 0
             )
             val = result.stdout.strip()
             info["last_windows_update"] = val if val else "No disponible"
@@ -650,7 +652,8 @@ def get_system_info_extended() -> dict:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "(Get-WmiObject -query 'select * from SoftwareLicensingProduct where LicenseStatus=1 and Name like \"Windows%\"').LicenseStatus"],
-            capture_output=True, text=True, timeout=8
+            capture_output=True, text=True, timeout=8,
+            creationflags=0x08000000 if os.name == 'nt' else 0
         )
         val = result.stdout.strip()
         info["windows_activated"] = "Activado" if val == "1" else ("No activado" if val else "Desconocido")
@@ -725,7 +728,8 @@ def get_system_info_extended() -> dict:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-WmiObject -Namespace root/SecurityCenter2 -Class AntiVirusProduct | Select-Object -ExpandProperty displayName"],
-            capture_output=True, text=True, timeout=8
+            capture_output=True, text=True, timeout=8,
+            creationflags=0x08000000 if os.name == 'nt' else 0
         )
         av_list = [x.strip() for x in result.stdout.strip().splitlines() if x.strip()]
         info["antivirus"] = ", ".join(av_list) if av_list else "No detectado"
@@ -829,7 +833,7 @@ def request_session_switch(target_session_id: int, username: str = '', password:
 
 
 async def send_telemetry(lbl_status):
-    global LIC_KEY, SERVER_WS_URL, HAS_ACTIVE_VIEWER, HQ_MODE_ACTIVE, HQ_FFMPEG_PROC
+    global LIC_KEY, SERVER_WS_URL, HAS_ACTIVE_VIEWER, HQ_MODE_ACTIVE, HQ_FFMPEG_PROC, HQ_TASK
     reconnect_delay = 5  # Backoff exponencial: empieza en 5s
 
     while True:
@@ -1347,18 +1351,25 @@ async def send_telemetry(lbl_status):
                                     logger.warning("[STREAM] set_stream_params inválido: %s", e)
 
                             elif data.get("type") == "start_hq":
-                                # Backend pide iniciar modo Alto Rendimiento (MJPEG Turbo)
-                                if not HQ_MODE_ACTIVE:
-                                    HQ_MODE_ACTIVE = True
-                                    logger.info("[HQ] Modo Alto Rendimiento (WebP Turbo Canvas) activado")
-                                    # asyncio.create_task(hq_stream_loop(REAL_DEVICE_ID, LIC_KEY)) # Deshabilitado FFmpeg redundante
-                                else:
-                                    logger.debug("[HQ] start_hq recibido pero ya activo")
+                                # Backend pide iniciar modo Alto Rendimiento
+                                if HQ_MODE_ACTIVE and HQ_TASK is not None:
+                                    logger.info("[HQ] Reiniciando stream H.264 para forzar cabeceras (moov)")
+                                    HQ_MODE_ACTIVE = False
+                                    try: HQ_TASK.cancel()
+                                    except: pass
+                                
+                                HQ_MODE_ACTIVE = True
+                                logger.info("[HQ] Modo Alto Rendimiento activado")
+                                HQ_TASK = asyncio.create_task(hq_stream_loop(REAL_DEVICE_ID, LIC_KEY))
 
                             elif data.get("type") == "stop_hq":
                                 # Backend pide detener modo HQ (no quedan viewers HQ)
                                 HQ_MODE_ACTIVE = False
-                                logger.info("[HQ] Modo Alto Rendimiento (WebP Turbo Canvas) desactivado")
+                                if HQ_TASK is not None:
+                                    try: HQ_TASK.cancel()
+                                    except: pass
+                                    HQ_TASK = None
+                                logger.info("[HQ] Modo Alto Rendimiento desactivado")
 
                             elif data.get("type") == "get_sessions":
                                 # Técnico solicita lista de sesiones Windows
@@ -1457,7 +1468,7 @@ async def hq_stream_loop(device_id: int, license_key: str):
     encoder_args, encoder_name = _detect_best_encoder()
     logger.info(f"[HQ] Encoder seleccionado: {encoder_name}")
 
-    TARGET_FPS = 50  # 50 FPS estables y reales
+    TARGET_FPS = 24  # 24 FPS estables y reales (cine)
     KEYFRAME_INTERVAL = TARGET_FPS
 
     ffmpeg_cmd = [
@@ -1470,14 +1481,11 @@ async def hq_stream_loop(device_id: int, license_key: str):
         '-pix_fmt', 'bgr24',
         '-framerate', str(TARGET_FPS),
         '-i', '-',
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', # Asegurar dimensiones pares para H.264
+        '-vf', 'format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2', # Forzar pixel format y dimensiones pares
     ] + encoder_args + [
         '-g', str(KEYFRAME_INTERVAL),
         '-keyint_min', str(KEYFRAME_INTERVAL),
-        '-sc_threshold', '0',
-        '-pix_fmt', 'yuv420p',
-        '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'h264',
         'pipe:1'
     ]
 
@@ -1486,7 +1494,8 @@ async def hq_stream_loop(device_id: int, license_key: str):
     except: hq_log_file = subprocess.DEVNULL
 
     try:
-        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=hq_log_file, bufsize=10**7)
+        creation_flags = 0x08000000 if os.name == 'nt' else 0 # CREATE_NO_WINDOW
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=hq_log_file, bufsize=10**7, creationflags=creation_flags)
         HQ_FFMPEG_PROC = proc
     except Exception as e:
         logger.error("[HQ] No se pudo iniciar ffmpeg: %s", e)
@@ -1510,19 +1519,21 @@ async def hq_stream_loop(device_id: int, license_key: str):
             mv_buf = memoryview(buf)
             
             try:
+                loop = asyncio.get_event_loop()
                 while HQ_MODE_ACTIVE and proc.poll() is None:
                     t0 = time.perf_counter()
-                    gdi32.BitBlt(hdc_mem, 0, 0, target_w, target_h, hdc_screen, 0, 0, 0x00CC0020)
-                    gdi32.GetDIBits(hdc_mem, hbm, 0, target_h, buf, bmi, 0)
-
-                    sample = mv_buf[::max(1, frame_size_bgr24 // 1024)][:1024]
-                    h = hash(sample.tobytes())
                     
-                    if h != last_frame_hash_quick:
-                        last_frame_hash_quick = h
-                        try:
-                            proc.stdin.write(buf.raw)
-                        except: break
+                    def _capture_and_write():
+                        gdi32.BitBlt(hdc_mem, 0, 0, target_w, target_h, hdc_screen, 0, 0, 0x00CC0020)
+                        gdi32.GetDIBits(hdc_mem, hbm, 0, target_h, buf, bmi, 0)
+                        proc.stdin.write(buf.raw)
+                        proc.stdin.flush()
+                        
+                    try:
+                        await loop.run_in_executor(None, _capture_and_write)
+                    except Exception as pipe_err:
+                        logger.debug(f"[HQ] Tubería cerrada: {pipe_err}")
+                        break
                     
                     elapsed = time.perf_counter() - t0
                     await asyncio.sleep(max(0.001, FRAME_TIME - elapsed))
@@ -1573,8 +1584,10 @@ async def hq_stream_loop(device_id: int, license_key: str):
     try:
         await run_with_hq_ws()
     finally:
-        HQ_MODE_ACTIVE = False
-        HQ_FFMPEG_PROC = None
+        global HQ_TASK
+        if HQ_TASK == asyncio.current_task():
+            HQ_MODE_ACTIVE = False
+            HQ_FFMPEG_PROC = None
         _set_high_res_timer(False)
         try: proc.terminate()
         except: pass
@@ -1671,7 +1684,7 @@ def manage_service(action: str):
             sc_exe = sysnative
         cmd = [sc_exe] + list(args)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, creationflags=0x08000000 if os.name == 'nt' else 0)
             return result.returncode == 0, result.stdout + result.stderr
         except Exception as e:
             return False, str(e)
@@ -1768,7 +1781,7 @@ def ensure_and_start_embedded_rustdesk():
     # 2. Iniciar si no está corriendo
     try:
         # Usar tasklist para ver si ya corre y evitar dependencia psutil si falla
-        output = subprocess.check_output('tasklist /FI "IMAGENAME eq rustdesk.exe"', shell=True).decode('utf-8', errors='ignore')
+        output = subprocess.check_output('tasklist /FI "IMAGENAME eq rustdesk.exe"', shell=True, creationflags=0x08000000 if os.name == 'nt' else 0).decode('utf-8', errors='ignore')
         if 'rustdesk.exe' in output.lower():
             logger.info("[EMBEDDED-RD] RustDesk ya esta corriendo")
             return
@@ -2247,7 +2260,7 @@ def main():
         import io as _io
         import mss as _mss
         from PIL import Image, ImageGrab
-        global LATEST_FRAME, ACTIVE_MONITOR, HQ_MODE_ACTIVE
+        global LATEST_FRAME, LATEST_FRAME_PACKET, FORCE_NEXT_FRAME, ACTIVE_MONITOR, HQ_MODE_ACTIVE
         last_pixel_hash = None
         motion_frames = 0
         frames_captured = 0
