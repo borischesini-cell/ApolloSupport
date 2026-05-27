@@ -2774,13 +2774,13 @@ def clear_centinela_logs(
 
 
 
-@app.get(/api/centinela/update_check)
+@app.get("/api/centinela/update_check")
 def check_update():
-    version_file = os.path.join(updates, version.json)
+    version_file = os.path.join("updates", "version.json")
     if os.path.exists(version_file):
         try:
-            with open(version_file, r) as f:
+            with open(version_file, "r") as f:
                 return json.load(f)
         except Exception as e:
-            return {error: str(e)}
-    return {version: 0.0.0, url: "}
+            return {"error": str(e)}
+    return {"version": "0.0.0", "url": ""}
