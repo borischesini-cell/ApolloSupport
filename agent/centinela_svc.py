@@ -25,11 +25,13 @@ import logging.handlers
 
 # ── Configuracion ─────────────────────────────────────────────────────────────
 SERVICE_NAME    = "ApolloCentinela"
+__version__     = "3.1.3"
 BASE_DIR        = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
-COMPANION_EXE   = os.path.normpath(os.path.join(BASE_DIR, "ApolloCentinela.exe"))
 CONFIG_DIR      = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport")
-CONFIG_FILE     = os.path.join(CONFIG_DIR, "centinela_config.json")
+CONFIG_FILE     = os.path.join(CONFIG_DIR, "centinela.dat")
+LEGACY_CONFIG   = os.path.join(CONFIG_DIR, "centinela_config.json")
 LOG_FILE        = os.path.join(CONFIG_DIR, "service.log")
+COMPANION_EXE   = os.path.normpath(os.path.join(BASE_DIR, "ApolloCentinela.exe"))
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -40,10 +42,25 @@ _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s
 logger.addHandler(_handler)
 
 # ── Config local ──────────────────────────────────────────────────────────────
+import base64
+
+def xor_crypt(data: str, key: str = "Ap0ll0$ecr3t_2026!") -> str:
+    key_len = len(key)
+    return "".join(chr(ord(c) ^ ord(key[i % key_len])) for i, c in enumerate(data))
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE) as f:
+            with open(CONFIG_FILE, "r") as f:
+                content = f.read()
+            decrypted = xor_crypt(base64.b64decode(content.encode()).decode())
+            return json.loads(decrypted)
+        except Exception:
+            pass
+            
+    if os.path.exists(LEGACY_CONFIG):
+        try:
+            with open(LEGACY_CONFIG, "r") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -386,6 +403,63 @@ async def headless_ws_loop():
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, 60)
 
+# ── OTA Auto-Updater ────────────────────────────────────────────────────────
+def parse_version(v_str):
+    return [int(x) for x in v_str.split('.') if x.isdigit()]
+
+async def perform_update(url):
+    import urllib.request
+    import tempfile
+    try:
+        temp_dir = tempfile.gettempdir()
+        installer_path = os.path.join(temp_dir, "ApolloSetup_update.exe")
+        
+        logger.info(f"[OTA] Descargando actualizacion desde {url}...")
+        urllib.request.urlretrieve(url, installer_path)
+        logger.info("[OTA] Descarga completada. Ejecutando instalacion silenciosa y cerrando servicio...")
+        
+        # Ejecutar el instalador desatendido de InnoSetup (se reiniciara el servicio solo)
+        subprocess.Popen([installer_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        
+        # Nos cerramos a nosotros mismos para liberar archivos y dejar que el instalador pise los .exe
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"[OTA] Error aplicando actualizacion: {e}")
+
+async def update_checker_loop():
+    while True:
+        try:
+            # Esperar 2 minutos despues de arrancar antes de la primera comprobacion
+            await asyncio.sleep(120)
+            
+            cfg = load_config()
+            if cfg and 'base_ws_url' in cfg:
+                base_url = cfg['base_ws_url'].replace('wss://', 'https://').replace('ws://', 'http://').split('/api/ws')[0]
+                api_url = f"{base_url}/api/centinela/update_check"
+                
+                import urllib.request
+                req = urllib.request.Request(api_url)
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                
+                remote_version = data.get("version", "0.0.0")
+                download_url = data.get("url", "")
+                
+                if parse_version(remote_version) > parse_version(__version__) and download_url:
+                    logger.info(f"[OTA] Nueva version {remote_version} detectada (Actual: {__version__}). Iniciando update...")
+                    await perform_update(download_url)
+        except Exception as e:
+            logger.debug(f"[OTA] Chequeo de version fallido: {e}")
+            
+        # Comprobar cada 12 horas
+        await asyncio.sleep(12 * 3600)
+
+# ── Loop principal WebSocket ──────────────────────────────────────────────────
+async def websocket_loop():
+    asyncio.create_task(update_checker_loop())
+    await headless_ws_loop()
+
 # ── Entry points ──────────────────────────────────────────────────────────────
 def run_as_service():
     """
@@ -420,3 +494,12 @@ def run_as_service():
 
 if __name__ == "__main__":
     run_as_service()
+
+
+# ¿Cómo lo usarás tú a partir de mañana?
+# Haces un cambio groso en el código.
+# Abres centinela_svc.py y cambias arriba de todo __version__ = "3.1.3".
+# Le das doble clic a tu .bat mágico para generar el instalador.
+# Agarras el nuevo ApolloSetup_v3.1.3.exe (Universal), lo renombras simplemente a ApolloSetup.exe y lo subes a la carpeta updates/ de tu servidor.
+# Editas el version.json del servidor y le pones "version": "3.1.3".
+# Te sientas a tomar un café. En las próximas 12 horas, todos los clientes del país se habrán actualizado solos, sin que les salte ni un solo cartelito en la pantalla.

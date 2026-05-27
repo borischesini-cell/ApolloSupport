@@ -138,25 +138,53 @@ SERVICE_DISPLAY = "Apollo Centinela Agent"
 
 # Usar AppData\Roaming para que el servicio (que corre como SYSTEM en Session 0)
 # pueda leer/escribir la configuraciÃ³n sin depender del directorio de trabajo
+import base64
+
+def xor_crypt(data: str, key: str = "Ap0ll0$ecr3t_2026!") -> str:
+    key_len = len(key)
+    return "".join(chr(ord(c) ^ ord(key[i % key_len])) for i, c in enumerate(data))
+
 def get_config_path():
     appdata = os.environ.get("PROGRAMDATA", os.environ.get("APPDATA", os.path.dirname(os.path.abspath(__file__))))
     config_dir = os.path.join(appdata, "ApolloSupport")
     os.makedirs(config_dir, exist_ok=True)
-    return os.path.join(config_dir, "centinela_config.json")
+    return os.path.join(config_dir, "centinela.dat")
 
 CONFIG_FILE = get_config_path()
 
+def save_local_config(config):
+    try:
+        json_str = json.dumps(config)
+        encrypted = base64.b64encode(xor_crypt(json_str).encode()).decode()
+        with open(CONFIG_FILE, "w") as f:
+            f.write(encrypted)
+    except Exception as e:
+        logger.error(f"Error guardando config segura: {e}")
+
 def load_local_config():
+    legacy_file = os.path.join(os.path.dirname(CONFIG_FILE), "centinela_config.json")
+    
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except: return None
+                content = f.read()
+            decrypted = xor_crypt(base64.b64decode(content.encode()).decode())
+            return json.loads(decrypted)
+        except Exception as e:
+            logger.error(f"Error cargando config segura: {e}")
+            
+    if os.path.exists(legacy_file):
+        try:
+            with open(legacy_file, "r") as f:
+                cfg = json.load(f)
+            save_local_config(cfg)
+            try:
+                os.remove(legacy_file)
+            except: pass
+            return cfg
+        except: pass
+        
     return None
-
-def save_local_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f)
 
 # ==========================================
 # PUNTEO WEB AL SERVIDOR CENTRAL DE MASTER IS
@@ -1478,7 +1506,7 @@ async def hq_stream_loop(device_id: int, license_key: str):
         '-f', 'rawvideo',
         '-vcodec', 'rawvideo',
         '-s', f"{target_w}x{target_h}",
-        '-pix_fmt', 'bgr24',
+        '-pix_fmt', 'bgra',
         '-framerate', str(TARGET_FPS),
         '-i', '-',
         '-vf', 'format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2', # Forzar pixel format y dimensiones pares
@@ -1512,11 +1540,13 @@ async def hq_stream_loop(device_id: int, license_key: str):
             hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
             hbm = gdi32.CreateCompatibleBitmap(hdc_screen, target_w, target_h)
             gdi32.SelectObject(hdc_mem, hbm)
-            bmi = struct.pack('<IiiHHIIiiII', 40, target_w, -target_h, 1, 24, 0, frame_size_bgr24, 0, 0, 0, 0)
+            # Se usa 32-bit (BGRA) para evitar los problemas de "padding" / "stride" de GDI
+            # ya que cualquier width * 4 siempre es multiplo de 4 (alineacion de DWORD natural).
+            actual_frame_size = target_w * target_h * 4
+            bmi = struct.pack('<IiiHHIIiiII', 40, target_w, -target_h, 1, 32, 0, actual_frame_size, 0, 0, 0, 0)
 
             last_frame_hash_quick = 0
-            buf = (ctypes.c_char * frame_size_bgr24)()
-            mv_buf = memoryview(buf)
+            buf = (ctypes.c_char * actual_frame_size)()
             
             try:
                 loop = asyncio.get_event_loop()
@@ -1867,11 +1897,11 @@ def main():
         return
 
     root.title("ApolloSoporte")
-    root.geometry("340x400")
+    root.geometry("360x420")
     root.resizable(False, False)
-    root.configure(bg="#ffffff")
+    root.configure(bg="#0f172a")
 
-    # Guardar referencia global del ROOT y Callback de la notificaciÃ³n
+    # Guardar referencia global del ROOT y Callback de la notificacion
     global ROOT_WINDOW, SHOW_FLOATING_PANEL_CALLBACK
     ROOT_WINDOW = root
 
@@ -1886,72 +1916,43 @@ def main():
     except Exception as e:
         print(f"Error cargando icono: {e}")
 
-    # TÃ­tulo Corporativo
-    lbl_title = tk.Label(root, text="ApolloGesCom", font=("Arial", 16, "bold"), bg="#ffffff", fg="#f59e0b")
-    lbl_title.pack(pady=(15, 2))
+    # Header frame
+    header_frame = tk.Frame(root, bg="#1e293b", pady=15)
+    header_frame.pack(fill=tk.X)
 
-    lbl_subtitle = tk.Label(root, text="Módulo de Asistencia Activa", font=("Arial", 9), bg="#ffffff", fg="#64748b")
-    lbl_subtitle.pack(pady=(0, 5))
+    lbl_title = tk.Label(header_frame, text="ApolloGesCom", font=("Segoe UI", 18, "bold"), bg="#1e293b", fg="#f59e0b")
+    lbl_title.pack()
 
-    # Info de Compilación (Pedido por usuario para control de versiones)
-    lbl_build = tk.Label(root, text=f"Versión: {CLIENT_VERSION} | Build: {BUILD_DATE}", font=("Arial", 7), bg="#ffffff", fg="#94a3b8")
-    lbl_build.pack(pady=(0, 10))
+    lbl_subtitle = tk.Label(header_frame, text="Módulo de Asistencia Activa", font=("Segoe UI", 10), bg="#1e293b", fg="#94a3b8")
+    lbl_subtitle.pack()
 
-    lbl_info = tk.Label(root, text="Dicte este ID al técnico por teléfono:", font=("Arial", 10, "bold"), bg="#ffffff", fg="#334155")
-    lbl_info.pack()
+    # Body frame
+    body_frame = tk.Frame(root, bg="#0f172a", pady=20)
+    body_frame.pack(fill=tk.BOTH, expand=True)
+
+    lbl_info = tk.Label(body_frame, text="Dicte este ID al técnico:", font=("Segoe UI", 11), bg="#0f172a", fg="#cbd5e1")
+    lbl_info.pack(pady=(10, 5))
 
     # ID Formateado XXL
-    lbl_id = tk.Label(root, text=f"{str(CLIENT_ID)[:3]} {str(CLIENT_ID)[3:]}", font=("Courier", 26, "bold"), bg="#f8fafc", fg="#0f172a", relief="groove", borderwidth=2, padx=10, pady=3)
-    lbl_id.pack(pady=5)
+    id_card = tk.Frame(body_frame, bg="#1e293b", padx=20, pady=15, relief="flat", bd=0)
+    id_card.pack(pady=10)
+    
+    lbl_id = tk.Label(id_card, text=f"{str(CLIENT_ID)[:3]} {str(CLIENT_ID)[3:]}", font=("Consolas", 32, "bold"), bg="#1e293b", fg="#38bdf8")
+    lbl_id.pack()
 
     # PIN de Soporte
-    lbl_pin_info = tk.Label(root, text=f"PIN de Soporte: {REMOTE_PASSWORD}", font=("Arial", 12, "bold"), bg="#ffffff", fg="#16a34a")
-    lbl_pin_info.pack(pady=5)
+    lbl_pin_info = tk.Label(body_frame, text=f"PIN: {REMOTE_PASSWORD}", font=("Segoe UI", 14, "bold"), bg="#0f172a", fg="#10b981")
+    lbl_pin_info.pack(pady=15)
 
-    # Status Bar
-    lbl_status = tk.Label(root, text="Estado: Iniciando motor...", font=("Arial", 9, "bold"), bg="#ffffff", fg="#ea580c")
-    lbl_status.pack(side=tk.BOTTOM, pady=10)
+    # Footer
+    footer_frame = tk.Frame(root, bg="#0f172a")
+    footer_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=15)
 
-    # FunciÃ³n para instalar como servicio de Windows (usa manage_service robusta)
-    def install_as_service():
-        if not is_admin():
-            ctypes.windll.user32.MessageBoxW(0, "Se requieren permisos de Administrador. El programa se relanzarÃ¡ con privilegios elevados.", "ApolloSupport", 0x40)
-            script = sys.executable if getattr(sys, 'frozen', False) else __file__
-            ctypes.windll.shell32.ShellExecuteW(None, 'runas', script, '--install', None, 1)
-            return
-        try:
-            lbl_status.config(text="Estado: Instalando Servicio...", fg="#2563eb")
-            root.update()
-            ok, msg = manage_service('install')
-            if ok:
-                lbl_status.config(text="Estado: âœ… Servicio Instalado y Activo", fg="#16a34a")
-                ctypes.windll.user32.MessageBoxW(
-                    0,
-                    f"Â¡Servicio instalado correctamente!\n\nAhora el Centinela se iniciarÃ¡ automÃ¡ticamente con Windows, incluso tras reinicios.\n\nServicio: {SERVICE_DISPLAY}",
-                    "ApolloSupport - Servicio Instalado", 0x40
-                )
-            else:
-                lbl_status.config(text="Estado: Error instalando servicio", fg="#ef4444")
-                ctypes.windll.user32.MessageBoxW(0, f"Error al instalar el servicio:\n{msg}", "ApolloSupport", 0x10)
-        except Exception as e:
-            ctypes.windll.user32.MessageBoxW(0, f"Error inesperado: {e}", "ApolloSupport", 0x10)
+    lbl_status = tk.Label(footer_frame, text="Estado: Iniciando motor...", font=("Segoe UI", 9, "bold"), bg="#0f172a", fg="#fbbf24")
+    lbl_status.pack()
 
-    # BotÃ³n para registrar como servicio de Windows
-    btn_service = tk.Button(
-        root, 
-        text="âš™ï¸ Instalar como Servicio Windows", 
-        font=("Arial", 10, "bold"), 
-        bg="#0284c7", # Azul premium
-        fg="#ffffff", 
-        activebackground="#0369a1", 
-        activeforeground="#ffffff", 
-        relief="flat", 
-        cursor="hand2",
-        padx=10, 
-        pady=5, 
-        command=install_as_service
-    )
-    btn_service.pack(pady=5)
+    lbl_build = tk.Label(footer_frame, text=f"v{CLIENT_VERSION} | build {BUILD_DATE}", font=("Segoe UI", 8), bg="#0f172a", fg="#475569")
+    lbl_build.pack(pady=(5, 0))
 
     # Arrancar el Socket sin frizar la pantallita
     t = threading.Thread(target=run_background_worker, args=(lbl_status,), daemon=True)

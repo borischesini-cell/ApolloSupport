@@ -13,6 +13,7 @@ import {
   getCentinelaLogs, clearCentinelaLogs,
 } from './api';
 import Login from './Login';
+// @ts-ignore
 import JMuxer from 'jmuxer';
 
 const triggerPushNotification = (title: string, body: string, url: string = '/') => {
@@ -641,12 +642,18 @@ export default function App() {
   const [toolbarVisible, setToolbarVisible] = useState<boolean>(true);
   const toolbarTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const enterViewerFullscreen = () => {
+  const enterViewerFullscreen = async () => {
     setIsViewerFullscreen(true);
     setToolbarVisible(true);
     resetToolbarTimer();
-    // También pedir fullscreen nativo del navegador para eliminar la barra de dirección
-    document.documentElement.requestFullscreen().catch(() => {});
+    try {
+      await document.documentElement.requestFullscreen();
+      if ('keyboard' in navigator && (navigator as any).keyboard && (navigator as any).keyboard.lock) {
+        await (navigator as any).keyboard.lock(['Escape']);
+      }
+    } catch (e) {
+      console.warn("Fullscreen error", e);
+    }
   };
 
   const exitViewerFullscreen = () => {
@@ -654,6 +661,9 @@ export default function App() {
     if (toolbarTimerRef.current) clearTimeout(toolbarTimerRef.current);
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
+    }
+    if ('keyboard' in navigator && (navigator as any).keyboard && (navigator as any).keyboard.unlock) {
+      (navigator as any).keyboard.unlock();
     }
   };
 
@@ -665,16 +675,7 @@ export default function App() {
     }, 3000); // Ocultar barra 3s después de la última acción del mouse
   };
 
-  // Salir con Escape también cuando está en viewer fullscreen
-  useEffect(() => {
-    const handleKeyEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isViewerFullscreen) {
-        exitViewerFullscreen();
-      }
-    };
-    document.addEventListener('keydown', handleKeyEsc);
-    return () => document.removeEventListener('keydown', handleKeyEsc);
-  }, [isViewerFullscreen]);
+  // Se eliminó el listener de Escape para permitir enviar ESC a la PC remota
 
   // Sincronizar si el usuario sale del fullscreen nativo del browser (F11 o barra del browser)
   useEffect(() => {
@@ -787,8 +788,15 @@ export default function App() {
     if (msg.type === 'session_list') {
       type WS = { id: number; name: string; username: string; state: string; current: boolean; };
       setWinSessions((msg.sessions as WS[]) ?? []);
+      setSessionSwitching(false); // Failsafe to hide spinner when new agent connects
     } else if (msg.type === 'session_switching') {
       setSessionSwitching(true);
+    } else if (msg.type === 'session_switched') {
+      setSessionSwitching(false);
+      setWinSessions(prev => prev.map(s => ({
+        ...s,
+        current: s.id === msg.session_id
+      })));
     } else if (msg.type === 'login_result') {
       if (msg.success) {
         setSessionSwitching(true);
@@ -2876,7 +2884,7 @@ export default function App() {
             )}
 
             {/* Panel de Herramientas Flotante */}
-            <div className="absolute top-4 right-4 flex flex-col gap-2 z-30">
+            <div className="absolute top-4 right-4 flex flex-col gap-2 z-30" style={{ display: isViewerFullscreen ? 'none' : 'flex' }}>
               <button
                 onClick={() => setIsControlEnabled(!isControlEnabled)}
                 className={`p-2.5 rounded-xl text-white shadow-lg border border-white/10 ${isControlEnabled ? 'bg-brand-500 hover:bg-brand-600' : 'bg-slate-700 hover:bg-slate-600'}`}
@@ -3729,10 +3737,10 @@ export default function App() {
                     return matchSocial || matchFantasia || matchLocalidad || matchCodigo || matchFac;
                   }).sort((a, b) => {
                     const aMaxSeen = a.devices && a.devices.length > 0
-                      ? Math.max(...a.devices.map((d: any) => d.last_seen ? new Date(d.last_seen).getTime() : 0))
+                      ? Math.max(...a.devices.map((d: any) => d.last_support_date ? new Date(d.last_support_date).getTime() : 0))
                       : 0;
                     const bMaxSeen = b.devices && b.devices.length > 0
-                      ? Math.max(...b.devices.map((d: any) => d.last_seen ? new Date(d.last_seen).getTime() : 0))
+                      ? Math.max(...b.devices.map((d: any) => d.last_support_date ? new Date(d.last_support_date).getTime() : 0))
                       : 0;
                     return bMaxSeen - aMaxSeen; // Descending (newest activity first)
                   }).map(client => {

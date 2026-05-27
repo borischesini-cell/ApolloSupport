@@ -133,6 +133,8 @@ for d in ["temp_files", "uploads", "temp_files/uploads"]:
 
 app.mount("/api/temp", StaticFiles(directory="temp_files"), name="static_temp")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="static_uploads")
+os.makedirs("updates", exist_ok=True)
+app.mount("/updates", StaticFiles(directory="updates"), name="static_updates")
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -1146,11 +1148,25 @@ class ConnectionManager:
                     pass
             self.device_sessions[device_id][session_id] = websocket
             
-            # Autopromoción: Si no hay ninguna seleccionada, o si la seleccionada es Session 0 (servicio sin GUI) y conecta una sesión interactiva (>0), la seleccionamos como activa.
+            # Autopromoción: Si no hay ninguna seleccionada, o si la seleccionada es Session 0 (servicio sin GUI) y conecta una sesión interactiva (>0), o si es la sesión solicitada, la seleccionamos como activa.
             current_selected = self.selected_sessions.get(device_id)
-            if (device_id not in self.selected_sessions) or (current_selected == 0 and session_id != 0 and session_id is not None):
+            requested_session = getattr(self, "requested_sessions", {}).get(device_id)
+            
+            if (device_id not in self.selected_sessions) or (current_selected == 0 and session_id != 0 and session_id is not None) or (session_id == requested_session):
                 self.selected_sessions[device_id] = session_id
                 logger.info(f"[WS-PROMOTION] Promoviendo sesion {session_id} como activa frente a {current_selected}")
+                
+                if session_id == requested_session:
+                    self.requested_sessions.pop(device_id, None)
+                    for v_ws in list(self.viewer_connections.get(device_id, {}).values()):
+                        try:
+                            await v_ws.send_json({"type": "session_switched", "session_id": session_id})
+                        except Exception as e:
+                            logger.error(f"[WS-SWITCH] Error notifying viewer: {e}")
+                            
+                    # Si HQ esta activo, pedirle al nuevo agente que inicie FFMPEG
+                    if self.has_hq_viewers(device_id):
+                        await self.send_json_safe(device_id, {"type": "start_hq", "device_id": device_id})
         else:
             # Fallback si no tiene session_id (agentes viejos)
             # Evitar colisión de múltiples agentes en el mismo ID de dispositivo
@@ -1208,7 +1224,7 @@ class ConnectionManager:
         if client_id in self.active_clients:
             # Solo remover del panel si no queda NINGUNA sesion activa para este dispositivo
             if device_id not in self.device_sessions or not self.device_sessions[device_id]:
-                if device_id not in self.active_clients[client_id]:
+                if device_id in self.active_clients[client_id]:
                     self.active_clients[client_id].remove(device_id)
                     
         # Limpiar otros buffers solo si se perdieron todas las conexiones de este device
@@ -1441,13 +1457,31 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
                         if cmd_type == "switch_session":
                             target_session_id = int(cmd.get("session_id", -1))
                             if target_session_id != -1 and device_id in manager.device_sessions:
+                                if not hasattr(manager, "requested_sessions"):
+                                    manager.requested_sessions = {}
+                                manager.requested_sessions[device_id] = target_session_id
+                                
                                 if target_session_id in manager.device_sessions[device_id]:
+                                    # Detener HQ en el agente viejo para que no mande frames mezclados
+                                    if manager.has_hq_viewers(device_id):
+                                        await manager.send_json_safe(device_id, {"type": "stop_hq"})
+                                        
                                     # Cambio de sesion interno instantaneo
                                     manager.selected_sessions[device_id] = target_session_id
                                     manager.active_connections[device_id] = manager.device_sessions[device_id][target_session_id]
                                     logger.info(f"[WS-SWITCH] Servidor cambio sesion activa de device {device_id} a {target_session_id} internamente")
                                     # Pedir refresh frame
                                     await manager.send_json_safe(device_id, {"type": "refresh_frame"})
+                                    # Notify viewers
+                                    for v_ws in list(manager.viewer_connections.get(device_id, {}).values()):
+                                        try:
+                                            await v_ws.send_json({"type": "session_switched", "session_id": target_session_id})
+                                        except Exception as e:
+                                            logger.error(f"[WS-SWITCH] Error notifying viewer: {e}")
+                                            
+                                    # Si HQ esta activo y es un switch interno, el agente necesita re-iniciar HQ? No, FFMPEG es global por sesion. Pero igual aseguramos:
+                                    if manager.has_hq_viewers(device_id):
+                                        await manager.send_json_safe(device_id, {"type": "start_hq", "device_id": device_id})
                                 else:
                                     logger.info(f"[WS-SWITCH] Sesion {target_session_id} no conectada aun. Enviando signal al companion activo.")
                                     await manager.send_json_safe(device_id, cmd)
@@ -2075,8 +2109,16 @@ def delete_centinela_device(device_id: int, db: Session = Depends(get_db), curre
         raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
     
     # Si estÃ¡ conectado actualmente, desconectarlo del manager
-    manager.disconnect(device_id, device.client_id)
+    try:
+        manager.disconnect(device_id, device.client_id)
+    except Exception as e:
+        logger.error(f"Error al desconectar manager durante eliminación: {e}")
     
+    # Eliminar registros dependientes manualmente para evitar IntegrityError (ForeingKey)
+    db.query(models.SupportSession).filter(models.SupportSession.device_id == device_id).delete(synchronize_session=False)
+    db.query(models.RemoteChat).filter(models.RemoteChat.device_id == device_id).delete(synchronize_session=False)
+    db.query(models.RemoteLog).filter(models.RemoteLog.device_id == device_id).delete(synchronize_session=False)
+
     db.delete(device)
     db.commit()
     return {"status": "success", "message": "Dispositivo eliminado correctamente"}
@@ -2452,6 +2494,7 @@ async def verify_remote_password(device_id: int, data: dict, db: Session = Depen
             # Si no tiene clave, entra directo (requisito USER)
             device.current_technician_id = current_user.id
             device.session_start = datetime.utcnow()
+            device.last_support_date = datetime.utcnow()
             db.add(models.AccessLog(technician_id=current_user.id, client_id=device.client_id, action=f"CONEXIÃ“N REMOTA: {device.device_name}"))
             
             # Cerrar cualquier sesiÃ³n previa de este tÃ©cnico en este dispositivo que haya quedado colgada (sin end_time)
@@ -2730,3 +2773,14 @@ def clear_centinela_logs(
 
 
 
+
+@app.get(/api/centinela/update_check)
+def check_update():
+    version_file = os.path.join(updates, version.json)
+    if os.path.exists(version_file):
+        try:
+            with open(version_file, r) as f:
+                return json.load(f)
+        except Exception as e:
+            return {error: str(e)}
+    return {version: 0.0.0, url: "}
