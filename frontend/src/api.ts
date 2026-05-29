@@ -107,6 +107,7 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
 
     const url = `${WS_BASE_URL}/ws/viewer/${deviceId}?token=${encodeURIComponent(token)}`;
     const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -124,10 +125,10 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
       if (!mountedRef.current) return;
       
       // Manejar chunks binarios de HQ (H.264)
-      if (event.data instanceof Blob) {
-        console.log('[WS] Recibido BLOB binario. Tamaño:', event.data.size, 'onHqChunk:', !!onHqChunk);
+      if (event.data instanceof ArrayBuffer) {
+        console.log('[WS] Recibido ArrayBuffer binario. Tamaño:', event.data.byteLength, 'onHqChunk:', !!onHqChunk);
         if (onHqChunk) {
-            onHqChunk(await event.data.arrayBuffer());
+            onHqChunk(event.data);
             
             // Reusar el calculador de FPS para HQ
             const now = performance.now();
@@ -138,11 +139,14 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
             if (!lastQualityUpdateRef.current || now - lastQualityUpdateRef.current >= 2000) {
               const fps = Math.round(frameTimestampsRef.current.length / 2);
               onQuality?.(fps, connectionQualityFromFps(fps));
+
               lastQualityUpdateRef.current = now;
             }
         }
         return;
       }
+      
+      if (event.data === 'pong') return; // Ignore pong
       
       if (typeof event.data !== 'string') {
         console.log('[WS] Recibido dato desconocido no-string y no-blob:', typeof event.data, event.data);
@@ -173,7 +177,7 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
           onMessage(data as Record<string, unknown>);
         }
         // ping/pong manejado por servidor, no necesita acción en cliente
-      } catch (_) {}
+      } catch (e) { console.error('[WS] Error processing JSON message:', e); }
     };
 
 
@@ -720,3 +724,12 @@ export const clearCentinelaLogs = async (deviceId?: number | null) => {
 };
 
 
+
+export const forceCentinelaUpdate = async (deviceId: string | number) => {
+    const response = await fetch(`${API_URL}/centinela/${deviceId}/force_update`, {
+        method: 'POST',
+        headers: getAuthHeaders()
+    });
+    if (!response.ok) throw new Error('Error al forzar actualizacion');
+    return response.json();
+};

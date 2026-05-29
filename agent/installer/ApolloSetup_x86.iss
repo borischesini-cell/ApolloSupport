@@ -1,10 +1,10 @@
 ; ==============================================================================
-; Apollo Centinela - Script de Instalador x86 (32-bit) Profesional v3.1.2
+; Apollo Centinela - Script de Instalador x86 (32-bit) Profesional v3.1.19
 ; Herramienta: Inno Setup 6.x
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.1.2"
+#define MyAppVersion   "3.1.23"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"
@@ -56,21 +56,21 @@ english.StartingSvc=Starting Windows service...
 english.Done=Installation complete. The agent is online.
 
 [Files]
-; Servicio (Session 0 - siempre activo) - Versión 32-bit
+; Servicio (Session 0 - siempre activo) - VersiÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n 32-bit
 Source: "..\dist\ApolloCentinelaService_x86.exe"; DestDir: "{app}"; DestName: "{#ServiceExe}"; Flags: ignoreversion
 
-; Companion UI (lanzado por el servicio en sesion del usuario) - Versión 32-bit
+; Companion UI (lanzado por el servicio en sesion del usuario) - VersiÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n 32-bit
 Source: "..\dist\ApolloCentinela_x86.exe";        DestDir: "{app}"; DestName: "{#CompanionExe}"; Flags: ignoreversion
 
 ; Iconos y recursos
 Source: "..\apollo_logo.ico";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\apollo_logo.png";      DestDir: "{app}"; Flags: ignoreversion
 
-; DLLs de Visual C++ Runtime — incluidas directamente para compatibilidad
+; DLLs de Visual C++ Runtime ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â incluidas directamente para compatibilidad
 Source: "dlls\vcruntime140.dll";   DestDir: "{app}"; Flags: ignoreversion
 Source: "dlls\msvcp140.dll";       DestDir: "{app}"; Flags: ignoreversion
 
-; ffmpeg.exe — necesario para el modo Alto Rendimiento (H.264 MSE).
+; ffmpeg.exe ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â necesario para el modo Alto Rendimiento (H.264 MSE).
 Source: "..\ffmpeg.exe";           DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]

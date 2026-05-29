@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Ticket, Users, Settings, Bell, Search, Moon, Sun, Monitor, MessageSquare, X, LogOut, ArrowUpRight, Sparkles, FileText, Clipboard, Plus, Folder, Trash2, Menu, DollarSign, CheckCircle2, AlertCircle, Activity, UserPlus, Shield, Phone, MapPin, Mail, Lock, Key, Camera, Edit2, Maximize2, Minimize, Terminal } from 'lucide-react';
 import {
   API_URL, getTickets, getClients, createTicket, createClient, updateClient,
-  toggleClientStatus, getActiveCentinelas, fetchAiAnalysis, getCentinelaFrame,
+  toggleClientStatus, getActiveCentinelas, forceCentinelaUpdate, fetchAiAnalysis, getCentinelaFrame,
   getCentinelaAlerts, runCentinelaCommand, sendCentinelaControl, getAreas,
   addIntervention, uploadFile, deleteCentinelaDevice, getCentinelaClipboard,
   syncClientsFromDbf, updateCentinelaDeviceNotes, getPendingCentinelas, assignCentinelaLicense,
@@ -973,7 +973,8 @@ export default function App() {
   const [winSessions, setWinSessions] = useState<WinSession[]>([]);
   const [showSessionPicker, setShowSessionPicker] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
-  const [loginCreds, setLoginCreds] = useState({ username: '', password: '', domain: '.' });
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [loginCreds, setLoginCreds] = useState({ username: localStorage.getItem('last_remote_username') || '', password: '', domain: localStorage.getItem('last_remote_domain') || '.' });
   const [loginError, setLoginError] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
   const [sessionSwitching, setSessionSwitching] = useState(false);
@@ -3176,9 +3177,7 @@ export default function App() {
             <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'space' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
               ␣ Espacio
             </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'ctrl+shift+enter' })} className="bg-brand-500/20 hover:bg-brand-500/40 text-[10px] font-extrabold text-brand-400 px-3 py-1.5 rounded-lg border border-brand-500/30 transition-all" title="Envia la combinación CTRL + SHIFT + ENTER a la PC remota">
-              ⚡ Ctrl + Shift + Enter
-            </button>
+
             <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'ctrl+alt+del' })} className="bg-red-500/20 hover:bg-red-500/40 text-[10px] font-extrabold text-red-400 px-3 py-1.5 rounded-lg border border-red-500/30 transition-all" title="Envia la combinación de seguridad CTRL + ALT + SUP (Ctrl+Alt+Del) para desbloquear la pantalla de Windows">
               🚨 Ctrl + Alt + Sup
             </button>
@@ -3235,24 +3234,48 @@ export default function App() {
                     value={loginCreds.domain}
                     onChange={e => setLoginCreds(c => ({...c, domain: e.target.value}))}
                     placeholder="."
-                    className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50"
+                    className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50 pr-10"
                   />
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginPassword(!showLoginPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                    title={showLoginPassword ? "Ocultar" : "Mostrar"}
+                  >
+                    {showLoginPassword ? "👁️‍🗨️" : "👁️"}
+                  </button>
                 </div>
                 <div>
                   <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 block">Contraseña</label>
-                  <input
-                    type="password"
-                    value={loginCreds.password}
-                    onChange={e => setLoginCreds(c => ({...c, password: e.target.value}))}
-                    placeholder="••••••••"
-                    onKeyDown={e => {
-                      if (e.key === 'Enter' && loginCreds.username && loginCreds.password) {
-                        setLoginLoading(true); setLoginError('');
-                        sendViewerCommand({ type: 'login_session', ...loginCreds });
-                      }
-                    }}
-                    className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50"
-                  />
+                  <div className="relative">
+                    <input
+                      type={showLoginPassword ? "text" : "password"}
+                      value={loginCreds.password}
+                      onChange={e => setLoginCreds(c => ({...c, password: e.target.value}))}
+                      placeholder="••••••••"
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' && loginCreds.username && loginCreds.password) {
+                          setLoginLoading(true); setLoginError('');
+                          localStorage.setItem('last_remote_username', loginCreds.username);
+                          localStorage.setItem('last_remote_domain', loginCreds.domain);
+                          sendViewerCommand({ type: 'login_session', ...loginCreds });
+                        }
+                      }}
+                      className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50 pr-10"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowLoginPassword(!showLoginPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white flex items-center justify-center"
+                      title={showLoginPassword ? "Ocultar contraseña" : "Ver contraseña"}
+                    >
+                      {showLoginPassword ? (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" y1="2" x2="22" y2="22"/></svg>
+                      ) : (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                      )}
+                    </button>
+                  </div>
                 </div>
                 {loginError && (
                   <div className="text-red-400 text-xs bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
@@ -3827,7 +3850,7 @@ export default function App() {
                                       <div className="text-sm font-extrabold flex items-center gap-2">{dev.device_name}{(telemetry?.remote_password || dev.remote_password) && (<span className="text-[10px] font-mono bg-brand-500/10 text-brand-500 px-2.5 py-0.5 rounded-full flex items-center gap-1 shadow-sm">🔑 {telemetry?.remote_password || dev.remote_password}</span>)}</div>
                                       <div className="flex items-center gap-2 text-[9px] uppercase font-bold text-slate-500">
                                         {isOnline ? (
-                                          <>CPU: {telemetry?.cpu || 0}% | RAM: {telemetry?.ram || 0}%</>
+                                          <>CPU: {telemetry?.cpu || 0}% | RAM: {telemetry?.ram || 0}% {telemetry?.agent_version && <span className="text-amber-500 font-extrabold ml-1">V{telemetry.agent_version}</span>}</>
                                         ) : 'Desconectado'}
                                       </div>
                                       {/* Info extendida del sistema — viene de system_info en telemetría */}
@@ -3843,18 +3866,50 @@ export default function App() {
                                               🪟 {telemetry.system_info.windows_name}
                                             </span>
                                           )}
-                                          {telemetry.system_info.last_windows_update && telemetry.system_info.last_windows_update !== 'No disponible' && (
-                                            <span className="text-[9px] text-amber-400 font-semibold">
-                                              🔄 Update: {telemetry.system_info.last_windows_update}
-                                            </span>
-                                          )}
-                                          {telemetry.system_info.antivirus && telemetry.system_info.antivirus !== 'No detectado' && (
-                                            <span className="text-[9px] text-emerald-400 font-semibold">
-                                              🛡️ {telemetry.system_info.antivirus}
-                                            </span>
-                                          )}
-                                        </div>
-                                      )}
+                                          
+                                            {telemetry.system_info.last_windows_update && telemetry.system_info.last_windows_update !== 'No disponible' && (
+                                              <span className="text-[9px] text-amber-400 font-semibold">
+                                                🗓️ Update: {telemetry.system_info.last_windows_update}
+                                              </span>
+                                            )}
+                                          </div>
+                                        )}
+                                        {/* OTA PROGRESS Y BOTON */}
+                                        {isOnline && (
+                                          <div className="mt-1 w-full pr-4">
+                                            {telemetry?.ota_status && (
+                                              <>
+                                                <div className="flex justify-between items-center text-[9px] text-amber-500 font-bold mb-1 uppercase">
+                                                  <span>Actualización OTA: {telemetry.ota_status}</span>
+                                                  <span>{telemetry.ota_progress}%</span>
+                                                </div>
+                                                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                                  <div className="bg-amber-500 h-1.5 transition-all" style={{ width: `${telemetry.ota_progress}%` }}></div>
+                                                </div>
+                                              </>
+                                            )}
+                                            {telemetry?.agent_version && !telemetry?.ota_status && (
+                                              <button
+                                                onClick={async (e) => {
+                                                  e.stopPropagation();
+                                                  if (window.confirm(`¿Forzar actualización OTA en ${dev.device_name}?`)) {
+                                                    try {
+                                                      await forceCentinelaUpdate(dev.id);
+                                                      alert('Comando OTA enviado. Verás el progreso en breve.');
+                                                    } catch (err) {
+                                                      alert('Error al forzar OTA');
+                                                    }
+                                                  }
+                                                }}
+                                                className="mt-1 flex items-center gap-1 text-[9px] px-2 py-0.5 rounded-lg bg-amber-500/10 text-amber-500 hover:bg-amber-500 hover:text-white transition-colors"
+                                                title="Forzar actualización OTA ahora"
+                                              >
+                                                <ArrowUpRight size={10} /> Forzar Actualización OTA
+                                              </button>
+                                            )}
+                                          </div>
+                                        )}
+
                                       {renderLastErpUpdate(dev.last_erp_update, telemetry)}
                                     </div>
                                   </div>

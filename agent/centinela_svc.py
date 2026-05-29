@@ -25,7 +25,7 @@ import logging.handlers
 
 # ── Configuracion ─────────────────────────────────────────────────────────────
 SERVICE_NAME    = "ApolloCentinela"
-__version__     = "3.1.3"
+__version__     = "3.1.23"
 BASE_DIR        = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
 CONFIG_DIR      = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport")
 CONFIG_FILE     = os.path.join(CONFIG_DIR, "centinela.dat")
@@ -182,9 +182,14 @@ def spawn_in_user_session(exe_path, session_id=None):
 
 
     user_token = ctypes.wintypes.HANDLE()
+    has_user_token = True
     if not WTSAPI32.WTSQueryUserToken(session_id, ctypes.byref(user_token)):
-        logger.warning("WTSQueryUserToken fallo (error %d)", KERNEL32.GetLastError())
-        return None
+        logger.warning("WTSQueryUserToken fallo (error %d). Cayendo a token SYSTEM para session %d", KERNEL32.GetLastError(), session_id)
+        has_user_token = False
+        # Usar el token del proceso actual (SYSTEM)
+        if not ADVAPI32.OpenProcessToken(KERNEL32.GetCurrentProcess(), 0x02000000, ctypes.byref(user_token)):
+            logger.error("OpenProcessToken fallo (error %d)", KERNEL32.GetLastError())
+            return None
 
     dup_token = ctypes.wintypes.HANDLE()
     if not ADVAPI32.DuplicateTokenEx(
@@ -201,6 +206,38 @@ def spawn_in_user_session(exe_path, session_id=None):
         return None
     KERNEL32.CloseHandle(user_token)
 
+    if not has_user_token:
+        # Habilitar SE_TCB_NAME antes de cambiar el SessionId
+        def enable_privilege(priv_name):
+            TOKEN_ADJUST_PRIVILEGES = 0x0020
+            TOKEN_QUERY = 0x0008
+            hToken = ctypes.wintypes.HANDLE()
+            if ADVAPI32.OpenProcessToken(KERNEL32.GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(hToken)):
+                luid = ctypes.c_int64()
+                if ADVAPI32.LookupPrivilegeValueW(None, priv_name, ctypes.byref(luid)):
+                    class TOKEN_PRIVILEGES(ctypes.Structure):
+                        _fields_ = [("PrivilegeCount", ctypes.c_uint32), ("Privileges", ctypes.c_int64 * 1), ("Attributes", ctypes.c_uint32 * 1)]
+                    tp = TOKEN_PRIVILEGES()
+                    tp.PrivilegeCount = 1
+                    tp.Privileges[0] = luid.value
+                    tp.Attributes[0] = 2 # SE_PRIVILEGE_ENABLED
+                    ADVAPI32.AdjustTokenPrivileges(hToken, False, ctypes.byref(tp), ctypes.sizeof(tp), None, None)
+                KERNEL32.CloseHandle(hToken)
+                
+        enable_privilege("SeTcbPrivilege")
+        enable_privilege("SeAssignPrimaryTokenPrivilege")
+        enable_privilege("SeIncreaseQuotaPrivilege")
+
+        # Setear el SessionId en el token duplicado
+        session_id_c = ctypes.c_uint32(session_id)
+        if not ADVAPI32.SetTokenInformation(
+            dup_token,
+            12,  # TokenSessionId
+            ctypes.byref(session_id_c),
+            ctypes.sizeof(session_id_c)
+        ):
+            logger.error("SetTokenInformation fallo para session %d (error %d)", session_id, KERNEL32.GetLastError())
+    
     env_block = ctypes.c_void_p()
     creation_flags = 0
     env_ok = bool(USERENV.CreateEnvironmentBlock(ctypes.byref(env_block), dup_token, False))
@@ -212,7 +249,11 @@ def spawn_in_user_session(exe_path, session_id=None):
 
     si = STARTUPINFOW()
     si.cb = ctypes.sizeof(STARTUPINFOW)
-    si.lpDesktop = "winsta0\\default"
+    if has_user_token:
+        si.lpDesktop = "winsta0\\default"
+    else:
+        si.lpDesktop = "winsta0\\Winlogon"
+        
     si.dwFlags = 0x00000001   # STARTF_USESHOWWINDOW
     si.wShowWindow = 0        # SW_HIDE
 
@@ -410,12 +451,16 @@ def parse_version(v_str):
 async def perform_update(url):
     import urllib.request
     import tempfile
+    import shutil
     try:
         temp_dir = tempfile.gettempdir()
         installer_path = os.path.join(temp_dir, "ApolloSetup_update.exe")
         
         logger.info(f"[OTA] Descargando actualizacion desde {url}...")
-        urllib.request.urlretrieve(url, installer_path)
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        with urllib.request.urlopen(req, timeout=30) as response, open(installer_path, 'wb') as out_file:
+            shutil.copyfileobj(response, out_file)
+            
         logger.info("[OTA] Descarga completada. Ejecutando instalacion silenciosa y cerrando servicio...")
         
         # Ejecutar el instalador desatendido de InnoSetup (se reiniciara el servicio solo)
@@ -439,7 +484,7 @@ async def update_checker_loop():
                 api_url = f"{base_url}/api/centinela/update_check"
                 
                 import urllib.request
-                req = urllib.request.Request(api_url)
+                req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
                 with urllib.request.urlopen(req, timeout=10) as response:
                     data = json.loads(response.read().decode())
                 
@@ -477,13 +522,131 @@ def run_as_service():
         os.path.isfile(COMPANION_EXE),
     )
 
+    # --- Habilitar directiva SAS para poder enviar Ctrl+Alt+Del ---
+    try:
+        import winreg
+        key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "SoftwareSASGeneration", 0, winreg.REG_DWORD, 3) # 3 = Servicios y Ease of Access
+        logger.info("[SAS] Directiva de simulacion de Ctrl+Alt+Del activada con exito en el Registro (por el Servicio SYSTEM).")
+    except Exception as e:
+        logger.error(f"[SAS] Error activando directiva en el Registro: {e}")
+
     monitor_thread = threading.Thread(target=companion_monitor, daemon=True)
     monitor_thread.start()
+
+    updater_thread = threading.Thread(target=lambda: asyncio.run(update_checker_loop()), daemon=True)
+    updater_thread.start()
 
     # Mantener el proceso vivo (el monitor corre en el hilo daemon)
     try:
         while _svc_running:
-            time.sleep(5)
+            time.sleep(1)
+            
+            # --- SAS SIGNAL CHECK ---
+            force_sas_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "force_sas.txt")
+            if os.path.isfile(force_sas_file):
+                logger.info("[SAS] Detectado archivo signal force_sas.txt. Enviando Ctrl+Alt+Del...")
+                try:
+                    os.remove(force_sas_file)
+                except:
+                    pass
+                try:
+                    import ctypes
+                    
+                    # 1. Despertar monitor (Wake Screen) forzando el estado del sistema
+                    ES_CONTINUOUS = 0x80000000
+                    ES_DISPLAY_REQUIRED = 0x00000002
+                    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
+                    
+                    # Mover el mouse un pixel para asegurar
+                    ctypes.windll.user32.mouse_event(0x0001, 1, 1, 0, 0)
+                    
+                    # 2. Inyectar SAS (Ctrl+Alt+Del)
+                    sas_dll = ctypes.windll.LoadLibrary("sas.dll")
+                    sas_dll.SendSAS(False)
+                    logger.info("[SAS] Monitor despertado y SendSAS(False) ejecutado.")
+                    
+                    # Restaurar estado
+                    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+                except Exception as e:
+                    logger.error(f"[SAS] Error ejecutando SendSAS: {e}")
+                    
+            # --- LOGIN INJECTION SIGNAL CHECK ---
+            inject_pwd_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "inject_password.txt")
+            if os.path.isfile(inject_pwd_file):
+                logger.info("[LOGIN] Detectado signal inject_password.txt. Tipeando password...")
+                try:
+                    with open(inject_pwd_file, "r") as f:
+                        pwd = f.read()
+                    os.remove(inject_pwd_file)
+                    
+                    # Usar keyboard_event para tipear el password como SYSTEM
+                    import ctypes
+                    
+                    # 1. Despertar pantalla por si acaso
+                    ES_CONTINUOUS = 0x80000000
+                    ES_DISPLAY_REQUIRED = 0x00000002
+                    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
+                    ctypes.windll.user32.mouse_event(0x0001, 1, 1, 0, 0)
+                    time.sleep(1)
+                    
+                    # 2. Tipear cada letra
+                    for char in pwd:
+                        vk = ctypes.windll.user32.VkKeyScanW(ord(char))
+                        shift = (vk & 0x0100) != 0
+                        ctrl = (vk & 0x0200) != 0
+                        alt = (vk & 0x0400) != 0
+                        vk_code = vk & 0xFF
+                        
+                        if shift: ctypes.windll.user32.keybd_event(0x10, 0, 0, 0) # Shift down
+                        if ctrl: ctypes.windll.user32.keybd_event(0x11, 0, 0, 0) # Ctrl down
+                        if alt: ctypes.windll.user32.keybd_event(0x12, 0, 0, 0) # Alt down
+                        
+                        ctypes.windll.user32.keybd_event(vk_code, 0, 0, 0) # Key down
+                        ctypes.windll.user32.keybd_event(vk_code, 0, 2, 0) # Key up
+                        
+                        if alt: ctypes.windll.user32.keybd_event(0x12, 0, 2, 0) # Alt up
+                        if ctrl: ctypes.windll.user32.keybd_event(0x11, 0, 2, 0) # Ctrl up
+                        if shift: ctypes.windll.user32.keybd_event(0x10, 0, 2, 0) # Shift up
+                        
+                        time.sleep(0.02)
+                    
+                    # 3. Enter
+                    ctypes.windll.user32.keybd_event(0x0D, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x0D, 0, 2, 0)
+                    
+                    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+                    logger.info("[LOGIN] Password inyectado y ENTER enviado.")
+                except Exception as e:
+                    logger.error(f"[LOGIN] Error inyectando password: {e}")
+                    
+            # --- OTA UPDATE SIGNAL CHECK ---
+            force_ota_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "force_ota.txt")
+            if os.path.isfile(force_ota_file):
+                logger.info("[OTA] Detectado archivo signal force_ota.txt. Forzando actualizacion...")
+                try:
+                    os.remove(force_ota_file)
+                except:
+                    pass
+                
+                cfg = load_config()
+                if cfg and 'base_ws_url' in cfg:
+                    base_url = cfg['base_ws_url'].replace('wss://', 'https://').replace('ws://', 'http://').split('/api/ws')[0]
+                    api_url = f"{base_url}/api/centinela/update_check"
+                    
+                    import urllib.request
+                    try:
+                        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+                        with urllib.request.urlopen(req, timeout=10) as response:
+                            data = json.loads(response.read().decode())
+                        download_url = data.get("url", "")
+                        if download_url:
+                            # Lanzar en thread separado
+                            threading.Thread(target=lambda: asyncio.run(perform_update(download_url)), daemon=True).start()
+                    except Exception as e:
+                        logger.error(f"[OTA] Error comprobando API para force update: {e}")
+                        
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -498,7 +661,7 @@ if __name__ == "__main__":
 
 # ¿Cómo lo usarás tú a partir de mañana?
 # Haces un cambio groso en el código.
-# Abres centinela_svc.py y cambias arriba de todo __version__ = "3.1.3".
+# Abres centinela_svc.py y cambias arriba de todo __version__ = "3.1.23".
 # Le das doble clic a tu .bat mágico para generar el instalador.
 # Agarras el nuevo ApolloSetup_v3.1.3.exe (Universal), lo renombras simplemente a ApolloSetup.exe y lo subes a la carpeta updates/ de tu servidor.
 # Editas el version.json del servidor y le pones "version": "3.1.3".

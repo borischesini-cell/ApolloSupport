@@ -72,6 +72,7 @@ class CentinelaDeviceOut(CentinelaDeviceBase):
     technician_name: Optional[str] = None
     notes: Optional[str] = None
     last_erp_update: Optional[str] = None
+    last_support_date: Optional[datetime] = None
     apollo_serials: Optional[List[str]] = None
     proposed_client: Optional[ProposedClientOut] = None
     
@@ -312,3 +313,8 @@ class RemoteLogOut(RemoteLogBase):
     class Config:
         from_attributes = True
 
+
+class OTAProgress(BaseModel):
+    device_id: str
+    status: str
+    progress: int

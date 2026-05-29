@@ -3,16 +3,16 @@
 ; Herramienta: Inno Setup 6.x
 ;
 ; ARQUITECTURA DOS PROCESOS:
-;   ApolloCentinelaService.exe  → Windows Service (Session 0, SYSTEM)
+;   ApolloCentinelaService.exe  ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ Windows Service (Session 0, SYSTEM)
 ;     - Arranca con Windows, SIN necesidad de login de usuario
 ;     - Mantiene conexion WebSocket con el backend (device siempre "online")
 ;     - Detecta cuando un usuario inicia sesion y lanza el companion
 ;
-;   ApolloCentinela.exe  → Companion UI (sesion interactiva del usuario)
+;   ApolloCentinela.exe  ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ Companion UI (sesion interactiva del usuario)
 ;     - Lanzado automaticamente por el Service en la sesion del usuario
 ;     # NOTA: La auto-elevacion a admin es necesaria para que mss (screen capture)
 ;     # funcione sin restricciones en todas las configuraciones de Windows.
-;     # is_running_as_service() ahora usa ProcessIdToSessionId — no se ve afectada
+;     # is_running_as_service() ahora usa ProcessIdToSessionId ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no se ve afectada
 ;     # por el nivel de privilegio, solo por el Session ID (0=servicio, 1+=usuario).
 ;     if not is_admin():
 ;         try:
@@ -21,12 +21,12 @@
 ;             sys.exit(0)
 ;         except Exception as e:
 ;             print(f"No se pudieron elevar privilegios: {e}")
-;             # Continuar sin admin — mss intentara funcionar igual
+;             # Continuar sin admin ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â mss intentara funcionar igual
 ;     - Si el companion cae, el Service lo relanza automaticamente
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.1.2"
+#define MyAppVersion   "3.1.23"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"
@@ -91,15 +91,12 @@ Source: "..\dist\ApolloCentinela_x86.exe"; DestDir: "{app}"; DestName: "{#Compan
 Source: "..\apollo_logo.ico";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\apollo_logo.png";      DestDir: "{app}"; Flags: ignoreversion
 
-; DLLs de Visual C++ Runtime — incluidas directamente para compatibilidad
-Source: "dlls\vcruntime140.dll";   DestDir: "{app}"; Flags: ignoreversion
-Source: "dlls\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dlls\msvcp140.dll";       DestDir: "{app}"; Flags: ignoreversion
+; DLLs de Visual C++ Runtime ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â incluidas directamente para compatibilidad
 
-; Visual C++ 2015-2022 Redistributable — instala Universal CRT
+; Visual C++ 2015-2022 Redistributable ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â instala Universal CRT
 Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Check: Is64BitInstallMode; Flags: ignoreversion deleteafterinstall
 
-; ffmpeg.exe — necesario para el modo Alto Rendimiento (H.264 MSE).
+; ffmpeg.exe ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â necesario para el modo Alto Rendimiento (H.264 MSE).
 Source: "..\ffmpeg.exe";           DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
@@ -145,7 +142,7 @@ Filename: "{sys}\sc.exe";       Parameters: "delete ""{#ServiceName}""";   Flags
 
 [Messages]
 spanish.WelcomeLabel1=Bienvenido al instalador de [name]
-spanish.WelcomeLabel2=Este asistente instalara [name/ver] en su equipo.%n%nArquitectura de dos procesos:%n%n• Servicio Windows: mantiene el equipo conectado 24/7, incluso sin usuario logueado.%n• Icono de bandeja: aparece automaticamente cuando un usuario inicia sesion.%n%nSe recomienda cerrar todas las aplicaciones antes de continuar.
+spanish.WelcomeLabel2=Este asistente instalara [name/ver] en su equipo.%n%nArquitectura de dos procesos:%n%nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ Servicio Windows: mantiene el equipo conectado 24/7, incluso sin usuario logueado.%nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ Icono de bandeja: aparece automaticamente cuando un usuario inicia sesion.%n%nSe recomienda cerrar todas las aplicaciones antes de continuar.
 spanish.FinishedLabel=Apollo Centinela instalado correctamente.%n%nEl equipo ahora aparece como "en linea" en el panel de soporte de Master IS.%n%nEl icono de bandeja aparecera automaticamente al iniciar sesion de Windows.
 
 [Code]
@@ -163,7 +160,7 @@ begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "ApolloCentinela.exe"', '',
     SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-  // 3. Matar el centinela VIEJO (Apollo_Centinela.exe con guion bajo — build anterior)
+  // 3. Matar el centinela VIEJO (Apollo_Centinela.exe con guion bajo ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â build anterior)
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "Apollo_Centinela.exe"', '',
     SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
@@ -188,15 +185,15 @@ function VCRedistNeedsInstall(): Boolean;
 var
   sVersion: String;
 begin
-  // Verificar si VC++ 2015-2022 Redist x64 ya está instalado (v14.x)
+  // Verificar si VC++ 2015-2022 Redist x64 ya estÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ instalado (v14.x)
   if RegQueryStringValue(HKLM,
     'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
     'Version', sVersion) then
   begin
-    // Ya instalado — saltar
+    // Ya instalado ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â saltar
     Result := False;
   end else begin
-    Result := True;  // No instalado — instalar
+    Result := True;  // No instalado ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â instalar
   end;
 end;
 

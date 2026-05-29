@@ -59,6 +59,12 @@ from jose import JWTError, jwt
 from datetime import datetime
 import shutil
 import asyncio
+
+import subprocess
+import tempfile
+import time
+from cryptography.fernet import Fernet
+
 from collections import deque
 import uuid
 from datetime import timedelta
@@ -77,6 +83,8 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/documentacion"
 )
+
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -2774,6 +2782,37 @@ def clear_centinela_logs(
 
 
 
+@app.post("/api/centinela/ota_progress")
+async def ota_progress(payload: schemas.OTAProgress):
+    try:
+        device_id = int(payload.device_id)
+        if device_id in manager.client_telemetry:
+            manager.client_telemetry[device_id]["ota_status"] = payload.status
+            manager.client_telemetry[device_id]["ota_progress"] = payload.progress
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+from fastapi.responses import FileResponse
+
+@app.post("/api/centinela/{device_id}/force_update")
+async def force_update(device_id: int):
+    if device_id in manager.active_connections:
+        ws = manager.active_connections[device_id]
+        try:
+            await ws.send_json({"type": "command", "action": "force_update"})
+            return {"status": "ok", "message": "Command sent"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    return {"status": "error", "message": "Agent not connected"}
+
+@app.get("/api/centinela/download_update")
+def download_update():
+    file_path = os.path.join("updates", "ApolloSetup.exe")
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="application/octet-stream", filename="ApolloSetup.exe")
+    return {"error": "File not found"}
+
 @app.get("/api/centinela/update_check")
 def check_update():
     version_file = os.path.join("updates", "version.json")
@@ -2784,3 +2823,148 @@ def check_update():
         except Exception as e:
             return {"error": str(e)}
     return {"version": "0.0.0", "url": ""}
+
+
+
+# ==========================================
+# RUTAS DE BACKUP Y RESTORE ENCRIPTADO
+# ==========================================
+BACKUP_ENCRYPTION_KEY = b'G1yB-o_x3t1U7pM7M3o1I9_z1Y0XqPzG1yB-o_x3t1U='
+cipher_suite = Fernet(BACKUP_ENCRYPTION_KEY)
+
+def get_pg_dump_path():
+    possible_paths = [
+        "pg_dump", 
+        r"C:\Program Files\PostgreSQL\15\bin\pg_dump.exe",
+        r"C:\Program Files\PostgreSQL\14\bin\pg_dump.exe",
+        r"C:\Program Files\PostgreSQL\13\bin\pg_dump.exe",
+        r"C:\Program Files\PostgreSQL\12\bin\pg_dump.exe",
+    ]
+    for path in possible_paths:
+        if path == "pg_dump":
+            try:
+                subprocess.run(["pg_dump", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                return "pg_dump"
+            except:
+                continue
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError("No se encontr pg_dump en el servidor.")
+
+def get_psql_path():
+    possible_paths = [
+        "psql", 
+        r"C:\Program Files\PostgreSQL\15\bin\psql.exe",
+        r"C:\Program Files\PostgreSQL\14\bin\psql.exe",
+        r"C:\Program Files\PostgreSQL\13\bin\psql.exe",
+        r"C:\Program Files\PostgreSQL\12\bin\psql.exe",
+    ]
+    for path in possible_paths:
+        if path == "psql":
+            try:
+                subprocess.run(["psql", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                return "psql"
+            except:
+                continue
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError("No se encontr psql en el servidor.")
+
+@app.get("/api/backup")
+def backup_database(current_user: models.User = Depends(get_current_user)):
+    from database import DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME
+    if current_user.rol != 'admin':
+        raise HTTPException(status_code=403, detail="Solo administradores pueden hacer backups.")
+    
+    try:
+        pg_dump = get_pg_dump_path()
+        env = os.environ.copy()
+        env['PGPASSWORD'] = DB_PASSWORD
+        
+        fd_raw, raw_path = tempfile.mkstemp(suffix=".sql")
+        os.close(fd_raw)
+        
+        fd_enc, enc_path = tempfile.mkstemp(suffix=".apbk")
+        os.close(fd_enc)
+        
+        cmd = [
+            pg_dump,
+            "-h", DB_HOST,
+            "-p", str(DB_PORT),
+            "-U", DB_USER,
+            "-d", DB_NAME,
+            "--clean",
+            "--if-exists",
+            "-F", "p", 
+            "-f", raw_path
+        ]
+        
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"pg_dump fall: {result.stderr}")
+            
+        with open(raw_path, "rb") as f_in:
+            raw_data = f_in.read()
+            
+        encrypted_data = cipher_suite.encrypt(raw_data)
+        
+        with open(enc_path, "wb") as f_out:
+            f_out.write(encrypted_data)
+            
+        os.remove(raw_path)
+        
+        filename = f"ApolloBackup_{time.strftime('%Y%m%d_%H%M%S')}.apbk"
+        return FileResponse(enc_path, filename=filename, media_type="application/octet-stream")
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/restore")
+async def restore_database(file: UploadFile = File(...), current_user: models.User = Depends(get_current_user)):
+    from database import DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME
+    if current_user.rol != 'admin':
+        raise HTTPException(status_code=403, detail="Solo administradores pueden restaurar backups.")
+    
+    if not file.filename.endswith(".apbk"):
+        raise HTTPException(status_code=400, detail="Formato de archivo invǭlido. Debe ser un backup de Apollo (.apbk).")
+        
+    try:
+        psql = get_psql_path()
+        env = os.environ.copy()
+        env['PGPASSWORD'] = DB_PASSWORD
+        
+        encrypted_data = await file.read()
+        
+        try:
+            raw_data = cipher_suite.decrypt(encrypted_data)
+        except Exception:
+            raise HTTPException(status_code=400, detail="El archivo estǭ corrupto o la clave no coincide.")
+        
+        fd_raw, raw_path = tempfile.mkstemp(suffix=".sql")
+        os.close(fd_raw)
+        
+        with open(raw_path, "wb") as f_out:
+            f_out.write(raw_data)
+            
+        cmd = [
+            psql,
+            "-h", DB_HOST,
+            "-p", str(DB_PORT),
+            "-U", DB_USER,
+            "-d", DB_NAME,
+            "-f", raw_path
+        ]
+        
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        
+        os.remove(raw_path)
+        
+        if result.returncode != 0:
+            raise Exception(f"La restauracin fall (psql error): {result.stderr}")
+            
+        return {"status": "ok", "message": "Base de datos restaurada con Ǹxito."}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

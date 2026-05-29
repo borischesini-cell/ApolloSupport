@@ -1,1 +1,4 @@
-{version: 3.1.2, url: https://support.ultimate.net.ar/updates/ApolloSetup.exe}
+{
+    "version": "3.1.23",
+    "url": "https://support.ultimate.net.ar/api/centinela/download_update"
+}

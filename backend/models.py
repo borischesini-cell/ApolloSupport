@@ -177,6 +177,7 @@ class CentinelaDevice(Base):
     session_start = Column(DateTime, nullable=True)
     notes = Column(Text, nullable=True)
     last_erp_update = Column(String, nullable=True)
+    last_support_date = Column(DateTime, nullable=True)
     cliente = relationship("Client", back_populates="devices")
     technician = relationship("User")
 
