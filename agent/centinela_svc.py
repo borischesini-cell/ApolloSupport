@@ -161,7 +161,7 @@ def get_active_session_id():
 
     return best_session
 
-def spawn_in_user_session(exe_path, session_id=None):
+def spawn_in_user_session(exe_path, args="", session_id=None):
     """
     Lanza exe_path en la sesion interactiva del usuario usando WTSQueryUserToken.
     Retorna el handle del proceso o None si falla.
@@ -261,7 +261,8 @@ def spawn_in_user_session(exe_path, session_id=None):
     work_dir = os.path.dirname(exe_path)
     app_name = ctypes.create_unicode_buffer(exe_path)
     # lpCommandLine debe ser buffer mutable; con lpApplicationName fijado, el comando puede citar el mismo exe
-    cmdline = ctypes.create_unicode_buffer(f'"{exe_path}"')
+    cmdline_str = f'"{exe_path}"' if not args else f'"{exe_path}" {args}'
+    cmdline = ctypes.create_unicode_buffer(cmdline_str)
     work_buf = ctypes.create_unicode_buffer(work_dir)
 
     try:
@@ -575,51 +576,13 @@ def run_as_service():
             # --- LOGIN INJECTION SIGNAL CHECK ---
             inject_pwd_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "inject_password.txt")
             if os.path.isfile(inject_pwd_file):
-                logger.info("[LOGIN] Detectado signal inject_password.txt. Tipeando password...")
+                logger.info("[LOGIN] Detectado signal inject_password.txt. Delegando al Companion en Winlogon...")
                 try:
-                    with open(inject_pwd_file, "r") as f:
-                        pwd = f.read()
-                    os.remove(inject_pwd_file)
-                    
-                    # Usar keyboard_event para tipear el password como SYSTEM
-                    import ctypes
-                    
-                    # 1. Despertar pantalla por si acaso
-                    ES_CONTINUOUS = 0x80000000
-                    ES_DISPLAY_REQUIRED = 0x00000002
-                    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
-                    ctypes.windll.user32.mouse_event(0x0001, 1, 1, 0, 0)
-                    time.sleep(1)
-                    
-                    # 2. Tipear cada letra
-                    for char in pwd:
-                        vk = ctypes.windll.user32.VkKeyScanW(ord(char))
-                        shift = (vk & 0x0100) != 0
-                        ctrl = (vk & 0x0200) != 0
-                        alt = (vk & 0x0400) != 0
-                        vk_code = vk & 0xFF
-                        
-                        if shift: ctypes.windll.user32.keybd_event(0x10, 0, 0, 0) # Shift down
-                        if ctrl: ctypes.windll.user32.keybd_event(0x11, 0, 0, 0) # Ctrl down
-                        if alt: ctypes.windll.user32.keybd_event(0x12, 0, 0, 0) # Alt down
-                        
-                        ctypes.windll.user32.keybd_event(vk_code, 0, 0, 0) # Key down
-                        ctypes.windll.user32.keybd_event(vk_code, 0, 2, 0) # Key up
-                        
-                        if alt: ctypes.windll.user32.keybd_event(0x12, 0, 2, 0) # Alt up
-                        if ctrl: ctypes.windll.user32.keybd_event(0x11, 0, 2, 0) # Ctrl up
-                        if shift: ctypes.windll.user32.keybd_event(0x10, 0, 2, 0) # Shift up
-                        
-                        time.sleep(0.02)
-                    
-                    # 3. Enter
-                    ctypes.windll.user32.keybd_event(0x0D, 0, 0, 0)
-                    ctypes.windll.user32.keybd_event(0x0D, 0, 2, 0)
-                    
-                    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-                    logger.info("[LOGIN] Password inyectado y ENTER enviado.")
+                    # Usamos spawn_in_user_session para lanzar el companion dentro del desktop de Winlogon
+                    # Esto garantiza que el proceso tiene acceso interactivo para inyectar teclas.
+                    spawn_in_user_session(COMPANION_EXE, args="--type-credentials")
                 except Exception as e:
-                    logger.error(f"[LOGIN] Error inyectando password: {e}")
+                    logger.error(f"[LOGIN] Error lanzando companion para login: {e}")
                     
             # --- OTA UPDATE SIGNAL CHECK ---
             force_ota_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "force_ota.txt")

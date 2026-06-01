@@ -11,12 +11,15 @@ echo.
 cd /d "%~dp0"
 
 :: 1. Activar Entorno Virtual si existe
-if exist venv\Scripts\activate.bat (
-    echo [*] Activando entorno virtual de Python (venv)...
-    call venv\Scripts\activate.bat
-) else (
-    echo [!] ADVERTENCIA: No se encontro la carpeta 'venv'. Se ejecutara usando el Python global.
-)
+if not exist venv\Scripts\activate.bat goto no_venv
+echo [*] Activando entorno virtual de Python (venv)...
+call venv\Scripts\activate.bat
+goto venv_done
+
+:no_venv
+echo [!] ADVERTENCIA: No se encontro la carpeta 'venv'. Se ejecutara usando el Python global.
+
+:venv_done
 
 echo.
 :: 2. Instalar / Actualizar dependencias de requirements.txt
@@ -26,10 +29,10 @@ pip install -r requirements.txt
 
 echo.
 :: 3. Inicializacion automatica de tablas de la base de datos (seguro de ejecutar siempre)
-if exist create_db.py (
-    echo [*] Verificando e inicializando tablas en la Base de Datos...
-    python create_db.py
-)
+if not exist create_db.py goto skip_db
+echo [*] Verificando e inicializando tablas en la Base de Datos...
+python create_db.py
+:skip_db
 
 echo.
 :: 4. Iniciar Servidor FastAPI con Uvicorn expuesto para conexiones externas

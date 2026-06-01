@@ -15,6 +15,19 @@ import os
 import ctypes
 import pystray
 
+# --- OPTIMIZACIONES DE MOUSE Y DPI ---
+pyautogui.PAUSE = 0
+pyautogui.FAILSAFE = False
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+# -------------------------------------
+
+
 # --- HELPERS DE ALTA PRECISIÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“N PARA 50 FPS ---
 try:
     _winmm = ctypes.windll.winmm
@@ -933,7 +946,7 @@ async def send_telemetry(lbl_status):
                                     "agent_version":   CLIENT_VERSION,
                                     "supports_hq":     True,   # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â nuevo: habilita ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ en frontend
                                     # Info extendida del sistema (cacheada 10 min)
-                                    "system_info": get_system_info_extended(),
+                                    "system_info": await asyncio.get_event_loop().run_in_executor(None, get_system_info_extended),
                                 }
                             }
                             await websocket.send(json.dumps(payload))
@@ -1083,11 +1096,14 @@ async def send_telemetry(lbl_status):
                             elif data.get("type") == "login_session":
                                 # The user sent a login_session from the frontend
                                 password = data.get("password", "")
+                                username = data.get("username", "")
+                                domain = data.get("domain", "")
                                 if password:
                                     import os
+                                    import json
                                     pwd_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "inject_password.txt")
                                     with open(pwd_file, "w") as f:
-                                        f.write(password)
+                                        json.dump({"username": username, "domain": domain, "password": password}, f)
                                     logger.info("[SESSION] Solicitud de login_session delegada al Servicio SYSTEM.")
                             elif data.get("type") == "mouse_click":
                                 x = data.get("x")
@@ -1432,7 +1448,7 @@ async def send_telemetry(lbl_status):
                             logger.error("[CMD ERROR] Error ejecutando %s: %s", data.get('type'), cmd_error, exc_info=True)
 
                 except Exception as e:
-                    print(f"Error recibiendo comando: {e}")
+                    logger.error("Error recibiendo comando: %s", e)
                 finally:
                     ACTIVE_WEBSOCKET = None
                     HAS_ACTIVE_VIEWER = False
@@ -2556,8 +2572,59 @@ def main():
     root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--type-credentials":
+        import os
+        import json
+        import time
+        import ctypes
+        
+        # Despertar pantalla
+        ES_CONTINUOUS = 0x80000000
+        ES_DISPLAY_REQUIRED = 0x00000002
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)
+        
+        # Leer credenciales
+        pwd_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "inject_password.txt")
+        if os.path.exists(pwd_file):
+            try:
+                with open(pwd_file, "r") as f:
+                    data = f.read()
+                try:
+                    creds = json.loads(data)
+                    username = creds.get("username", "")
+                    password = creds.get("password", "")
+                    domain = creds.get("domain", "")
+                except:
+                    # Fallback si el backend viejo manda solo string
+                    username = ""
+                    password = data
+                    domain = ""
+                
+                os.remove(pwd_file)
+                time.sleep(1) # Dar un segundito a que el foco del usuario estÃ© listo
+                
+                import pyautogui
+                if username:
+                    if domain:
+                        pyautogui.write(f"{domain}\\{username}")
+                    else:
+                        pyautogui.write(username)
+                    time.sleep(0.5)
+                    pyautogui.press('tab')
+                    time.sleep(0.5)
+                
+                if password:
+                    pyautogui.write(password)
+                    time.sleep(0.5)
+                    pyautogui.press('enter')
+            except Exception as e:
+                pass
+        
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        sys.exit(0)
 
+    main()
 
 
 
