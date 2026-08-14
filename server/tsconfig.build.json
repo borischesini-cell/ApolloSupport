@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "moduleResolution": "Node",
+    "module": "ESNext",
+    "noEmit": false
+  },
+  "exclude": ["src/**/*.test.ts"]
+}

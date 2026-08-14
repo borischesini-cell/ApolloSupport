@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+
+# Local SQLite database files (generated at runtime)
+server/data/*.db
+server/data/*.db-*
+
+.DS_Store
+.env
+.env.local
