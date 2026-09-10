@@ -1,23 +1,47 @@
-import { StrictMode } from 'react'
+import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
+import PwaUpdateBanner from './PwaUpdateBanner.tsx'
+import {
+  ensureFreshPortalBundle,
+  registerPortalServiceWorker,
+  reloadForNewBundle,
+  type UpdateInfo,
+} from './pwa'
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+function Root() {
+  const [pendingUpdate, setPendingUpdate] = useState<UpdateInfo | null>(null);
 
-// Registrar el Service Worker para habilitar PWA
-if ('serviceWorker' in navigator && import.meta.env.PROD) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js')
-      .then(reg => {
-        console.log('Service Worker registrado con éxito en el ámbito:', reg.scope);
-      })
-      .catch(err => {
-        console.error('Error al registrar el Service Worker:', err);
-      });
-  });
+  useEffect(() => {
+    registerPortalServiceWorker((info) => {
+      setPendingUpdate((prev) => prev ?? info);
+    });
+  }, []);
+
+  return (
+    <>
+      <App />
+      <PwaUpdateBanner
+        update={pendingUpdate}
+        onDismiss={() => setPendingUpdate(null)}
+      />
+    </>
+  );
 }
+
+async function bootstrap() {
+  const needsReload = await ensureFreshPortalBundle();
+  if (needsReload) {
+    reloadForNewBundle();
+    return;
+  }
+
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <Root />
+    </StrictMode>,
+  );
+}
+
+void bootstrap();

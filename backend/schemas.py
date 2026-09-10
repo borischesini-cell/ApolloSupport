@@ -6,7 +6,7 @@ Descripción: Estos modelos aseguran que la información que entra y sale de
 la API tenga el formato correcto y sea segura.
 -------------------------------------------------------------------------
 """
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import List, Optional
 from datetime import datetime, date
 
@@ -40,6 +40,20 @@ class ClientBase(BaseModel):
     apikey_apollo: Optional[str] = None
     remote_password: Optional[str] = None
 
+    @field_validator("fecha_ultimo_pago", "fecha_registro", mode="before")
+    @classmethod
+    def empty_date_to_none(cls, value):
+        if value in (None, "", "None"):
+            return None
+        return value
+
+    @field_validator("fecha_vencimiento", mode="before")
+    @classmethod
+    def empty_datetime_to_none(cls, value):
+        if value in (None, "", "None"):
+            return None
+        return value
+
 class ClientCreate(ClientBase):
     pass
 
@@ -53,6 +67,7 @@ class CentinelaDeviceBase(BaseModel):
     client_id: Optional[int] = None
     device_name: str
     remote_password: Optional[str] = None
+    assist_id: Optional[str] = None
     alt_remote_id: Optional[str] = None
 
 class ProposedClientOut(BaseModel):
@@ -318,3 +333,129 @@ class OTAProgress(BaseModel):
     device_id: str
     status: str
     progress: int
+
+
+# =======================
+# ESTADOS DE CUENTA CORRIENTE (ClasiCli)
+# =======================
+class EstadoCuentaCorrienteBase(BaseModel):
+    codigo: str
+    descripcion: str = ""
+    activo: bool = True
+
+
+class EstadoCuentaCorrienteCreate(EstadoCuentaCorrienteBase):
+    pass
+
+
+class EstadoCuentaCorrienteUpdate(BaseModel):
+    descripcion: Optional[str] = None
+    activo: Optional[bool] = None
+
+
+class EstadoCuentaCorrienteOut(EstadoCuentaCorrienteBase):
+    id: int
+    origen: Optional[str] = "manual"
+
+    class Config:
+        from_attributes = True
+
+
+# =======================
+# AGENDA: GRABACIONES + REUNIONES
+# =======================
+class ScheduledRecordingCreate(BaseModel):
+    client_id: int
+    device_id: int
+    technician_id: int
+    scheduled_at: datetime
+    duration_minutes: int = 30
+    notes: Optional[str] = None
+
+
+class ScheduledRecordingUpdate(BaseModel):
+    scheduled_at: Optional[datetime] = None
+    duration_minutes: Optional[int] = None
+    technician_id: Optional[int] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+
+class ScheduledRecordingOut(BaseModel):
+    id: int
+    client_id: int
+    device_id: int
+    technician_id: int
+    scheduled_at: datetime
+    duration_minutes: int
+    status: str
+    support_session_id: Optional[int] = None
+    file_path: Optional[str] = None
+    file_size: Optional[int] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    client_name: Optional[str] = None
+    device_name: Optional[str] = None
+    assist_id: Optional[str] = None
+    technician_name: Optional[str] = None
+    has_video: bool = False
+    duration_seconds: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ScheduledMeetingCreate(BaseModel):
+    client_id: int
+    title: str
+    agenda: Optional[str] = None
+    starts_at: datetime
+    duration_minutes: int = 30
+    notify_minutes_before: int = 15
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+
+
+class ScheduledMeetingUpdate(BaseModel):
+    title: Optional[str] = None
+    agenda: Optional[str] = None
+    starts_at: Optional[datetime] = None
+    duration_minutes: Optional[int] = None
+    notify_minutes_before: Optional[int] = None
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+    status: Optional[str] = None
+
+
+class ScheduledMeetingOut(BaseModel):
+    id: int
+    client_id: int
+    host_user_id: int
+    title: str
+    agenda: Optional[str] = None
+    starts_at: datetime
+    duration_minutes: int
+    join_url: str
+    status: str
+    notify_minutes_before: int
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+    alert_sent_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    client_name: Optional[str] = None
+    host_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MeetingShareOut(BaseModel):
+    join_url: str
+    message: str
+    mailto: Optional[str] = None
+    wa_url: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None

@@ -1,6 +1,6 @@
 import os
 import sys
-# Asegurar que el directorio de este script estÃ© en el sys.path para resoluciÃ³n robusta de paquetes ('core', 'models', etc.)
+# Asegurar que el directorio de este script esté en el sys.path para resolución robusta de paquetes ('core', 'models', etc.)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import logging
@@ -8,9 +8,9 @@ import logging.handlers
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # LOGGING ESTRUCTURADO
-# - Archivo rotativo diario, retenciÃ³n 30 dÃ­as
-# - Formato: timestamp | level | mÃ³dulo | mensaje
-# - Salida simultÃ¡nea a consola y archivo
+# - Archivo rotativo diario, retención 30 días
+# - Formato: timestamp | level | módulo | mensaje
+# - Salida simultánea a consola y archivo
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -24,7 +24,7 @@ log_formatter = logging.Formatter(
 file_handler = logging.handlers.RotatingFileHandler(
     filename=os.path.join(LOG_DIR, "apollo.log"),
     maxBytes=10 * 1024 * 1024,  # 10 MB por archivo
-    backupCount=5,              # Retener 5 archivos histÃ³ricos (50 MB total max)
+    backupCount=5,              # Retener 5 archivos históricos (50 MB total max)
     encoding="utf-8"
 )
 file_handler.setFormatter(log_formatter)
@@ -35,10 +35,10 @@ console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(log_formatter)
 console_handler.setLevel(logging.INFO)
 
-# Logger raÃ­z de la aplicaciÃ³n
+# Logger raíz de la aplicación
 logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler])
 
-# Silenciar loggers ruidosos de librerÃ­as externas
+# Silenciar loggers ruidosos de librerías externas
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.ERROR)   # Silencia cada request HTTP
 logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
@@ -49,11 +49,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("apollo")
 logger.info("=== ApolloSupport Backend iniciando ===")
 
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, File, UploadFile, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy import text
 from typing import List, Dict, Any, Optional
 from jose import JWTError, jwt
 from datetime import datetime
@@ -76,11 +77,15 @@ import auth
 import httpx
 from core.erp_bridge import ERPBridge
 
-# Instanciamos la AplicaciÃ³n FastAPI
+BACKEND_VERSION = "3.2.6"
+BACKEND_BUILD = "2026-06-02"
+BACKEND_VERSION_TAG = "WebCodecs-HD"
+
+# Instanciamos la Aplicación FastAPI
 app = FastAPI(
     title="ApolloSupport API",
     description="Motor Central Seguro para Master IS.",
-    version="1.0.0",
+    version=BACKEND_VERSION,
     docs_url="/documentacion"
 )
 
@@ -96,11 +101,11 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info("="*60)
-    logger.info("APOLLO BACKEND V3.1 - CON SOPORTE HQ ACTIVADO")
+    logger.info("APOLLO BACKEND v%s build %s (%s)", BACKEND_VERSION, BACKEND_BUILD, BACKEND_VERSION_TAG)
     logger.info("="*60)
     try:
         print("\n" + "="*60)
-        print("APOLLO BACKEND V3.1 - CON SOPORTE HQ ACTIVADO")
+        print(f"APOLLO BACKEND v{BACKEND_VERSION} build {BACKEND_BUILD} ({BACKEND_VERSION_TAG})")
         print("="*60 + "\n")
     except Exception:
         pass
@@ -108,9 +113,22 @@ async def startup_event():
 @app.get("/api/hq-test")
 def test_hq_endpoint():
     return {
-        "status": "OK", 
-        "mensaje": "El nuevo backend esta corriendo perfectamente!", 
-        "version": "3.1-HQ"
+        "status": "OK",
+        "mensaje": "Backend Apollo activo",
+        "version": BACKEND_VERSION,
+        "build": BACKEND_BUILD,
+        "tag": BACKEND_VERSION_TAG,
+    }
+
+
+@app.get("/api/version")
+def get_app_version():
+    """Versión desplegada del backend (pública, sin auth)."""
+    return {
+        "component": "backend",
+        "version": BACKEND_VERSION,
+        "build": BACKEND_BUILD,
+        "tag": BACKEND_VERSION_TAG,
     }
 
 from fastapi import Request
@@ -146,8 +164,23 @@ app.mount("/updates", StaticFiles(directory="updates"), name="static_updates")
 
 models.Base.metadata.create_all(bind=engine)
 
+def _ensure_centinela_assist_id_column():
+    """Agrega centinela_devices.assist_id si falta (ID que muestra ApolloSoporte)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE centinela_devices ADD COLUMN IF NOT EXISTS assist_id VARCHAR"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_centinela_devices_assist_id ON centinela_devices (assist_id)"
+            ))
+    except Exception as e:
+        logger.warning("[SCHEMA] No se pudo asegurar columna assist_id: %s", e)
+
+_ensure_centinela_assist_id_column()
+
 async def server_ping_loop(device_id: int):
-    """ Mantiene viva la conexiÃ³n WebSocket enviando un ping cada 20 segundos. """
+    """ Mantiene viva la conexión WebSocket enviando un ping cada 20 segundos. """
     while True:
         await asyncio.sleep(20)
         try:
@@ -174,7 +207,7 @@ def _db_cleanup_device_on_idle_viewers(device_id: int):
 
 
 async def periodic_viewer_cleanup():
-    logger.info("[CLEANUP] Tarea periÃ³dica de monitoreo de espectadores iniciada.")
+    logger.info("[CLEANUP] Tarea periódica de monitoreo de espectadores iniciada.")
     while True:
         try:
             await asyncio.sleep(4.0)
@@ -203,6 +236,14 @@ async def periodic_viewer_cleanup():
                     # OJO: Si hay viewers por WS, no enviar array vacio, usar un placeholder
                     final_viewers = list(active_viewers)
                     has_ws_viewers = (device_id in manager.viewer_connections and len(manager.viewer_connections[device_id]) > 0) or manager.has_hq_viewers(device_id)
+                    try:
+                        from session_recorder import recorder_manager
+                        if recorder_manager.is_recording_device(device_id):
+                            has_ws_viewers = True
+                            if "Grabador Agenda" not in final_viewers:
+                                final_viewers.append("Grabador Agenda")
+                    except Exception:
+                        pass
                     
                     if len(final_viewers) == 0 and has_ws_viewers:
                         final_viewers = ["Soporte Web (WS)"]
@@ -218,7 +259,7 @@ async def periodic_viewer_cleanup():
                     if len(viewers_dict) == 0 and not has_ws_viewers:
                         await asyncio.to_thread(_db_cleanup_device_on_idle_viewers, device_id)
         except Exception as e:
-            logger.error(f"[CLEANUP ERROR] Error en limpieza periÃ³dica de espectadores: {e}")
+            logger.error(f"[CLEANUP ERROR] Error en limpieza periódica de espectadores: {e}")
 
 # Resetear estado online de dispositivos al iniciar el servidor
 @app.on_event("startup")
@@ -227,6 +268,12 @@ def startup_event():
     asyncio.get_event_loop().create_task(periodic_viewer_cleanup())
     asyncio.get_event_loop().create_task(periodic_orphan_session_cleanup())
     asyncio.get_event_loop().create_task(periodic_zombie_cleanup())
+    try:
+        from agenda import periodic_agenda_worker as _agenda_worker
+        asyncio.get_event_loop().create_task(_agenda_worker())
+        logger.info("[STARTUP] Agenda worker programado")
+    except Exception as e:
+        logger.error("[STARTUP] No se pudo iniciar agenda worker: %s", e)
 
     db = SessionLocal()
     try:
@@ -236,9 +283,9 @@ def startup_event():
             models.CentinelaDevice.session_start: None
         })
         db.commit()
-        logger.info("[STARTUP] Reset de estado online y liberaciÃ³n de dispositivos completado.")
+        logger.info("[STARTUP] Reset de estado online y liberación de dispositivos completado.")
 
-        # Cerrar sesiones huÃ©rfanas que quedaron abiertas del reinicio anterior
+        # Cerrar sesiones huérfanas que quedaron abiertas del reinicio anterior
         _close_orphaned_sessions(db)
     except Exception as e:
         logger.error("[STARTUP] Error al resetear estados de dispositivos: %s", e)
@@ -249,8 +296,8 @@ def startup_event():
 def _close_orphaned_sessions(db: Session):
     """
     Cierra SupportSessions cuyo end_time es NULL y el dispositivo no se vio
-    en los Ãºltimos 10 minutos. Esto cubre el caso en que el tÃ©cnico cierra
-    el navegador sin hacer clic en 'Cerrar ConexiÃ³n'.
+    en los últimos 10 minutos. Esto cubre el caso en que el técnico cierra
+    el navegador sin hacer clic en 'Cerrar Conexión'.
     """
     try:
         cutoff = datetime.utcnow() - timedelta(minutes=10)
@@ -263,16 +310,16 @@ def _close_orphaned_sessions(db: Session):
             device = db.query(models.CentinelaDevice).filter(
                 models.CentinelaDevice.id == s.device_id
             ).first()
-            # Si el dispositivo no existe o no se vio en 10 min â†’ cerrar sesiÃ³n
+            # Si el dispositivo no existe o no se vio en 10 min â†’ cerrar sesión
             if device is None or (device.last_seen and device.last_seen < cutoff):
                 s.end_time = datetime.utcnow()
                 closed += 1
 
         if closed:
             db.commit()
-            logger.warning("[ORPHAN] Cerradas %d sesiones huÃ©rfanas al iniciar.", closed)
+            logger.warning("[ORPHAN] Cerradas %d sesiones huérfanas al iniciar.", closed)
     except Exception as e:
-        logger.error("[ORPHAN] Error cerrando sesiones huÃ©rfanas: %s", e)
+        logger.error("[ORPHAN] Error cerrando sesiones huérfanas: %s", e)
 
 
 def _db_run_orphan_session_cleanup():
@@ -280,17 +327,17 @@ def _db_run_orphan_session_cleanup():
     try:
         _close_orphaned_sessions(db)
     except Exception as e:
-        logger.error("[ORPHAN] Error en ciclo periÃ³dico: %s", e)
+        logger.error("[ORPHAN] Error en ciclo periódico: %s", e)
     finally:
         db.close()
 
 
 async def periodic_orphan_session_cleanup():
     """
-    Tarea periÃ³dica que cierra sesiones de soporte huÃ©rfanas cada 5 minutos.
-    Una sesiÃ³n es huÃ©rfana si end_time=NULL y el agente no se vio en 10+ minutos.
+    Tarea periódica que cierra sesiones de soporte huérfanas cada 5 minutos.
+    Una sesión es huérfana si end_time=NULL y el agente no se vio en 10+ minutos.
     """
-    logger.info("[ORPHAN] Tarea de limpieza de sesiones huÃ©rfanas iniciada.")
+    logger.info("[ORPHAN] Tarea de limpieza de sesiones huérfanas iniciada.")
     while True:
         await asyncio.sleep(300)  # Cada 5 minutos
         await asyncio.to_thread(_db_run_orphan_session_cleanup)
@@ -329,18 +376,18 @@ async def periodic_zombie_cleanup():
 
 
 # ==========================================
-# CONFIGURACIÃ“N DE SEGURIDAD (OAUTH2)
+# CONFIGURACIÓN DE SEGURIDAD (OAUTH2)
 # ==========================================
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     """ 
     Filtro de Seguridad: Revisa si el usuario trajo su llave (JWT).
-    Se usa inyectÃ¡ndolo en las rutas que queramos proteger.
+    Se usa inyectándolo en las rutas que queramos proteger.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Credenciales invÃ¡lidas o sesiÃ³n expirada.",
+        detail="Credenciales inválidas o sesión expirada.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
@@ -357,7 +404,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 async def send_push_notification(expo_token: str, title: str, body: str):
-    """ EnvÃ­a una notificaciÃ³n Push a travÃ©s de los servidores de Expo. """
+    """ Envía una notificación Push a través de los servidores de Expo. """
     url = "https://exp.host/--/api/v2/push/send"
     payload = {
         "to": expo_token,
@@ -382,11 +429,11 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     # Buscamos el email
     user = db.query(models.User).filter(models.User.email == form_data.username).first()
     
-    # Comprobamos la clave encriptada cruzÃ¡ndola con la tipeada
+    # Comprobamos la clave encriptada cruzándola con la tipeada
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Email o contraseÃ±a incorrectos",
+            detail="Email o contraseña incorrectos",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
@@ -395,7 +442,7 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     user.last_login = datetime.utcnow()
     user.last_activity = datetime.utcnow()
     user.current_page = "Dashboard"
-    user.current_task = "IniciÃ³ sesiÃ³n"
+    user.current_task = "Inició sesión"
     db.commit()
     
     # Otorgamos el token de pase
@@ -418,7 +465,7 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
 
 @app.get("/api/public/users", response_model=List[Dict[str, Any]], tags=["Seguridad"])
 def obtener_usuarios_publicos(db: Session = Depends(get_db)):
-    """ Retorna una lista pÃºblica de nombres y correos de los usuarios activos para sugerencias de autocompletado """
+    """ Retorna una lista pública de nombres y correos de los usuarios activos para sugerencias de autocompletado """
     users = db.query(models.User).filter(models.User.activo == True).order_by(models.User.nombre.asc()).all()
     return [{"email": u.email, "nombre": u.nombre} for u in users]
 
@@ -449,7 +496,28 @@ def test_db_write(db: Session = Depends(get_db)):
 # ==========================================
 @app.post("/api/clients/", response_model=schemas.ClientOut, tags=["Clientes"])
 def crear_cliente(cliente: schemas.ClientCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    db_client = models.Client(**cliente.model_dump())
+    import erp_licensing as _el
+    payload = cliente.model_dump()
+    payload = _apply_clasificacion_from_catalog(db, payload)
+    codigo = (payload.get("codigo") or "").strip().upper()
+    if codigo.isdigit():
+        codigo = codigo.zfill(4)[:4]
+    if codigo:
+        payload["codigo"] = codigo
+        if db.query(models.Client).filter(models.Client.codigo == codigo).first():
+            raise HTTPException(status_code=400, detail=f"El número de cliente ya existe ({codigo})")
+        versi = (payload.get("version_apollo") or "E")[:1].upper()
+        payload["version_apollo"] = versi
+        if versi in "ESRP" and not _el.check_client_code_version(codigo, versi):
+            raise HTTPException(status_code=400, detail="El número de Cliente (Serie) no coincide con la Versión de AGC.")
+        import cligesco_dbf
+        if cligesco_dbf.code_exists(codigo):
+            raise HTTPException(status_code=400, detail=f"El número de cliente ya existe en CLIGESCO.DBF ({codigo})")
+        try:
+            cligesco_dbf.upsert_client(payload, create=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"No se pudo grabar CLIGESCO.DBF: {e}")
+    db_client = models.Client(**payload)
     db.add(db_client)
     db.commit()
     db.refresh(db_client)
@@ -459,15 +527,269 @@ def crear_cliente(cliente: schemas.ClientCreate, db: Session = Depends(get_db), 
 def obtener_clientes(skip: int = 0, limit: int = 5000, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     return db.query(models.Client).options(joinedload(models.Client.devices).joinedload(models.CentinelaDevice.technician)).order_by(models.Client.codigo.asc().nulls_last(), models.Client.razon_social.asc()).offset(skip).limit(limit).all()
 
+@app.get("/api/clients/next-code", tags=["Clientes"])
+def siguiente_codigo_gesacti(version: str = "E", db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """Sugiere el próximo código de 4 caracteres según la versión GesActi (E/S/R/P)."""
+    versi = (version or "E").upper()[:1]
+    codes = [c[0] for c in db.query(models.Client.codigo).filter(models.Client.codigo.isnot(None)).all() if c[0]]
+    try:
+        import cligesco_dbf
+        codes = list({*(c.strip().upper() for c in codes), *cligesco_dbf.list_codes()})
+    except Exception:
+        pass
+    matching = [c.strip().upper().ljust(4)[:4] for c in codes if erp_licensing.check_client_code_version(c, versi)]
+    def bump(code: str) -> str:
+        raw = code.strip()
+        if raw.isdigit():
+            return str(int(raw) + 1).zfill(4)[:4]
+        prefix, digits = "", ""
+        for ch in raw:
+            if ch.isdigit():
+                digits += ch
+            elif not digits:
+                prefix += ch
+        if digits:
+            nxt = str(int(digits) + 1).zfill(len(digits))
+            return (prefix + nxt).ljust(4)[:4]
+        return raw
+
+    if matching:
+        matching.sort()
+        suggested = bump(matching[-1])
+        while suggested in {x.strip().upper() for x in codes} or not erp_licensing.check_client_code_version(suggested, versi):
+            suggested = bump(suggested)
+            if suggested == matching[-1]:
+                break
+    else:
+        suggested = {"E": "0001", "S": "M001", "R": "R001", "P": "V001"}.get(versi, "0001")
+    return {"codigo": suggested, "version": versi}
+
 @app.post("/api/clients/sync", tags=["Clientes"])
 def sincronizar_clientes_dbf(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Sincroniza los clientes desde el archivo CLIGESCO.DBF local. """
+    """Sincroniza CLIGESCO.DBF y luego refresca saldos desde Ventas\\Clientes.CSaldo."""
     try:
         from sync_dbf_to_postgres import sync_data
         sync_data()
-        return {"status": "success", "message": "SincronizaciÃ³n de clientes DBF completada exitosamente."}
+        saldos = _sync_saldos_from_clientes_erp(db)
+        return {
+            "status": "success",
+            "message": "Sincronización DBF + saldos ERP (Clientes:CSaldo) completada.",
+            "saldos": saldos,
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error durante la sincronizaciÃ³n: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error durante la sincronización: {str(e)}")
+
+
+def _sync_saldos_from_clientes_erp(db: Session) -> dict:
+    """
+    Actualiza clients.saldo y fecha_ultimo_pago desde Ventas\\Clientes (CSaldo / CULPA),
+    matcheando por CCLIFAC (código de facturación ERP).
+    """
+    saldos = ERPBridge.browse_clientes_saldos()
+    updated = 0
+    skipped = 0
+    for cli in db.query(models.Client).filter(models.Client.cclifac.isnot(None)).all():
+        fac = str(cli.cclifac or "").strip()
+        if not fac:
+            skipped += 1
+            continue
+        keys = [fac]
+        if fac.isdigit():
+            keys.extend([fac.zfill(7), fac.lstrip("0") or "0", fac.zfill(5)])
+        hit = None
+        for k in keys:
+            if k in saldos:
+                hit = saldos[k]
+                break
+        if not hit:
+            skipped += 1
+            continue
+        cli.saldo = float(hit.get("saldo") or 0.0)
+        if hit.get("fecha_ultimo_pago") is not None:
+            cli.fecha_ultimo_pago = hit["fecha_ultimo_pago"]
+        updated += 1
+    db.commit()
+    return {"updated": updated, "skipped": skipped, "erp_clientes": len(saldos)}
+
+
+@app.post("/api/clients/sync-saldos-erp", tags=["Clientes"])
+def sincronizar_saldos_erp(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """Refresca saldos desde Clientes:CSaldo (sin tocar el resto de datos DBF)."""
+    try:
+        return {"status": "success", **_sync_saldos_from_clientes_erp(db)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error sincronizando saldos ERP: {str(e)}")
+
+
+# ==========================================
+# ESTADOS DE CUENTA CORRIENTE (ClasiCli ERP)
+# ==========================================
+def _normalize_estado_codigo(codigo: str) -> str:
+    c = (codigo or "").strip().upper()
+    if c.isdigit() and len(c) < 5:
+        c = c.zfill(5)
+    return c[:10]
+
+
+def _apply_clasificacion_from_catalog(db: Session, payload: dict) -> dict:
+    """Normaliza CCLAS y completa CNOMCLAS desde el catálogo de estados."""
+    cod = _normalize_estado_codigo(payload.get("clasificacion_codigo") or "")
+    if not cod:
+        payload["clasificacion_codigo"] = None
+        return payload
+    payload["clasificacion_codigo"] = cod
+    row = db.query(models.EstadoCuentaCorriente).filter(models.EstadoCuentaCorriente.codigo == cod).first()
+    if row:
+        payload["clasificacion_nombre"] = (row.descripcion or "").strip()
+    elif not (payload.get("clasificacion_nombre") or "").strip():
+        payload["clasificacion_nombre"] = cod
+    return payload
+
+
+@app.get("/api/estados-cuenta-corriente", response_model=List[schemas.EstadoCuentaCorrienteOut], tags=["Estados Cta Cte"])
+def listar_estados_cuenta_corriente(
+    solo_activos: bool = False,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    q = db.query(models.EstadoCuentaCorriente)
+    if solo_activos:
+        q = q.filter(models.EstadoCuentaCorriente.activo == True)  # noqa: E712
+    return q.order_by(models.EstadoCuentaCorriente.codigo.asc()).all()
+
+
+@app.post("/api/estados-cuenta-corriente", response_model=schemas.EstadoCuentaCorrienteOut, tags=["Estados Cta Cte"])
+def crear_estado_cuenta_corriente(
+    data: schemas.EstadoCuentaCorrienteCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    codigo = _normalize_estado_codigo(data.codigo)
+    if not codigo:
+        raise HTTPException(status_code=400, detail="El código es obligatorio.")
+    if db.query(models.EstadoCuentaCorriente).filter(models.EstadoCuentaCorriente.codigo == codigo).first():
+        raise HTTPException(status_code=400, detail=f"Ya existe el estado {codigo}.")
+    row = models.EstadoCuentaCorriente(
+        codigo=codigo,
+        descripcion=(data.descripcion or "").strip()[:60],
+        activo=bool(data.activo),
+        origen="manual",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.put("/api/estados-cuenta-corriente/{estado_id}", response_model=schemas.EstadoCuentaCorrienteOut, tags=["Estados Cta Cte"])
+def actualizar_estado_cuenta_corriente(
+    estado_id: int,
+    data: schemas.EstadoCuentaCorrienteUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = db.query(models.EstadoCuentaCorriente).filter(models.EstadoCuentaCorriente.id == estado_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Estado no encontrado.")
+    payload = data.model_dump(exclude_unset=True)
+    if "descripcion" in payload and payload["descripcion"] is not None:
+        row.descripcion = str(payload["descripcion"]).strip()[:60]
+    if "activo" in payload and payload["activo"] is not None:
+        row.activo = bool(payload["activo"])
+    # Propagar nombre a clientes que usan este código
+    if "descripcion" in payload:
+        db.query(models.Client).filter(models.Client.clasificacion_codigo == row.codigo).update(
+            {models.Client.clasificacion_nombre: row.descripcion},
+            synchronize_session=False,
+        )
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.delete("/api/estados-cuenta-corriente/{estado_id}", tags=["Estados Cta Cte"])
+def eliminar_estado_cuenta_corriente(
+    estado_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    row = db.query(models.EstadoCuentaCorriente).filter(models.EstadoCuentaCorriente.id == estado_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Estado no encontrado.")
+    usados = db.query(models.Client).filter(models.Client.clasificacion_codigo == row.codigo).count()
+    if usados:
+        row.activo = False
+        db.commit()
+        return {"status": "deactivated", "codigo": row.codigo, "clientes": usados, "message": "Estado en uso: se desactivó."}
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted", "codigo": row.codigo}
+
+
+@app.post("/api/estados-cuenta-corriente/sync-erp", tags=["Estados Cta Cte"])
+def sync_estados_cuenta_corriente_erp(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Importa/actualiza el catálogo desde Ventas\\ClasiCli del ERP."""
+    try:
+        items = ERPBridge.get_estados_cuenta_corriente()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"No se pudo leer ClasiCli del ERP: {e}")
+
+    # Asegurar NORMAL (00001) si el ERP no lo trae pero hay clientes con ese código
+    codes_erp = {i["codigo"] for i in items}
+    if "00001" not in codes_erp:
+        items.append({"codigo": "00001", "descripcion": "NORMAL"})
+
+    inserted = updated = 0
+    for item in items:
+        codigo = _normalize_estado_codigo(item.get("codigo") or "")
+        if not codigo:
+            continue
+        desc = (item.get("descripcion") or "").strip()[:60]
+        row = db.query(models.EstadoCuentaCorriente).filter(models.EstadoCuentaCorriente.codigo == codigo).first()
+        if row:
+            row.descripcion = desc or row.descripcion
+            row.activo = True
+            row.origen = "erp"
+            updated += 1
+        else:
+            db.add(models.EstadoCuentaCorriente(
+                codigo=codigo,
+                descripcion=desc or codigo,
+                activo=True,
+                origen="erp",
+            ))
+            inserted += 1
+    db.commit()
+
+    # Completar nombres vacíos en clientes según catálogo
+    catalog = {
+        e.codigo: e.descripcion
+        for e in db.query(models.EstadoCuentaCorriente).filter(models.EstadoCuentaCorriente.activo == True).all()  # noqa: E712
+    }
+    filled = 0
+    for cli in db.query(models.Client).filter(models.Client.clasificacion_codigo.isnot(None)).all():
+        cod = (cli.clasificacion_codigo or "").strip()
+        if not cod:
+            continue
+        if cod.isdigit() and len(cod) < 5:
+            cod = cod.zfill(5)
+            cli.clasificacion_codigo = cod
+        nombre = catalog.get(cod)
+        if nombre and (not cli.clasificacion_nombre or not str(cli.clasificacion_nombre).strip()):
+            cli.clasificacion_nombre = nombre
+            filled += 1
+    db.commit()
+    return {
+        "status": "success",
+        "from_erp": len(items),
+        "inserted": inserted,
+        "updated": updated,
+        "clientes_nombre_completado": filled,
+    }
+
 
 @app.put("/api/clients/{client_id}", response_model=schemas.ClientOut, tags=["Clientes"])
 def actualizar_cliente(client_id: int, cliente: schemas.ClientCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
@@ -475,8 +797,18 @@ def actualizar_cliente(client_id: int, cliente: schemas.ClientCreate, db: Sessio
     if not db_client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
-    for key, value in cliente.model_dump().items():
+    payload = cliente.model_dump()
+    payload = _apply_clasificacion_from_catalog(db, payload)
+    for key, value in payload.items():
         setattr(db_client, key, value)
+
+    if db_client.codigo:
+        payload["codigo"] = db_client.codigo
+        try:
+            import cligesco_dbf
+            cligesco_dbf.upsert_client(payload, create=False)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"No se pudo actualizar CLIGESCO.DBF: {e}")
     
     db.commit()
     db.refresh(db_client)
@@ -489,18 +821,24 @@ def eliminar_cliente(client_id: int, db: Session = Depends(get_db), current_user
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
     db_client.activo = not db_client.activo
+    if db_client.codigo:
+        try:
+            import cligesco_dbf
+            cligesco_dbf.set_activo(db_client.codigo, db_client.activo)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"No se pudo actualizar CACTI en CLIGESCO.DBF: {e}")
     db.commit()
     return {"status": "success", "activo": db_client.activo}
 
 # ==========================================
-# RUTAS DE INTEGRACIÃ“N ERP (XaGesApi)
+# RUTAS DE INTEGRACIÓN ERP (XaGesApi)
 # ==========================================
-@app.get("/api/erp/clientes/{client_id_or_code}/saldo", tags=["IntegraciÃ³n ERP"])
+@app.get("/api/erp/clientes/{client_id_or_code}/saldo", tags=["Integración ERP"])
 def obtener_saldo_erp_real(client_id_or_code: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     """
-    Obtiene el saldo real del cliente directamente desde el ERP local en tiempo real y actualiza el cachÃ© de PostgreSQL.
+    Obtiene el saldo real del cliente directamente desde el ERP local en tiempo real y actualiza el caché de PostgreSQL.
     """
-    # Intentar buscar primero por ID de cliente, de lo contrario buscar por su cÃ³digo ERP (CCLIFAC) o cÃ³digo de licencias (CCOD)
+    # Intentar buscar primero por ID de cliente, de lo contrario buscar por su código ERP (CCLIFAC) o código de licencias (CCOD)
     db_client = None
     if client_id_or_code.isdigit():
         db_client = db.query(models.Client).filter(models.Client.id == int(client_id_or_code)).first()
@@ -515,14 +853,16 @@ def obtener_saldo_erp_real(client_id_or_code: str, db: Session = Depends(get_db)
         raise HTTPException(status_code=404, detail="Cliente no registrado en el sistema local.")
         
     if not db_client.cclifac:
-        raise HTTPException(status_code=400, detail="El cliente seleccionado no posee un cÃ³digo de cliente de facturaciÃ³n del ERP (CCLIFAC) asociado.")
+        raise HTTPException(status_code=400, detail="El cliente seleccionado no posee un código de cliente de facturación del ERP (CCLIFAC) asociado.")
         
     try:
-        # Obtener saldo real usando el conector de Harbour por CCLIFAC
-        saldo_real = ERPBridge.get_client_balance(db_client.cclifac)
-        
-        # Sincronizar el saldo real de vuelta en PostgreSQL
+        cuenta = ERPBridge.get_client_account(db_client.cclifac)
+        saldo_real = cuenta["saldo"]
+        fecha_pago = cuenta["fecha_ultimo_pago"]
+
         db_client.saldo = saldo_real
+        if fecha_pago is not None:
+            db_client.fecha_ultimo_pago = fecha_pago
         db.commit()
         
         return {
@@ -531,12 +871,13 @@ def obtener_saldo_erp_real(client_id_or_code: str, db: Session = Depends(get_db)
             "cclifac": db_client.cclifac,
             "razon_social": db_client.razon_social,
             "saldo_local": db_client.saldo,
-            "saldo_real_erp": saldo_real
+            "saldo_real_erp": saldo_real,
+            "fecha_ultimo_pago": db_client.fecha_ultimo_pago.isoformat() if db_client.fecha_ultimo_pago else None,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error consultando el motor ERP de Harbour: {str(e)}")
 
-@app.get("/api/erp/clientes/{client_id_or_code}/extracto", tags=["IntegraciÃ³n ERP"])
+@app.get("/api/erp/clientes/{client_id_or_code}/extracto", tags=["Integración ERP"])
 def obtener_extracto_erp_real(client_id_or_code: str, desde: Optional[str] = None, hasta: Optional[str] = None, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     """
     Obtiene el extracto de cuenta corriente detallado del cliente desde el ERP de manera interactiva.
@@ -555,7 +896,7 @@ def obtener_extracto_erp_real(client_id_or_code: str, desde: Optional[str] = Non
         raise HTTPException(status_code=404, detail="Cliente no registrado en el sistema local.")
         
     if not db_client.cclifac:
-        raise HTTPException(status_code=400, detail="El cliente seleccionado no posee un cÃ³digo de cliente de facturaciÃ³n del ERP (CCLIFAC) asociado.")
+        raise HTTPException(status_code=400, detail="El cliente seleccionado no posee un código de cliente de facturación del ERP (CCLIFAC) asociado.")
         
     try:
         extracto = ERPBridge.get_client_extracto(db_client.cclifac, desde, hasta)
@@ -569,7 +910,34 @@ def obtener_extracto_erp_real(client_id_or_code: str, desde: Optional[str] = Non
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error consultando el extracto en el motor ERP de Harbour: {str(e)}")
 
-@app.get("/api/erp/comprobantes/{hash_fac}/pdf", tags=["IntegraciÃ³n ERP"])
+@app.get("/api/erp/clientes/{client_id_or_code}/lic-facturadas", tags=["Integración ERP"])
+def obtener_lic_facturadas_erp(client_id_or_code: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """Licencias/artículos facturados (LisArtC), igual que GesActi → Lic Facturadas."""
+    db_client = None
+    if client_id_or_code.isdigit():
+        db_client = db.query(models.Client).filter(models.Client.id == int(client_id_or_code)).first()
+    if not db_client:
+        db_client = db.query(models.Client).filter(
+            (models.Client.cclifac == client_id_or_code) |
+            (models.Client.codigo == client_id_or_code)
+        ).first()
+    if not db_client:
+        raise HTTPException(status_code=404, detail="Cliente no registrado en el sistema local.")
+    if not db_client.cclifac:
+        raise HTTPException(status_code=400, detail="El cliente seleccionado no posee un código de cliente de facturación del ERP (CCLIFAC) asociado.")
+    try:
+        items = ERPBridge.get_client_lic_facturadas(db_client.cclifac)
+        return {
+            "cliente_id": db_client.id,
+            "codigo": db_client.codigo,
+            "cclifac": db_client.cclifac,
+            "razon_social": db_client.razon_social,
+            "items": items,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error consultando LisArtC en el ERP: {str(e)}")
+
+@app.get("/api/erp/comprobantes/{hash_fac}/pdf", tags=["Integración ERP"])
 def obtener_pdf_comprobante(hash_fac: str, current_user: models.User = Depends(get_current_user)):
     """
     Genera y descarga el PDF oficial del ERP para un comprobante en tiempo real.
@@ -616,9 +984,16 @@ def create_license(lic_data: dict, db: Session = Depends(get_db), current_user: 
     return new_lic
 
 # ==========================================
-# RUTAS DE LICENCIAS ERP (CONEXIÃ“N MYSQL)
+# RUTAS DE LICENCIAS ERP (CONEXIÓN MYSQL)
 # ==========================================
 import erp_licensing
+
+@app.get("/api/erp-licenses/summary", tags=["Licencias ERP"])
+def get_erp_licenses_summary(current_user: models.User = Depends(get_current_user)):
+    try:
+        return erp_licensing.fetch_license_panel_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/erp-licenses/client/{client_code}", tags=["Licencias ERP"])
 def get_erp_licenses_by_client(client_code: str, current_user: models.User = Depends(get_current_user)):
@@ -631,6 +1006,33 @@ def get_erp_licenses_by_client(client_code: str, current_user: models.User = Dep
 def get_erp_license_terminals(serial: str, current_user: models.User = Depends(get_current_user)):
     try:
         return erp_licensing.fetch_terminals_by_license(serial)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/erp-licenses/reports/{serial}", tags=["Licencias ERP"])
+def get_erp_license_reports(
+    serial: str,
+    date_from: str = None,
+    date_to: str = None,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Reportes de uso (misi_report), mismo flujo que GesActi → Licencias → Reportes."""
+    try:
+        return erp_licensing.fetch_reports_by_serial(serial, date_from, date_to)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/erp-licenses/reports/{report_id}/nodes", tags=["Licencias ERP"])
+def get_erp_report_nodes(report_id: int, current_user: models.User = Depends(get_current_user)):
+    try:
+        return erp_licensing.fetch_report_nodes(report_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/erp-licenses/reports/{report_id}/system", tags=["Licencias ERP"])
+def get_erp_report_system(report_id: int, current_user: models.User = Depends(get_current_user)):
+    try:
+        return erp_licensing.fetch_report_system(report_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -648,6 +1050,26 @@ def save_erp_license_management(data: dict, current_user: models.User = Depends(
         
     try:
         return erp_licensing.save_license_management(serial, m_down, m_newdate, m_tipmsg, m_showmode, m_text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/erp-licenses/management/bulk", tags=["Licencias ERP"])
+def save_erp_license_management_bulk(data: dict, current_user: models.User = Depends(get_current_user)):
+    """Monitoreo masivo GesActi: cartel/corte sobre licencias activas de clientes marcados."""
+    client_codes = data.get("client_codes") or []
+    if not client_codes:
+        raise HTTPException(status_code=400, detail="Indique client_codes (codigos de 4 digitos).")
+    try:
+        return erp_licensing.save_license_management_for_clients(
+            client_codes,
+            data.get("m_down", False),
+            data.get("m_newdate"),
+            data.get("m_tipmsg", 1),
+            data.get("m_showmode", "01"),
+            data.get("m_text", ""),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -676,10 +1098,30 @@ def deactivate_erp_license_node(data: dict, current_user: models.User = Depends(
     t_path_enc = data.get("t_path_enc")
     
     if not all([serial, t_id_enc, t_user_enc, t_path_enc]):
-        raise HTTPException(status_code=400, detail="Faltan parÃ¡metros obligatorios.")
+        raise HTTPException(status_code=400, detail="Faltan parámetros obligatorios.")
         
     try:
         return erp_licensing.deactivate_terminal_node(serial, t_id_enc, t_user_enc, t_path_enc)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/erp-licenses/modules", tags=["Licencias ERP"])
+def get_erp_license_modules(current_user: models.User = Depends(get_current_user)):
+    return erp_licensing.load_gesacti_modules()
+
+@app.post("/api/erp-licenses/generate-serial", tags=["Licencias ERP"])
+def generate_erp_serial(data: dict, current_user: models.User = Depends(get_current_user)):
+    """Genera el número de serie con el mismo algoritmo que GesActi (CalculaNuevoSerial)."""
+    try:
+        serial = erp_licensing.generate_gesacti_serial(
+            data.get("client_code") or data.get("l_cli") or "",
+            data.get("expiry_date") or data.get("l_date") or "",
+            data.get("module_nums") or data.get("modules") or [],
+            bool(data.get("all_modules") or data.get("todos")),
+        )
+        return {"l_number": serial, "status": "success"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -713,10 +1155,108 @@ def get_erp_license_templates(current_user: models.User = Depends(get_current_us
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/erp-licenses/templates", tags=["Licencias ERP"])
+def save_erp_license_template(data: dict, current_user: models.User = Depends(get_current_user)):
+    try:
+        m_num = int(data.get("m_num") or data.get("id") or 0)
+        if m_num < 1:
+            raise HTTPException(status_code=400, detail="m_num debe ser >= 1")
+        return erp_licensing.save_message_template(
+            m_num,
+            data.get("m_des") or data.get("label") or "",
+            data.get("m_text") or data.get("text") or "",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/erp-licenses/activation-requests", tags=["Licencias ERP"])
+def get_erp_activation_requests(pending_only: bool = True, current_user: models.User = Depends(get_current_user)):
+    """Activaciones pendientes OnLine (misi_request), como ActiPenOL de GesActi."""
+    try:
+        return erp_licensing.fetch_activation_requests(pending_only)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/erp-licenses/activation-requests/{key_id}/resolve", tags=["Licencias ERP"])
+def resolve_erp_activation_request(key_id: int, data: dict, current_user: models.User = Depends(get_current_user)):
+    """Activar / Denegar / Pendiente / c/mensaje / c/fecha (ActivarNormal)."""
+    try:
+        return erp_licensing.resolve_activation_request(
+            key_id,
+            data.get("state") or data.get("r_state"),
+            data.get("message") or data.get("r_message"),
+            data.get("new_date") or data.get("expiry_date"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/erp-licenses/extensions", tags=["Licencias ERP"])
+def get_erp_pending_extensions(pending_only: bool = True, current_user: models.User = Depends(get_current_user)):
+    """Extensiones OnLine pendientes (misi_extension), como ExtenOl de GesActi."""
+    try:
+        return erp_licensing.fetch_pending_extensions(pending_only)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/erp-licenses/extensions/{key_id}/approve", tags=["Licencias ERP"])
+def approve_erp_extension(key_id: int, data: dict = Body(default={}), current_user: models.User = Depends(get_current_user)):
+    """Generar extensión: actualiza licencia y e_newdate."""
+    data = data or {}
+    try:
+        return erp_licensing.approve_extension(key_id, data.get("new_date") or data.get("e_newdate"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# RUTAS DE DISPOSITIVOS ANDROID (misi_licand)
+# ==========================================
+
+@app.get("/api/android-devices/summary", tags=["Dispositivos Android"])
+def get_android_devices_summary(current_user: models.User = Depends(get_current_user)):
+    """
+    Devuelve el resumen de dispositivos Android activos agrupado por cliente y por tipo de app.
+    Cada elemento tiene el código de cliente (4 dígitos) y un dict de apps con cantidades.
+    """
+    try:
+        return erp_licensing.fetch_android_devices_summary()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error consultando dispositivos Android: {str(e)}")
+
+@app.get("/api/android-devices/client/{client_code}", tags=["Dispositivos Android"])
+def get_android_devices_by_client(client_code: str, current_user: models.User = Depends(get_current_user)):
+    """
+    Devuelve todos los dispositivos Android registrados para el cliente con el código dado (primeros 4 chars del serial).
+    """
+    try:
+        return erp_licensing.fetch_android_devices_by_client(client_code)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error consultando dispositivos del cliente {client_code}: {str(e)}")
+
+@app.post("/api/android-devices/toggle", tags=["Dispositivos Android"])
+def toggle_android_device(data: dict, current_user: models.User = Depends(get_current_user)):
+    """Habilita o inhabilita un dispositivo (Android o PC/navegador TCK) en misi_licand."""
+    key_id = data.get("id") or data.get("KeyId")
+    if not key_id:
+        raise HTTPException(status_code=400, detail="Falta id del dispositivo.")
+    habilitado = data.get("habilitado")
+    if habilitado is None:
+        habilitado = data.get("status", 1)
+    try:
+        return erp_licensing.toggle_android_device(int(key_id), bool(int(habilitado)))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"No se pudo cambiar el estado: {e}")
+
 # ==========================================
 # RUTAS DE AREAS (NUEVO)
 # ==========================================
-@app.get("/api/areas", response_model=List[schemas.AreaOut], tags=["ConfiguraciÃ³n"])
+
+@app.get("/api/areas", response_model=List[schemas.AreaOut], tags=["Configuración"])
 def obtener_areas(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     return db.query(models.Area).all()
 
@@ -725,7 +1265,7 @@ def obtener_areas(db: Session = Depends(get_db), current_user: models.User = Dep
 # ==========================================
 @app.get("/api/users", response_model=List[schemas.UserOut], tags=["Usuarios"])
 def obtener_usuarios(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Retorna todos los usuarios ordenados por si estÃ¡n online primero """
+    """ Retorna todos los usuarios ordenados por si están online primero """
     return db.query(models.User).order_by(models.User.is_online.desc(), models.User.nombre.asc()).all()
 
 @app.get("/api/users/me", response_model=schemas.UserOut, tags=["Usuarios"])
@@ -741,7 +1281,7 @@ def crear_usuario(user_data: schemas.UserCreate, db: Session = Depends(get_db), 
         
     email_exists = db.query(models.User).filter(models.User.email == user_data.email).first()
     if email_exists:
-        raise HTTPException(status_code=400, detail="El email ya estÃ¡ registrado.")
+        raise HTTPException(status_code=400, detail="El email ya está registrado.")
         
     hashed = auth.get_password_hash(user_data.password)
     db_user = models.User(
@@ -777,7 +1317,7 @@ def actualizar_usuario(user_id: int, user_data: schemas.UserUpdate, db: Session 
         db_user.hashed_password = auth.get_password_hash(update_data["password"])
         del update_data["password"]
         
-    # El usuario comÃºn no puede cambiarse el rol ni el estado activo
+    # El usuario común no puede cambiarse el rol ni el estado activo
     if current_user.rol != "admin":
         if "rol" in update_data:
             del update_data["rol"]
@@ -810,7 +1350,7 @@ def toggle_activo_usuario(user_id: int, db: Session = Depends(get_db), current_u
 
 @app.post("/api/users/status", response_model=schemas.UserOut, tags=["Usuarios"])
 def actualizar_estado_usuario(status_data: schemas.UserStatusUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Actualiza el estado en lÃ­nea, tarea actual y pÃ¡gina actual del usuario logueado en tiempo real """
+    """ Actualiza el estado en línea, tarea actual y página actual del usuario logueado en tiempo real """
     current_user.is_online = True
     current_user.last_activity = datetime.utcnow()
     
@@ -832,7 +1372,7 @@ def logout_usuario(db: Session = Depends(get_db), current_user: models.User = De
     current_user.current_task = ""
     current_user.current_page = ""
     db.commit()
-    return {"status": "success", "message": "SesiÃ³n cerrada correctamente."}
+    return {"status": "success", "message": "Sesión cerrada correctamente."}
 
 # ==========================================
 # RUTAS DE TICKETS (TAREAS)
@@ -845,8 +1385,8 @@ def crear_ticket(ticket: schemas.TicketCreate, db: Session = Depends(get_db), cu
         
     area_id = ticket.initial_area_id
     if not area_id:
-        # Default a 'AtenciÃ³n al Cliente'
-        area = db.query(models.Area).filter(models.Area.nombre == "AtenciÃ³n al Cliente").first()
+        # Default a 'Atención al Cliente'
+        area = db.query(models.Area).filter(models.Area.nombre == "Atención al Cliente").first()
         area_id = area.id if area else None
 
     db_ticket = models.Ticket(
@@ -892,7 +1432,7 @@ async def crear_intervencion(
     from_area_id = ticket.current_area_id
     to_area_id = intervencion.to_area_id
     
-    # Crear la intervenciÃ³n
+    # Crear la intervención
     db_intervention = models.Intervention(
         ticket_id=ticket_id,
         user_id=current_user.id,
@@ -904,7 +1444,7 @@ async def crear_intervencion(
         adjunto_tipo=intervencion.adjunto_tipo
     )
     
-    # Si es una transferencia, actualizamos el Ã¡rea del ticket
+    # Si es una transferencia, actualizamos el área del ticket
     if intervencion.tipo == "transferencia" and to_area_id:
         ticket.current_area_id = to_area_id
     
@@ -915,7 +1455,7 @@ async def crear_intervencion(
 
 @app.post("/api/upload", tags=["Utilidades"])
 async def upload_file(file: UploadFile = File(...), current_user: models.User = Depends(get_current_user)):
-    """ Sube un archivo (audio, imagen, doc) al servidor para adjuntar a una intervenciÃ³n. """
+    """ Sube un archivo (audio, imagen, doc) al servidor para adjuntar a una intervención. """
     temp_dir = "temp_files/uploads"
     if not os.path.exists(temp_dir): os.makedirs(temp_dir)
     
@@ -925,7 +1465,7 @@ async def upload_file(file: UploadFile = File(...), current_user: models.User = 
     
     return {"url": f"/api/temp/uploads/{os.path.basename(file_path)}", "filename": file.filename}
 
-# Integrar StaticFiles para las subidas temporales (ya montado vÃ­a /api/temp, pero damos ruta directa)
+# Integrar StaticFiles para las subidas temporales (ya montado vía /api/temp, pero damos ruta directa)
 # app.mount("/api/temp/uploads", StaticFiles(directory="temp_files/uploads"), name="temp_uploads")
 
 # ==========================================
@@ -944,7 +1484,7 @@ async def analyze_ticket_ai(ticket_id: int, db: Session = Depends(get_db), curre
     # Obtener el cliente asociado
     client = db.query(models.Client).filter(models.Client.id == ticket.client_id).first()
     client_name = client.razon_social if client else "Cliente Desconocido"
-    client_modules = client.modulos if client else "Base, FacturaciÃ³n"
+    client_modules = client.modulos if client else "Base, Facturación"
     client_version = client.version_apollo if client else "Desconocida"
     
     # Historial de intervenciones
@@ -953,7 +1493,7 @@ async def analyze_ticket_ai(ticket_id: int, db: Session = Depends(get_db), curre
         rol_usuario = inv.usuario.rol if inv.usuario else "Sistema"
         nombre_usuario = inv.usuario.full_name if inv.usuario else "Sistema"
         destino_msg = f" -> Transferencia a {inv.area_destino.nombre}" if inv.area_destino else ""
-        mensaje_texto = inv.mensaje if inv.mensaje else "[Mensaje VacÃ­o u Adjunto]"
+        mensaje_texto = inv.mensaje if inv.mensaje else "[Mensaje Vacío u Adjunto]"
         historial.append(
             f"[{inv.fecha_creacion.strftime('%Y-%m-%d %H:%M')}] {nombre_usuario} ({rol_usuario}){destino_msg}: {mensaje_texto}"
         )
@@ -961,18 +1501,18 @@ async def analyze_ticket_ai(ticket_id: int, db: Session = Depends(get_db), curre
     historial_texto = "\n".join(historial) if historial else "No hay comentarios previos."
     
     prompt = f"""
-ActÃºa como "Apollo AI Copilot", el arquitecto principal de soluciones de Apollo ERP (Sistemas de GestiÃ³n Comercial GesCom basados en bases de datos FoxPro/DBF, impresoras fiscales, spoolers de impresiÃ³n de Windows, y terminales de red local).
+Actúa como "Apollo AI Copilot", el arquitecto principal de soluciones de Apollo ERP (Sistemas de Gestión Comercial GesCom basados en bases de datos FoxPro/DBF, impresoras fiscales, spoolers de impresión de Windows, y terminales de red local).
 
-Tu objetivo es analizar un ticket de soporte de un cliente de Apollo ERP para ayudar al personal de AtenciÃ³n al Cliente y mejorar la comunicaciÃ³n con el Ã¡rea de Desarrollo.
+Tu objetivo es analizar un ticket de soporte de un cliente de Apollo ERP para ayudar al personal de Atención al Cliente y mejorar la comunicación con el área de Desarrollo.
 
-=== INFORMACIÃ“N DEL CLIENTE ===
+=== INFORMACIÓN DEL CLIENTE ===
 Empresa: {client_name}
-VersiÃ³n de Apollo ERP: {client_version}
-MÃ³dulos Habilitados: {client_modules}
+Versión de Apollo ERP: {client_version}
+Módulos Habilitados: {client_modules}
 
 === DETALLE DEL TICKET ===
 Asunto: {ticket.asunto}
-DescripciÃ³n Original: {ticket.descripcion}
+Descripción Original: {ticket.descripcion}
 Estado Actual: {ticket.estado}
 Prioridad: {ticket.prioridad}
 
@@ -980,56 +1520,56 @@ Prioridad: {ticket.prioridad}
 {historial_texto}
 
 === INSTRUCCIONES DE RESPUESTA ===
-Genera una respuesta en formato JSON estrictamente vÃ¡lido que contenga la clave "analysis". El valor de "analysis" debe ser un texto formateado con Markdown claro, premium y elegante, estructurado exactamente en los siguientes 4 bloques:
+Genera una respuesta en formato JSON estrictamente válido que contenga la clave "analysis". El valor de "analysis" debe ser un texto formateado con Markdown claro, premium y elegante, estructurado exactamente en los siguientes 4 bloques:
 
-1. ðŸ” **DiagnÃ³stico y Causa RaÃ­z Estructurada**: Analiza el problema considerando si es de red local, permisos de Windows, tablas de FoxPro (.dbf/.cdx corruptas, necesidad de reindexar), Spooler de impresiÃ³n, o un bug del sistema.
-2. ðŸ› ï¸ **Plan de AcciÃ³n de Soporte**: Pasos paso a paso prÃ¡cticos para que el agente de soporte intente solucionar el problema de inmediato en la PC del cliente de forma remota (por ejemplo, reiniciar spooler, limpiar temporales, revisar registros de Windows, etc.).
-3. ðŸ’» **Pase TÃ©cnico Consolidado para Desarrollo**: Un informe sÃºper formal y estructurado para el sector de ProgramaciÃ³n si el ticket debe ser derivado. Incluye: Tablas involucradas estimadas (ej: FACTURAS.DBF, HISTORIA\\ULTACT.DBF, etc.), comportamiento esperado, comportamiento observado, y lÃ­neas de cÃ³digo o validaciones lÃ³gicas que sospechas que fallan.
-4. âœ‰ï¸ **Borrador de Respuesta EmpÃ¡tica para el Cliente**: Un borrador cordial, tranquilizador y profesional dirigido al cliente (menciona a "{client_name}" y saluda como el Equipo de Soporte de Apollo).
+1. ðŸ” **Diagnóstico y Causa Raíz Estructurada**: Analiza el problema considerando si es de red local, permisos de Windows, tablas de FoxPro (.dbf/.cdx corruptas, necesidad de reindexar), Spooler de impresión, o un bug del sistema.
+2. ðŸ› ï¸ **Plan de Acción de Soporte**: Pasos paso a paso prácticos para que el agente de soporte intente solucionar el problema de inmediato en la PC del cliente de forma remota (por ejemplo, reiniciar spooler, limpiar temporales, revisar registros de Windows, etc.).
+3. ðŸ’» **Pase Técnico Consolidado para Desarrollo**: Un informe súper formal y estructurado para el sector de Programación si el ticket debe ser derivado. Incluye: Tablas involucradas estimadas (ej: FACTURAS.DBF, HISTORIA\\ULTACT.DBF, etc.), comportamiento esperado, comportamiento observado, y líneas de código o validaciones lógicas que sospechas que fallan.
+4. âœ‰ï¸ **Borrador de Respuesta Empática para el Cliente**: Un borrador cordial, tranquilizador y profesional dirigido al cliente (menciona a "{client_name}" y saluda como el Equipo de Soporte de Apollo).
 
-AsegÃºrate de que la salida sea un objeto JSON vÃ¡lido con el campo "analysis" conteniendo todo el Markdown para evitar problemas de parseo.
+Asegúrate de que la salida sea un objeto JSON válido con el campo "analysis" conteniendo todo el Markdown para evitar problemas de parseo.
 """
 
     gemini_key = os.getenv("GEMINI_API_KEY")
     if not gemini_key:
-        # Modo de demostraciÃ³n de sÃºper alta calidad con anÃ¡lisis dinÃ¡mico adaptado al ticket actual
-        # De esta forma, incluso sin API Key, el personal recibe una herramienta sÃºper Ãºtil.
+        # Modo de demostración de súper alta calidad con análisis dinámico adaptado al ticket actual
+        # De esta forma, incluso sin API Key, el personal recibe una herramienta súper útil.
         sintomas_especificos = ""
         dbfs_sospechosas = "TABLAS.DBF, INDICES.CDX"
         if "imp" in ticket.asunto.lower() or "impr" in ticket.asunto.lower() or "factur" in ticket.asunto.lower() or "ticket" in ticket.asunto.lower():
-            sintomas_especificos = "Falla de comunicaciÃ³n con controlador fiscal o impresora tÃ©rmica. El spooler de Windows suele acumular trabajos corruptos."
+            sintomas_especificos = "Falla de comunicación con controlador fiscal o impresora térmica. El spooler de Windows suele acumular trabajos corruptos."
             dbfs_sospechosas = "FACTURAS.DBF, COMPROBANTES.DBF"
         elif "usuario" in ticket.asunto.lower() or "permis" in ticket.asunto.lower() or "log" in ticket.asunto.lower():
-            sintomas_especificos = "Conflicto de autenticaciÃ³n o bloqueo de archivos de sesiÃ³n de usuario en red compartida."
+            sintomas_especificos = "Conflicto de autenticación o bloqueo de archivos de sesión de usuario en red compartida."
             dbfs_sospechosas = "USERG.DBF, ACCESO.DBF"
         else:
-            sintomas_especificos = "Inconsistencia lÃ³gica de datos o Ã­ndice FoxPro (.CDX) desincronizado por desconexiÃ³n de terminal de red."
+            sintomas_especificos = "Inconsistencia lógica de datos o índice FoxPro (.CDX) desincronizado por desconexión de terminal de red."
             dbfs_sospechosas = "HISTORIA\\ULTACT.DBF, CLIENTES.DBF"
 
-        analysis_mock = f"""### ðŸ¤– AnÃ¡lisis Copiloto IA (Modo DemostraciÃ³n)
+        analysis_mock = f"""### ðŸ¤– Análisis Copiloto IA (Modo Demostración)
 > [!NOTE]
 > Para activar la Inteligencia Artificial generativa real con Gemini, define `GEMINI_API_KEY` en tu archivo `.env` del backend.
 
-#### ðŸ” 1. DiagnÃ³stico y Posible Causa RaÃ­z
-* **SintomatologÃ­a:** El ticket titulado **"{ticket.asunto}"** para la empresa **{client_name}** indica un conflicto operativo que afecta a los mÃ³dulos activos: `{client_modules}`.
+#### ðŸ” 1. Diagnóstico y Posible Causa Raíz
+* **Sintomatología:** El ticket titulado **"{ticket.asunto}"** para la empresa **{client_name}** indica un conflicto operativo que afecta a los módulos activos: `{client_modules}`.
 * **Causa Estimada:** {sintomas_especificos}
-* **Comportamiento Observado:** Error en tiempo de ejecuciÃ³n o pantalla bloqueada debido a bloqueo exclusivo de archivos en red local (SMB v2/v3).
+* **Comportamiento Observado:** Error en tiempo de ejecución o pantalla bloqueada debido a bloqueo exclusivo de archivos en red local (SMB v2/v3).
 
-#### ðŸ› ï¸ 2. Plan de AcciÃ³n de Soporte (AtenciÃ³n al Cliente)
+#### ðŸ› ï¸ 2. Plan de Acción de Soporte (Atención al Cliente)
 1. **Comandos Remotos:** Utiliza las herramientas remotas integradas en este panel para acelerar el soporte:
-   * Haz clic en **"Reiniciar Spooler"** si se trata de un problema de impresiÃ³n atascada.
-   * Haz clic en **"Limpiar Temporales"** para liberar archivos de cachÃ© de FoxPro en la mÃ¡quina cliente (`%TEMP%`).
-2. **Chequeo de Archivos Bloqueados:** Accede al servidor del cliente y verifica si el archivo DBF de interÃ©s estÃ¡ retenido por alguna sesiÃ³n inactiva.
+   * Haz clic en **"Reiniciar Spooler"** si se trata de un problema de impresión atascada.
+   * Haz clic en **"Limpiar Temporales"** para liberar archivos de caché de FoxPro en la máquina cliente (`%TEMP%`).
+2. **Chequeo de Archivos Bloqueados:** Accede al servidor del cliente y verifica si el archivo DBF de interés está retenido por alguna sesión inactiva.
 
-#### ðŸ’» 3. Pase TÃ©cnico Consolidado para Desarrollo
-* **Origen de DerivaciÃ³n:** Sector AtenciÃ³n al Cliente -> Desarrollo.
-* **Componentes de InterÃ©s:**
+#### ðŸ’» 3. Pase Técnico Consolidado para Desarrollo
+* **Origen de Derivación:** Sector Atención al Cliente -> Desarrollo.
+* **Componentes de Interés:**
   * **Tablas de datos sospechosas:** `{dbfs_sospechosas}` en la ruta de tablas del cliente.
-  * **Comportamiento Esperado:** Flujo lÃ³gico continuo sin colisiones transaccionales de FoxPro.
-  * **Sugerencia de CÃ³digo:** Verificar si hay sentencias `SET EXCLUSIVE OFF` faltantes o manejo de reintentos `LOCK()` en bloqueos de registros.
+  * **Comportamiento Esperado:** Flujo lógico continuo sin colisiones transaccionales de FoxPro.
+  * **Sugerencia de Código:** Verificar si hay sentencias `SET EXCLUSIVE OFF` faltantes o manejo de reintentos `LOCK()` en bloqueos de registros.
 
-#### âœ‰ï¸ 4. Borrador de Respuesta EmpÃ¡tica para el Cliente
-*"Estimado cliente de **{client_name}**, buenas tardes. Le saluda el equipo de Soporte de Apollo. Hemos registrado su reporte sobre: **'{ticket.asunto}'**. Nuestros analistas ya estÃ¡n validando la situaciÃ³n y nos contactaremos a la brevedad para acceder de forma remota o aplicar la correcciÃ³n necesaria en sus terminales. Agradecemos enormemente su paciencia."*
+#### âœ‰ï¸ 4. Borrador de Respuesta Empática para el Cliente
+*"Estimado cliente de **{client_name}**, buenas tardes. Le saluda el equipo de Soporte de Apollo. Hemos registrado su reporte sobre: **'{ticket.asunto}'**. Nuestros analistas ya están validando la situación y nos contactaremos a la brevedad para acceder de forma remota o aplicar la corrección necesaria en sus terminales. Agradecemos enormemente su paciencia."*
 """
         return {"analysis": analysis_mock, "confidence": 1.0}
 
@@ -1059,10 +1599,10 @@ AsegÃºrate de que la salida sea un objeto JSON vÃ¡lido con el campo "analysi
                 result = response.json()
                 text_content = result["candidates"][0]["content"]["parts"][0]["text"]
                 parsed_res = json.loads(text_content)
-                return {"analysis": parsed_res.get("analysis", "No se obtuvo anÃ¡lisis del modelo."), "confidence": 0.95}
+                return {"analysis": parsed_res.get("analysis", "No se obtuvo análisis del modelo."), "confidence": 0.95}
             else:
                 return {
-                    "analysis": f"âš ï¸ Error en API de Gemini (CÃ³digo {response.status_code}): {response.text}",
+                    "analysis": f"âš ï¸ Error en API de Gemini (Código {response.status_code}): {response.text}",
                     "confidence": 0.0
                 }
     except Exception as e:
@@ -1115,19 +1655,57 @@ class ConnectionManager:
         # Multi-session tracking for Terminal Server scenario
         self.device_sessions: Dict[int, Dict[int, WebSocket]] = {}
         self.selected_sessions: Dict[int, int] = {}
-        # â”€â”€â”€ VIEWER WEBSOCKETS (estÃ¡ndar) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        self.requested_sessions: Dict[int, int] = {}
+        self.switch_requested_at: Dict[int, datetime] = {}
+        # â”€â”€â”€ VIEWER WEBSOCKETS (estándar) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # viewer_connections[device_id] = {ws_id: WebSocket}
         self.viewer_connections: Dict[int, Dict[str, WebSocket]] = {}
         self.viewer_write_locks: Dict[str, asyncio.Lock] = {}  # lock por ws_id individual
         # â”€â”€â”€ HQ VIEWER WEBSOCKETS (binary H.264) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # hq_viewer_connections[device_id] = {ws_id: WebSocket}
         # Forward raw H.264/fMP4 bytes directamente del agente al browser (MSE).
-        # Sistema completamente independiente del path estÃ¡ndar (no toca nada existente).
+        # Sistema completamente independiente del path estándar (no toca nada existente).
         self.hq_viewer_connections: Dict[int, Dict[str, WebSocket]] = {}
         self.hq_viewer_write_locks: Dict[str, asyncio.Lock] = {}
+        # Visor pidió HQ vía WS estándar (start_hq) — no requiere /viewer/{id}/hq
+        self.hq_wanted: set[int] = set()
+
+    async def _complete_session_switch(self, device_id: int, session_id: int, websocket: WebSocket, reason: str):
+        """Cierra el switch pendiente y avisa al panel (login suele caer en Consola, no en la sesion RDP pedida)."""
+        self.selected_sessions[device_id] = session_id
+        self.active_connections[device_id] = websocket
+        self.requested_sessions.pop(device_id, None)
+        self.switch_requested_at.pop(device_id, None)
+        backend_remote_log(
+            device_id,
+            f"[SESSION-SWITCH] Completado en sesión {session_id} ({reason})",
+            "INFO",
+        )
+        await self.notify_viewers_session_switched(device_id, session_id)
+        await self.notify_agent_viewers_watching(device_id)
+        if self.wants_hq_stream(device_id):
+            await self.send_json_safe(device_id, {"type": "start_hq", "device_id": device_id})
+
+    async def notify_agent_viewers_watching(self, device_id: int):
+        """Tras reconexion del agente: reactivar captura si hay tecnicos mirando (evita pantalla negra)."""
+        if not self.has_any_viewers(device_id):
+            return
+        now = datetime.utcnow()
+        active_viewers = []
+        for _uid, (u_name, last_seen) in self.device_viewers.get(device_id, {}).items():
+            if (now - last_seen).total_seconds() <= 30:
+                active_viewers.append(u_name)
+        if self.viewer_connections.get(device_id) or self.has_hq_viewers(device_id):
+            active_viewers.append("Soporte Web (WS)")
+        tech_name = active_viewers[0] if active_viewers else "Soporte"
+        await self.send_json_safe(device_id, {"type": "technician_joined", "name": tech_name})
+        await self.send_json_safe(device_id, {"type": "active_technicians", "technicians": active_viewers})
+        await self.send_json_safe(device_id, {"type": "refresh_frame"})
+        self.last_viewer_notification[device_id] = now
+        logger.info("[WS] Agente %s notificado: viewers activos (%s)", device_id, active_viewers)
 
     async def push_to_viewers(self, device_id: int, payload: dict):
-        """EnvÃ­a un mensaje JSON a todos los viewers estÃ¡ndar conectados a este device."""
+        """Envía un mensaje JSON a todos los viewers estándar conectados a este device."""
         viewers = list(self.viewer_connections.get(device_id, {}).items())
         for ws_id, ws in viewers:
             try:
@@ -1146,6 +1724,7 @@ class ConnectionManager:
             self.device_sessions[device_id] = {}
         
         if session_id is not None:
+            sessions_before_connect = set(self.device_sessions.get(device_id, {}).keys())
             # Si esta sesion ya tenia conexion activa, la cerramos limpiamente para evitar duplicidad en la misma sesion
             if session_id in self.device_sessions[device_id]:
                 old_ws = self.device_sessions[device_id][session_id]
@@ -1158,23 +1737,37 @@ class ConnectionManager:
             
             # Autopromoción: Si no hay ninguna seleccionada, o si la seleccionada es Session 0 (servicio sin GUI) y conecta una sesión interactiva (>0), o si es la sesión solicitada, la seleccionamos como activa.
             current_selected = self.selected_sessions.get(device_id)
-            requested_session = getattr(self, "requested_sessions", {}).get(device_id)
+            requested_session = self.requested_sessions.get(device_id)
             
-            if (device_id not in self.selected_sessions) or (current_selected == 0 and session_id != 0 and session_id is not None) or (session_id == requested_session):
+            promoted = (
+                device_id not in self.selected_sessions
+                or (current_selected == 0 and session_id != 0)
+                or session_id == requested_session
+            )
+            if promoted:
                 self.selected_sessions[device_id] = session_id
-                logger.info(f"[WS-PROMOTION] Promoviendo sesion {session_id} como activa frente a {current_selected}")
-                
+                logger.info(
+                    "[WS-PROMOTION] Promoviendo sesion %s como activa (antes=%s, pedida=%s)",
+                    session_id, current_selected, requested_session,
+                )
+
+            if requested_session is not None and session_id is not None:
+                sessions_map = self.device_sessions.get(device_id, {})
                 if session_id == requested_session:
-                    self.requested_sessions.pop(device_id, None)
-                    for v_ws in list(self.viewer_connections.get(device_id, {}).values()):
-                        try:
-                            await v_ws.send_json({"type": "session_switched", "session_id": session_id})
-                        except Exception as e:
-                            logger.error(f"[WS-SWITCH] Error notifying viewer: {e}")
-                            
-                    # Si HQ esta activo, pedirle al nuevo agente que inicie FFMPEG
-                    if self.has_hq_viewers(device_id):
-                        await self.send_json_safe(device_id, {"type": "start_hq", "device_id": device_id})
+                    await self._complete_session_switch(
+                        device_id, session_id, websocket, "coincide con la solicitada"
+                    )
+                elif (
+                    requested_session not in sessions_before_connect
+                    and session_id not in sessions_before_connect
+                ):
+                    # Tras login: agente en Consola (1) pero el panel esperaba RDP (24) sin WS
+                    await self._complete_session_switch(
+                        device_id,
+                        session_id,
+                        websocket,
+                        f"sesión {session_id} conectó; {requested_session} sin agente",
+                    )
         else:
             # Fallback si no tiene session_id (agentes viejos)
             # Evitar colisión de múltiples agentes en el mismo ID de dispositivo
@@ -1199,6 +1792,9 @@ class ConnectionManager:
         if device_id not in self.active_clients[client_id]:
             self.active_clients[client_id].append(device_id)
 
+        if self.active_connections.get(device_id) == websocket and self.has_any_viewers(device_id):
+            await self.notify_agent_viewers_watching(device_id)
+
     def disconnect(self, device_id: int, client_id: int, websocket: WebSocket = None):
         # Encontrar y remover de device_sessions
         session_to_remove = None
@@ -1214,10 +1810,19 @@ class ConnectionManager:
                 self.device_sessions.pop(device_id, None)
                 self.selected_sessions.pop(device_id, None)
             elif session_to_remove == self.selected_sessions.get(device_id):
-                # Si se desconectó la sesión activa, seleccionar otra sesión disponible
-                any_session = next(iter(self.device_sessions[device_id].keys()))
-                self.selected_sessions[device_id] = any_session
-                logger.info(f"[WS-SWITCH] Sesion seleccionada cambio a {any_session} tras desconexion de la activa")
+                pending = self.requested_sessions.get(device_id)
+                if pending is not None:
+                    logger.info(
+                        "[WS-SWITCH] Sesion activa %s desconectada durante cambio pendiente a %s (device %s)",
+                        session_to_remove, pending, device_id,
+                    )
+                    self.selected_sessions.pop(device_id, None)
+                    if device_id in self.active_connections:
+                        del self.active_connections[device_id]
+                else:
+                    any_session = next(iter(self.device_sessions[device_id].keys()))
+                    self.selected_sessions[device_id] = any_session
+                    logger.info(f"[WS-SWITCH] Sesion seleccionada cambio a {any_session} tras desconexion de la activa")
         
         # Si ya no quedan conexiones en absoluto para este dispositivo, limpiar active_connections
         if device_id not in self.device_sessions or not self.device_sessions[device_id]:
@@ -1256,20 +1861,13 @@ class ConnectionManager:
 
 
     async def send_json_safe(self, device_id: int, data: dict) -> bool:
-        """ Envía un mensaje JSON a un dispositivo de forma segura y secuencial (evita colisiones concurrentes). """
-        if device_id not in self.active_connections:
-            return False
-        
-        if device_id not in self.write_locks:
-            self.write_locks[device_id] = asyncio.Lock()
-            
-        async with self.write_locks[device_id]:
-            try:
-                await self.active_connections[device_id].send_json(data)
-                return True
-            except Exception as e:
-                logger.error("[WS ERROR] Error en envio seguro")
-                return False
+        """Envía JSON al agente usando la misma resolución de sesión que send_json_to_device.
+
+        Antes solo miraba active_connections; si quedaba apuntando a un WS muerto
+        (p. ej. tras cambio de sesión Windows), technician_joined/refresh_frame nunca
+        llegaban y el visor quedaba en negro con el agente 'online' en DB.
+        """
+        return await self.send_json_to_device(device_id, data)
 
     async def send_command(self, client_id: int, command: str):
         """ Envía un comando arbitrario al agente Centinela vía WebSocket de forma segura. """
@@ -1278,6 +1876,141 @@ class ConnectionManager:
             "command": command
         })
 
+    async def send_json_to_device(self, device_id: int, data: dict) -> bool:
+        """Envía JSON al agente. Input (teclado/mouse) va a la sesión seleccionada
+        con el mismo write_lock que pings/telemetry (evita corromper el WS)."""
+        if device_id not in self.write_locks:
+            self.write_locks[device_id] = asyncio.Lock()
+
+        cmd_type = (data.get("type") or "") if isinstance(data, dict) else ""
+        input_types = {
+            "key_press", "key_down", "key_up", "write_text",
+            "mouse_click", "mouse_down", "mouse_up", "mouse_move", "mouse_scroll",
+            "clipboard_sync", "clipboard_files", "clipboard_files_sync",
+        }
+
+        sessions = self.device_sessions.get(device_id, {})
+        targets = []
+        if cmd_type in input_types:
+            sel = self.selected_sessions.get(device_id)
+            if sel is not None and sel in sessions:
+                targets = [sessions[sel]]
+            elif device_id in self.active_connections:
+                targets = [self.active_connections[device_id]]
+            else:
+                targets = list(sessions.values())
+        else:
+            targets = list(sessions.values())
+            if not targets and device_id in self.active_connections:
+                targets = [self.active_connections[device_id]]
+
+        if not targets:
+            return False
+
+        async with self.write_locks[device_id]:
+            sent = False
+            for ws in targets:
+                try:
+                    await ws.send_json(data)
+                    sent = True
+                except Exception:
+                    pass
+            return sent
+
+    async def handle_session_switch(self, device_id: int, cmd: dict):
+        """Marca sesión destino, limpia frames viejos y notifica viewers (antes de mandar cmd al agente)."""
+        target_session_id = int(cmd.get("session_id", -1))
+        if target_session_id == -1:
+            return
+        backend_remote_log(
+            device_id,
+            f"[SESSION-SWITCH] Solicitud cambio a sesión Windows {target_session_id} "
+            f"(sesiones WS conectadas: {list(self.device_sessions.get(device_id, {}).keys())})",
+            "INFO",
+        )
+        self.requested_sessions[device_id] = target_session_id
+        self.switch_requested_at[device_id] = datetime.utcnow()
+        self.client_frames.pop(device_id, None)
+        self.frame_buffer.pop(device_id, None)
+
+        if self.wants_hq_stream(device_id):
+            await self.send_json_safe(device_id, {"type": "stop_hq"})
+
+        sessions = self.device_sessions.get(device_id, {})
+        if target_session_id in sessions:
+            self.selected_sessions[device_id] = target_session_id
+            self.active_connections[device_id] = sessions[target_session_id]
+            logger.info("[WS-SWITCH] Cambio instantaneo device %s -> sesion %s", device_id, target_session_id)
+            await self.send_json_safe(device_id, {"type": "refresh_frame"})
+            backend_remote_log(
+                device_id,
+                f"[SESSION-SWITCH] Cambio instantáneo a sesión {target_session_id} (ya conectada por WS)",
+                "INFO",
+            )
+            await self.notify_viewers_session_switched(device_id, target_session_id)
+            if self.wants_hq_stream(device_id):
+                await self.send_json_safe(device_id, {"type": "start_hq", "device_id": device_id})
+        else:
+            logger.info(
+                "[WS-SWITCH] Sesion %s no conectada; reinicio de companion (device %s)",
+                target_session_id, device_id,
+            )
+            backend_remote_log(
+                device_id,
+                f"[SESSION-SWITCH] Sesión {target_session_id} sin WS; se pide reinicio del companion al agente",
+                "WARNING",
+            )
+            for v_ws in list(self.viewer_connections.get(device_id, {}).values()):
+                try:
+                    await v_ws.send_json({
+                        "type": "session_switching",
+                        "target_session_id": target_session_id,
+                    })
+                except Exception:
+                    pass
+            asyncio.create_task(self._session_switch_watchdog(device_id, target_session_id))
+
+    async def notify_viewers_session_switched(self, device_id: int, session_id: int):
+        self.requested_sessions.pop(device_id, None)
+        self.switch_requested_at.pop(device_id, None)
+        backend_remote_log(
+            device_id,
+            f"[SESSION-SWITCH] Completado — viewers notificados (sesión activa {session_id})",
+            "INFO",
+        )
+        for v_ws in list(self.viewer_connections.get(device_id, {}).values()):
+            try:
+                await v_ws.send_json({"type": "session_switched", "session_id": session_id})
+            except Exception as e:
+                logger.error("[WS-SWITCH] Error notifying viewer: %s", e)
+
+    async def notify_viewers_session_switch_failed(self, device_id: int, error: str):
+        self.requested_sessions.pop(device_id, None)
+        self.switch_requested_at.pop(device_id, None)
+        for v_ws in list(self.viewer_connections.get(device_id, {}).values()):
+            try:
+                await v_ws.send_json({"type": "session_switch_failed", "error": error})
+            except Exception:
+                pass
+
+    async def _session_switch_watchdog(self, device_id: int, target_session_id: int, timeout_sec: float = 20.0):
+        await asyncio.sleep(timeout_sec)
+        if self.requested_sessions.get(device_id) != target_session_id:
+            return
+        logger.warning(
+            "[WS-SWITCH] Timeout esperando sesion %s en device %s",
+            target_session_id, device_id,
+        )
+        backend_remote_log(
+            device_id,
+            f"[SESSION-SWITCH] TIMEOUT esperando sesión {target_session_id}",
+            "ERROR",
+        )
+        await self.notify_viewers_session_switch_failed(
+            device_id,
+            "Tiempo de espera agotado al cambiar de sesión. Verifique que el agente esté actualizado.",
+        )
+
     async def push_frame_to_viewers(self, device_id: int, frame_data: str, delta: dict = None):
         """
         Envía el frame recién llegado del agente a TODOS los técnicos que tienen
@@ -1285,6 +2018,12 @@ class ConnectionManager:
         Opera de forma no-bloqueante: si un viewer falla, se elimina silenciosamente.
         DIRTY_RECT: si delta está presente, se reenvía al viewer para composición.
         """
+        try:
+            from session_recorder import recorder_manager
+            await recorder_manager.ingest_frame(device_id, frame_data, delta)
+        except Exception:
+            pass
+
         if device_id not in self.viewer_connections:
             return
 
@@ -1353,45 +2092,99 @@ class ConnectionManager:
     def has_hq_viewers(self, device_id: int) -> bool:
         return bool(self.hq_viewer_connections.get(device_id))
 
+    def wants_hq_stream(self, device_id: int) -> bool:
+        return device_id in self.hq_wanted or self.has_hq_viewers(device_id)
+
+    def has_any_viewers(self, device_id: int) -> bool:
+        try:
+            from session_recorder import recorder_manager
+            if recorder_manager.is_recording_device(device_id):
+                return True
+        except Exception:
+            pass
+        return bool(self.viewer_connections.get(device_id)) or self.has_hq_viewers(device_id)
+
+    async def _send_hq_bytes_to_viewer(self, ws_id: str, ws: WebSocket, chunk: bytes, locks: Dict[str, asyncio.Lock]):
+        lock = locks.get(ws_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[ws_id] = lock
+        async with lock:
+            await ws.send_bytes(chunk)
+
     async def push_hq_chunk_to_viewers(self, device_id: int, chunk: bytes):
-        """Forward binary H.264/fMP4 chunk del agente a todos los viewers HQ.
-        Opera 100% en binario — sin base64, sin JSON. Cero overhead.
-        """
+        """Forward binary H.264 del agente HQ a viewers (WS estándar y/o /hq legacy)."""
         if not hasattr(self, "_chunk_counts"):
             self._chunk_counts = {}
         self._chunk_counts[device_id] = self._chunk_counts.get(device_id, 0) + 1
 
-        if device_id not in self.viewer_connections:
+        std_viewers = self.viewer_connections.get(device_id, {})
+        hq_viewers = self.hq_viewer_connections.get(device_id, {})
+        if not std_viewers and not hq_viewers:
             if self._chunk_counts[device_id] % 100 == 1:
-                backend_remote_log(device_id, f"[BACKEND-TRANSMISIÓN] Recibiendo video H.264 (chunk #{self._chunk_counts[device_id]}, {len(chunk)} bytes) del agente pero ignorándolo: NO hay visores conectados en este WebSocket", "WARNING")
+                backend_remote_log(
+                    device_id,
+                    f"[BACKEND-TRANSMISIÓN] H.264 chunk #{self._chunk_counts[device_id]} ({len(chunk)} bytes) "
+                    f"sin visor conectado — enviando stop_hq al agente",
+                    "WARNING",
+                )
+                if device_id in self.hq_wanted:
+                    self.hq_wanted.discard(device_id)
+                asyncio.create_task(self.send_json_safe(device_id, {"type": "stop_hq"}))
             return
-        
-        viewers_count = len(self.viewer_connections[device_id])
-        logger.info("[HQ-FORWARD] Reenviando chunk de %d bytes del agente %d a %d viewers", len(chunk), device_id, viewers_count)
-        
+
+        viewers_count = len(std_viewers) + len(hq_viewers)
+        if self._chunk_counts[device_id] <= 5 or self._chunk_counts[device_id] % 100 == 0:
+            logger.info(
+                "[HQ-FORWARD] chunk #%d (%d bytes) device %d → %d viewer(s) (std=%d hq=%d)",
+                self._chunk_counts[device_id], len(chunk), device_id, viewers_count,
+                len(std_viewers), len(hq_viewers),
+            )
+        else:
+            logger.debug("[HQ-FORWARD] chunk #%d (%d bytes) device %d", self._chunk_counts[device_id], len(chunk), device_id)
+
         if self._chunk_counts[device_id] % 100 == 1:
-            backend_remote_log(device_id, f"[BACKEND-TRANSMISIÓN] Reenviando chunk de video H.264 #{self._chunk_counts[device_id]} ({len(chunk)} bytes) a {viewers_count} visor(es) conectado(s)", "INFO")
-        
-        dead = []
-        for ws_id, ws in list(self.viewer_connections[device_id].items()):
-            # Use viewer_write_locks to avoid concurrent JSON and binary writes
-            lock = self.viewer_write_locks.get(ws_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self.viewer_write_locks[ws_id] = lock
+            backend_remote_log(
+                device_id,
+                f"[BACKEND-TRANSMISIÓN] Reenviando H.264 #{self._chunk_counts[device_id]} ({len(chunk)} bytes) "
+                f"a {viewers_count} visor(es) (std={len(std_viewers)}, hq={len(hq_viewers)})",
+                "INFO",
+            )
+
+        dead_std: list[str] = []
+        for ws_id, ws in list(std_viewers.items()):
             try:
-                async with lock:
-                    await ws.send_bytes(chunk)
+                await self._send_hq_bytes_to_viewer(ws_id, ws, chunk, self.viewer_write_locks)
             except Exception as e:
-                logger.error("[HQ-FORWARD-ERROR] Error enviando bytes a viewer %s: %s", ws_id, e)
-                dead.append(ws_id)
-        for ws_id in dead:
-            self.viewer_connections[device_id].pop(ws_id, None)
+                logger.error("[HQ-FORWARD-ERROR] std viewer %s: %s", ws_id, e)
+                dead_std.append(ws_id)
+        for ws_id in dead_std:
+            std_viewers.pop(ws_id, None)
             self.viewer_write_locks.pop(ws_id, None)
-            logger.info("[VIEWER] Viewer HQ %s desconectado de device %d", ws_id, device_id)
+
+        dead_hq: list[str] = []
+        for ws_id, ws in list(hq_viewers.items()):
+            try:
+                await self._send_hq_bytes_to_viewer(ws_id, ws, chunk, self.hq_viewer_write_locks)
+            except Exception as e:
+                logger.error("[HQ-FORWARD-ERROR] hq viewer %s: %s", ws_id, e)
+                dead_hq.append(ws_id)
+        for ws_id in dead_hq:
+            hq_viewers.pop(ws_id, None)
+            self.hq_viewer_write_locks.pop(ws_id, None)
+
+        if not std_viewers and not hq_viewers:
+            if device_id in self.viewer_connections and not self.viewer_connections[device_id]:
+                del self.viewer_connections[device_id]
+            if device_id in self.hq_viewer_connections and not self.hq_viewer_connections[device_id]:
+                del self.hq_viewer_connections[device_id]
 
 
 manager = ConnectionManager()
+
+# Agenda: grabaciones + videoconferencias Jitsi
+from agenda import setup_agenda, periodic_agenda_worker
+setup_agenda(app, manager, get_current_user, send_push_notification)
 
 
 @app.websocket("/api/ws/viewer/{device_id}")
@@ -1418,6 +2211,13 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
     ws_id = str(uuid.uuid4())
     manager.add_viewer(device_id, ws_id, websocket)
 
+    # Limpiar switch pendiente viejo (evita pantalla negra si falló un cambio de sesión anterior)
+    stale_at = manager.switch_requested_at.get(device_id)
+    if stale_at and (datetime.utcnow() - stale_at).total_seconds() > 12.0:
+        manager.requested_sessions.pop(device_id, None)
+        manager.switch_requested_at.pop(device_id, None)
+        logger.info("[WS-SWITCH] Switch pendiente expirado al conectar viewer (device %s)", device_id)
+
     # Notificar al agente que hay un técnico mirando → activa HAS_ACTIVE_VIEWER en el agente
     # Sin esto, el agente nuevo nunca envía frames (espera este mensaje para empezar)
     await manager.send_json_safe(device_id, {
@@ -1441,7 +2241,7 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
     try:
         while True:
             try:
-                raw = await asyncio.wait_for(websocket.receive(), timeout=60.0)
+                raw = await asyncio.wait_for(websocket.receive(), timeout=30.0)
                 # Puede ser text (JSON) o ping simple
                 text = raw.get("text", "") or ""
                 if not text:
@@ -1462,41 +2262,48 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
                         "set_stream_params", "start_hq", "stop_hq"
                     }
                     if cmd_type in FORWARDED_CMDS:
+                        if cmd_type == "start_hq":
+                            manager.hq_wanted.add(device_id)
+                        elif cmd_type == "stop_hq":
+                            manager.hq_wanted.discard(device_id)
                         if cmd_type == "switch_session":
-                            target_session_id = int(cmd.get("session_id", -1))
-                            if target_session_id != -1 and device_id in manager.device_sessions:
-                                if not hasattr(manager, "requested_sessions"):
-                                    manager.requested_sessions = {}
-                                manager.requested_sessions[device_id] = target_session_id
-                                
-                                if target_session_id in manager.device_sessions[device_id]:
-                                    # Detener HQ en el agente viejo para que no mande frames mezclados
-                                    if manager.has_hq_viewers(device_id):
-                                        await manager.send_json_safe(device_id, {"type": "stop_hq"})
-                                        
-                                    # Cambio de sesion interno instantaneo
-                                    manager.selected_sessions[device_id] = target_session_id
-                                    manager.active_connections[device_id] = manager.device_sessions[device_id][target_session_id]
-                                    logger.info(f"[WS-SWITCH] Servidor cambio sesion activa de device {device_id} a {target_session_id} internamente")
-                                    # Pedir refresh frame
-                                    await manager.send_json_safe(device_id, {"type": "refresh_frame"})
-                                    # Notify viewers
-                                    for v_ws in list(manager.viewer_connections.get(device_id, {}).values()):
-                                        try:
-                                            await v_ws.send_json({"type": "session_switched", "session_id": target_session_id})
-                                        except Exception as e:
-                                            logger.error(f"[WS-SWITCH] Error notifying viewer: {e}")
-                                            
-                                    # Si HQ esta activo y es un switch interno, el agente necesita re-iniciar HQ? No, FFMPEG es global por sesion. Pero igual aseguramos:
-                                    if manager.has_hq_viewers(device_id):
-                                        await manager.send_json_safe(device_id, {"type": "start_hq", "device_id": device_id})
-                                else:
-                                    logger.info(f"[WS-SWITCH] Sesion {target_session_id} no conectada aun. Enviando signal al companion activo.")
-                                    await manager.send_json_safe(device_id, cmd)
-                            else:
-                                await manager.send_json_safe(device_id, cmd)
+                            await manager.handle_session_switch(device_id, cmd)
+                            if not await manager.send_json_to_device(device_id, cmd):
+                                backend_remote_log(
+                                    device_id,
+                                    "[SESSION-SWITCH] No se pudo enviar switch_session al agente (sin WS activo)",
+                                    "ERROR",
+                                )
+                        elif cmd_type == "login_session" and cmd.get("password"):
+                            target_session_id = int(cmd.get("session_id") or 1)
+                            manager.requested_sessions[device_id] = target_session_id
+                            manager.switch_requested_at[device_id] = datetime.utcnow()
+                            manager.client_frames.pop(device_id, None)
+                            manager.frame_buffer.pop(device_id, None)
+                            for v_ws in list(manager.viewer_connections.get(device_id, {}).values()):
+                                try:
+                                    await v_ws.send_json({
+                                        "type": "session_switching",
+                                        "target_session_id": target_session_id,
+                                    })
+                                except Exception:
+                                    pass
+                            asyncio.create_task(
+                                manager._session_switch_watchdog(device_id, target_session_id)
+                            )
+                            backend_remote_log(
+                                device_id,
+                                f"[SESSION-SWITCH] login_session con credenciales -> sesión {target_session_id}",
+                                "INFO",
+                            )
+                            if not await manager.send_json_to_device(device_id, cmd):
+                                backend_remote_log(
+                                    device_id,
+                                    "[SESSION-SWITCH] login_session no llegó al agente (sin WS)",
+                                    "ERROR",
+                                )
                         else:
-                            await manager.send_json_safe(device_id, cmd)
+                            await manager.send_json_to_device(device_id, cmd)
                 except Exception:
                     pass
             except asyncio.TimeoutError:
@@ -1518,6 +2325,9 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
                 "type": "active_technicians",
                 "technicians": []
             })
+            if not manager.has_hq_viewers(device_id) and device_id in manager.hq_wanted:
+                manager.hq_wanted.discard(device_id)
+                await manager.send_json_safe(device_id, {"type": "stop_hq"})
 
 
 # ——————————————————————————————————————————————————————————————————————————————
@@ -1559,7 +2369,7 @@ async def websocket_viewer_hq(websocket: WebSocket, device_id: int, token: str =
     try:
         while True:
             try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 if msg == "ping":
                     await websocket.send_text("pong")
             except asyncio.TimeoutError:
@@ -1594,6 +2404,59 @@ async def websocket_viewer_hq(websocket: WebSocket, device_id: int, token: str =
 # ==========================================
 # ROBUST THREAD-SAFE DB OPERATIONS FOR WEBSOCKET
 # ==========================================
+
+def _purge_duplicate_pending_devices(db, keep: models.CentinelaDevice) -> int:
+    """Elimina filas pendientes (client_id NULL) que representan el mismo PC que `keep`.
+    Evita el fantasma 'arriba sin asignar' cuando ya está bajo un cliente."""
+    if keep is None or keep.id is None:
+        return 0
+    from sqlalchemy import or_
+
+    clauses = []
+    if keep.assist_id:
+        clauses.append(models.CentinelaDevice.assist_id == keep.assist_id)
+    if keep.alt_remote_id:
+        clauses.append(models.CentinelaDevice.alt_remote_id == keep.alt_remote_id)
+    # Mismo hostname solo si el keeper ya está asignado (evita borrar otro pending distinto)
+    if keep.device_name and keep.client_id is not None:
+        clauses.append(models.CentinelaDevice.device_name == keep.device_name)
+    if not clauses:
+        return 0
+
+    dupes = (
+        db.query(models.CentinelaDevice)
+        .filter(
+            models.CentinelaDevice.id != keep.id,
+            models.CentinelaDevice.client_id == None,
+            or_(*clauses),
+        )
+        .all()
+    )
+    removed = 0
+    for d in dupes:
+        try:
+            did = d.id
+            db.query(models.SupportSession).filter(models.SupportSession.device_id == did).delete(synchronize_session=False)
+            db.query(models.RemoteChat).filter(models.RemoteChat.device_id == did).delete(synchronize_session=False)
+            db.query(models.RemoteLog).filter(models.RemoteLog.device_id == did).delete(synchronize_session=False)
+            db.delete(d)
+            removed += 1
+            logger.info(
+                "[DEDUP] Pending duplicado eliminado id=%s name=%s assist=%s (keep=%s client=%s)",
+                did, d.device_name, d.assist_id, keep.id, keep.client_id,
+            )
+            # Limpiar manager si estaba conectado como huérfano
+            try:
+                if did in manager.active_connections:
+                    manager.disconnect(did, None)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("[DEDUP] No se pudo borrar pending id=%s: %s", getattr(d, "id", None), e)
+    if removed:
+        db.commit()
+    return removed
+
 
 def handle_centinela_handshake(client_id_param: int, device_name: str, license_key: str, hq: str, device_id_param: int, alt_id: str = None) -> dict:
     """
@@ -1642,20 +2505,66 @@ def handle_centinela_handshake(client_id_param: int, device_name: str, license_k
         else:
             resolved_client_id = None
 
-        # Buscar o registrar
-        if is_pending:
-            device = db.query(models.CentinelaDevice).filter(
-                models.CentinelaDevice.device_name == device_name,
-                (models.CentinelaDevice.client_id == resolved_client_id) | (models.CentinelaDevice.client_id == None)
-            ).order_by(models.CentinelaDevice.id.desc()).first()
-        else:
-            device = db.query(models.CentinelaDevice).filter(
-                models.CentinelaDevice.client_id == resolved_client_id,
-                models.CentinelaDevice.device_name == device_name
-            ).first()
+        # Buscar dispositivo existente (evitar duplicados: mismo PC en pendientes + asignado)
+        device = None
+        assist_str = str(client_id_param) if client_id_param else None
+
+        # 1) Por assist_id (ID que muestra ApolloSoporte) — preferir el ya asignado
+        if assist_str:
+            candidates = (
+                db.query(models.CentinelaDevice)
+                .filter(models.CentinelaDevice.assist_id == assist_str)
+                .order_by(
+                    models.CentinelaDevice.client_id.is_(None).asc(),  # asignados primero
+                    models.CentinelaDevice.id.desc(),
+                )
+                .all()
+            )
+            if candidates:
+                device = candidates[0]
+
+        # 2) Por AnyDesk / RustDesk alt_id
+        if not device and alt_id:
+            candidates = (
+                db.query(models.CentinelaDevice)
+                .filter(models.CentinelaDevice.alt_remote_id == alt_id)
+                .order_by(
+                    models.CentinelaDevice.client_id.is_(None).asc(),
+                    models.CentinelaDevice.id.desc(),
+                )
+                .all()
+            )
+            if candidates:
+                device = candidates[0]
+
+        # 3) Por nombre + cliente (licenciado) o nombre sin cliente (pendiente)
+        if not device:
+            if not is_pending and resolved_client_id is not None:
+                device = db.query(models.CentinelaDevice).filter(
+                    models.CentinelaDevice.client_id == resolved_client_id,
+                    models.CentinelaDevice.device_name == device_name,
+                ).first()
+            if not device:
+                # Cualquier fila con mismo hostname (asignada o pendiente)
+                device = (
+                    db.query(models.CentinelaDevice)
+                    .filter(models.CentinelaDevice.device_name == device_name)
+                    .order_by(
+                        models.CentinelaDevice.client_id.is_(None).asc(),
+                        models.CentinelaDevice.id.desc(),
+                    )
+                    .first()
+                )
 
         if not device:
-            device = models.CentinelaDevice(client_id=resolved_client_id, device_name=device_name, is_online=True, alt_remote_id=alt_id)
+            # Solo crear pendiente/nuevo si no hay ningún rastro del PC
+            device = models.CentinelaDevice(
+                client_id=resolved_client_id,
+                device_name=device_name,
+                is_online=True,
+                alt_remote_id=alt_id,
+                assist_id=assist_str,
+            )
             db.add(device)
             db.commit()
             db.refresh(device)
@@ -1664,9 +2573,23 @@ def handle_centinela_handshake(client_id_param: int, device_name: str, license_k
             device.last_seen = datetime.utcnow()
             if alt_id:
                 device.alt_remote_id = alt_id
+            if assist_str:
+                device.assist_id = assist_str
+            # Si conectó con licencia válida, asegurar client_id (recupera huérfanos)
+            if not is_pending and resolved_client_id is not None and device.client_id is None:
+                device.client_id = resolved_client_id
+                logger.info(
+                    "[WS-HANDSHAKE] Dispositivo huérfano %s (%s) reasignado a client_id=%s",
+                    device.id, device_name, resolved_client_id,
+                )
             db.commit()
 
-        return {"status": "ok", "device_id": device.id, "client_id": resolved_client_id}
+            # Limpiar duplicados pendientes del mismo PC (mismo assist / nombre / alt)
+            _purge_duplicate_pending_devices(db, device)
+
+        # Si es conexión pendiente pero el device ya está asignado, devolver su client_id real
+        out_client_id = resolved_client_id if resolved_client_id is not None else device.client_id
+        return {"status": "ok", "device_id": device.id, "client_id": out_client_id}
     except Exception as e:
         logger.error("[WS-INIT-DB] Error: %s", e)
         return {"status": "exception", "error": str(e)}
@@ -1929,6 +2852,8 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                     "technicians": active_viewers
                 })
                 logger.info("[WS-WELCOME] Agente notificado de viewers activos inmediatamente: %s", active_viewers)
+            if manager.has_any_viewers(device_id):
+                await manager.notify_agent_viewers_watching(device_id)
         except Exception as welcome_notify_err:
             logger.error("[WS-WELCOME] Error al notificar al agente de viewers activos: %s", welcome_notify_err)
 
@@ -1950,15 +2875,55 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                             is_active_session = False
 
                     if data["type"] in ["screen_frame", "video_frame"]:
-                        # AUTO-PROMOCIÓN: si el frame viene de una sesion no-activa,
-                        # la promovemos inmediatamente. La sesion que envía frames ES la correcta.
-                        if not is_active_session:
+                        frame_session_id = None
+                        for s_id, ws in manager.device_sessions.get(device_id, {}).items():
+                            if ws == websocket:
+                                frame_session_id = s_id
+                                break
+
+                        pending_switch = manager.requested_sessions.get(device_id)
+                        if pending_switch is not None:
+                            switch_age = None
+                            switch_started = manager.switch_requested_at.get(device_id)
+                            if switch_started is not None:
+                                switch_age = (datetime.utcnow() - switch_started).total_seconds()
+
+                            if frame_session_id == pending_switch:
+                                is_active_session = True
+                                asyncio.create_task(
+                                    manager._complete_session_switch(
+                                        device_id,
+                                        pending_switch,
+                                        websocket,
+                                        "frames en sesión solicitada",
+                                    )
+                                )
+                            elif frame_session_id is not None:
+                                pending_ws = manager.device_sessions.get(device_id, {}).get(pending_switch)
+                                if pending_ws is None or (switch_age is not None and switch_age > 12.0):
+                                    is_active_session = True
+                                    asyncio.create_task(
+                                        manager._complete_session_switch(
+                                            device_id,
+                                            frame_session_id,
+                                            websocket,
+                                            f"frames en sesión {frame_session_id} (esperaba {pending_switch})",
+                                        )
+                                    )
+                                else:
+                                    is_active_session = False
+                            else:
+                                is_active_session = False
+                        elif not is_active_session:
                             for s_id, ws in manager.device_sessions.get(device_id, {}).items():
                                 if ws == websocket:
                                     manager.selected_sessions[device_id] = s_id
                                     manager.active_connections[device_id] = ws
                                     is_active_session = True
-                                    logger.info(f"[WS-AUTOPROMOTE] Sesion {s_id} promovida: es la que envía frames (device {device_id})")
+                                    logger.info(
+                                        "[WS-AUTOPROMOTE] Sesion %s promovida (device %s)",
+                                        s_id, device_id,
+                                    )
                                     break
 
                         if is_active_session:
@@ -2059,12 +3024,12 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
 
 @app.get("/api/centinelas/activos", tags=["Centinela"])
 def get_centinelas_activos(current_user: models.User = Depends(get_current_user)):
-    """ React consulta por acÃ¡ quÃ© PCs maestras estÃ¡n encendidas y corriendo el programa Centinela. """
+    """ React consulta por acá qué PCs maestras están encendidas y corriendo el programa Centinela. """
     return manager.client_telemetry
 
 @app.get("/api/centinelas/devices/{device_id}/frame", tags=["Centinela"])
 async def get_centinela_frame(device_id: int, current_user: models.User = Depends(get_current_user)):
-    """ Devuelve el Ãºltimo frame capturado para un dispositivo especÃ­fico y registra al tÃ©cnico conectado. """
+    """ Devuelve el último frame capturado para un dispositivo específico y registra al técnico conectado. """
     now = datetime.utcnow()
     if device_id not in manager.device_viewers:
         manager.device_viewers[device_id] = {}
@@ -2072,7 +3037,7 @@ async def get_centinela_frame(device_id: int, current_user: models.User = Depend
     manager.device_viewers[device_id][current_user.id] = (current_user.full_name or current_user.nombre or current_user.email or "Soporte", now)
     
     last_notify = manager.last_viewer_notification.get(device_id)
-    if not last_notify or (now - last_notify).total_seconds() > 2.0:
+    if not last_notify or (now - last_notify).total_seconds() > 1.0:
         stale_threshold = 5.0
         active_viewers = []
         to_delete = []
@@ -2099,6 +3064,19 @@ async def get_centinela_frame(device_id: int, current_user: models.User = Depend
     frame = manager.client_frames.get(device_id)
     return {"frame": frame}
 
+
+@app.get("/api/centinelas/devices/{device_id}/windows-sessions", tags=["Centinela"])
+async def get_device_windows_sessions(
+    device_id: int,
+    refresh: bool = False,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Lista de sesiones Windows (Consola + RDP). Opcionalmente pide refresh al agente."""
+    if refresh and device_id in manager.active_connections:
+        await manager.send_json_safe(device_id, {"type": "get_sessions"})
+    sessions = manager.client_sessions.get(device_id, [])
+    return {"sessions": sessions, "device_id": device_id}
+
 @app.get("/api/centinelas/alertas", tags=["Centinela"])
 def get_centinelas_alertas(current_user: models.User = Depends(get_current_user)):
     """ Devuelve todas las alertas activas de todos los centinelas. """
@@ -2116,7 +3094,7 @@ def delete_centinela_device(device_id: int, db: Session = Depends(get_db), curre
     if not device:
         raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
     
-    # Si estÃ¡ conectado actualmente, desconectarlo del manager
+    # Si está conectado actualmente, desconectarlo del manager
     try:
         manager.disconnect(device_id, device.client_id)
     except Exception as e:
@@ -2145,16 +3123,58 @@ def update_centinela_device_notes(device_id: int, payload: schemas.DeviceNotesUp
 
 @app.get("/api/centinelas/pending", response_model=List[schemas.CentinelaDeviceOut], tags=["Centinela"])
 def get_pending_centinelas(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Devuelve todos los dispositivos que estÃ¡n pendientes de asignaciÃ³n de licencia con seriales, propuestas de clientes y datos del sistema. """
+    """ Devuelve dispositivos pendientes de licencia.
+    Autolimpia huérfanos que ya tienen gemelo asignado (mismo assist_id / alt / hostname). """
     devices = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.client_id == None).all()
-    
+
+    # Autodedup: si hay un PC asignado con mismo assist/alt/nombre, borrar el pending
+    cleaned = []
+    for dev in list(devices):
+        twin = None
+        if dev.assist_id:
+            twin = (
+                db.query(models.CentinelaDevice)
+                .filter(
+                    models.CentinelaDevice.assist_id == dev.assist_id,
+                    models.CentinelaDevice.client_id != None,
+                    models.CentinelaDevice.id != dev.id,
+                )
+                .first()
+            )
+        if not twin and dev.alt_remote_id:
+            twin = (
+                db.query(models.CentinelaDevice)
+                .filter(
+                    models.CentinelaDevice.alt_remote_id == dev.alt_remote_id,
+                    models.CentinelaDevice.client_id != None,
+                    models.CentinelaDevice.id != dev.id,
+                )
+                .first()
+            )
+        if not twin and dev.device_name:
+            twin = (
+                db.query(models.CentinelaDevice)
+                .filter(
+                    models.CentinelaDevice.device_name == dev.device_name,
+                    models.CentinelaDevice.client_id != None,
+                    models.CentinelaDevice.id != dev.id,
+                )
+                .first()
+            )
+        if twin:
+            _purge_duplicate_pending_devices(db, twin)
+            continue
+        cleaned.append(dev)
+
+    devices = cleaned
+
     for dev in devices:
         telemetry = manager.client_telemetry.get(dev.id, {})
         serials = telemetry.get("apollo_serials", [])
         dev.apollo_serials = serials
         dev.proposed_client = None
 
-        # Enriquecer con datos de telemetrÃ­a en vivo para identificaciÃ³n
+        # Enriquecer con datos de telemetría en vivo para identificación
         dev.os           = telemetry.get("os", None)
         dev.cpu          = telemetry.get("cpu", None)
         dev.ram          = telemetry.get("ram", None)
@@ -2173,7 +3193,7 @@ def get_pending_centinelas(db: Session = Depends(get_db), current_user: models.U
 
 @app.post("/api/centinelas/devices/{device_id}/assign/{client_id}", tags=["Centinela"])
 async def assign_centinela_license(device_id: int, client_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Asigna un dispositivo pendiente a un cliente y le envÃ­a su nueva licencia de forma segura por WebSocket. """
+    """ Asigna un dispositivo pendiente a un cliente y le envía su nueva licencia de forma segura por WebSocket. """
     import uuid
     device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
     if not device:
@@ -2202,7 +3222,7 @@ async def assign_centinela_license(device_id: int, client_id: int, db: Session =
     # Validar cupo de dispositivos del cliente
     devices_count = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.client_id == client_id).count()
     if devices_count >= lic.max_devices:
-        raise HTTPException(status_code=400, detail="LÃ­mite de dispositivos excedido para la licencia de este cliente")
+        raise HTTPException(status_code=400, detail="Límite de dispositivos excedido para la licencia de este cliente")
         
     # Asignar dispositivo
     device.client_id = client_id
@@ -2214,9 +3234,9 @@ async def assign_centinela_license(device_id: int, client_id: int, db: Session =
         "license_key": lic.license_key
     })
     
-    # Actualizar la conexiÃ³n interna del manager
+    # Actualizar la conexión interna del manager
     if device_id in manager.active_connections:
-        # Retirar del cliente anterior si existÃ­a
+        # Retirar del cliente anterior si existía
         for cid, dev_list in list(manager.active_clients.items()):
             if device_id in dev_list:
                 dev_list.remove(device_id)
@@ -2241,7 +3261,7 @@ async def register_push_token(token_data: dict, db: Session = Depends(get_db), c
     return {"status": "ok", "message": "Token registrado correctamente"}
 
 def log_session_command(device_id: int, technician_id: int, command: str, db: Session):
-    # Buscar sesiÃ³n activa para este tÃ©cnico en este dispositivo (end_time es None)
+    # Buscar sesión activa para este técnico en este dispositivo (end_time es None)
     session = db.query(models.SupportSession).filter(
         models.SupportSession.device_id == device_id,
         models.SupportSession.technician_id == technician_id,
@@ -2256,7 +3276,7 @@ def log_session_command(device_id: int, technician_id: int, command: str, db: Se
             logger.error("Error parsing commands list: %s", e)
             cmds = []
         
-        # AÃ±adir timestamp local y comando
+        # Añadir timestamp local y comando
         cmds.append({
             "time": datetime.utcnow().strftime("%H:%M:%S"),
             "cmd": command
@@ -2288,12 +3308,12 @@ def log_session_file(device_id: int, technician_id: int, file_info: str, db: Ses
 
 @app.post("/api/centinelas/devices/{device_id}/command", tags=["Centinela"])
 async def send_centinela_command(device_id: int, command_data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ EnvÃ­a una orden remota a un dispositivo especÃ­fico. """
+    """ Envía una orden remota a un dispositivo específico. """
     cmd = command_data.get("command")
     if not cmd:
         raise HTTPException(status_code=400, detail="Falta el comando.")
     
-    # Obtener el dispositivo para saber el client_id (para auditorÃ­a)
+    # Obtener el dispositivo para saber el client_id (para auditoría)
     device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
     if not device: raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
 
@@ -2302,7 +3322,7 @@ async def send_centinela_command(device_id: int, command_data: dict, db: Session
 
     await manager.send_json_safe(device_id, {"type": "run_command", "command": cmd})
     
-    # Grabar AuditorÃ­a
+    # Grabar Auditoría
     log = models.AccessLog(
         technician_id=current_user.id,
         client_id=device.client_id,
@@ -2310,7 +3330,7 @@ async def send_centinela_command(device_id: int, command_data: dict, db: Session
     )
     db.add(log)
     
-    # Loguear en la sesiÃ³n activa si existe
+    # Loguear en la sesión activa si existe
     try:
         log_session_command(device_id, current_user.id, cmd, db)
     except Exception as e:
@@ -2321,15 +3341,40 @@ async def send_centinela_command(device_id: int, command_data: dict, db: Session
 
 @app.post("/api/centinelas/devices/{device_id}/control", tags=["Centinela"])
 async def send_centinela_control(device_id: int, control_data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ EnvÃ­a una acciÃ³n de ratÃ³n o teclado (clics, textos, teclas especiales) al dispositivo. """
-    if device_id not in manager.active_connections:
+    """ Envía una acción de ratón o teclado (clics, textos, teclas especiales) al dispositivo. """
+    has_ws = bool(manager.device_sessions.get(device_id)) or device_id in manager.active_connections
+    if not has_ws:
         raise HTTPException(status_code=404, detail="Dispositivo offline")
-    await manager.send_json_safe(device_id, control_data)
+    cmd_type = control_data.get("type")
+    if cmd_type == "switch_session":
+        await manager.handle_session_switch(device_id, control_data)
+    elif cmd_type == "login_session" and control_data.get("password"):
+        target_session_id = int(control_data.get("session_id") or 1)
+        manager.requested_sessions[device_id] = target_session_id
+        manager.switch_requested_at[device_id] = datetime.utcnow()
+        manager.client_frames.pop(device_id, None)
+        manager.frame_buffer.pop(device_id, None)
+        backend_remote_log(
+            device_id,
+            f"[SESSION-SWITCH] login_session (HTTP) -> sesión {target_session_id}",
+            "INFO",
+        )
+        for v_ws in list(manager.viewer_connections.get(device_id, {}).values()):
+            try:
+                await v_ws.send_json({
+                    "type": "session_switching",
+                    "target_session_id": target_session_id,
+                })
+            except Exception:
+                pass
+        asyncio.create_task(manager._session_switch_watchdog(device_id, target_session_id))
+    if not await manager.send_json_to_device(device_id, control_data):
+        backend_remote_log(device_id, f"[CONTROL] Comando {cmd_type} no entregado al agente", "WARNING")
     return {"status": "success"}
 
 @app.post("/api/centinelas/devices/{device_id}/chat", tags=["Centinela"])
 async def send_centinela_chat(device_id: int, chat_data: schemas.RemoteChatBase, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ EnvÃ­a chat a un dispositivo especÃ­fico y lo guarda en el historial. """
+    """ Envía chat a un dispositivo específico y lo guarda en el historial. """
     msg = chat_data.message
     device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
     if not device: raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
@@ -2355,12 +3400,12 @@ async def send_centinela_chat(device_id: int, chat_data: schemas.RemoteChatBase,
 
 @app.get("/api/centinelas/devices/{device_id}/chat", response_model=List[schemas.RemoteChatOut], tags=["Centinela"])
 def get_centinela_chat_history(device_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Recupera los Ãºltimos 50 mensajes de chat entre tÃ©cnicos y este dispositivo. """
+    """ Recupera los últimos 50 mensajes de chat entre técnicos y este dispositivo. """
     return db.query(models.RemoteChat).filter(models.RemoteChat.device_id == device_id).order_by(models.RemoteChat.timestamp.asc()).limit(50).all()
 
 @app.post("/api/centinelas/devices/{device_id}/clipboard", tags=["Centinela"])
 async def sync_centinela_clipboard(device_id: int, clip_data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Sincroniza el portapapeles con un dispositivo especÃ­fico. """
+    """ Sincroniza el portapapeles con un dispositivo específico. """
     text = clip_data.get("text")
     if device_id in manager.active_connections:
         await manager.send_json_safe(device_id, {"type": "clipboard_sync", "text": text})
@@ -2369,7 +3414,7 @@ async def sync_centinela_clipboard(device_id: int, clip_data: dict, db: Session 
 
 @app.get("/api/centinelas/devices/{device_id}/clipboard", tags=["Centinela"])
 def get_centinela_clipboard(device_id: int, current_user: models.User = Depends(get_current_user)):
-    """ Recupera el Ãºltimo texto del portapapeles reportado por el cliente. """
+    """ Recupera el último texto del portapapeles reportado por el cliente. """
     text = manager.client_clipboard.get(device_id, "")
     return {"text": text}
 
@@ -2377,7 +3422,7 @@ def get_centinela_clipboard(device_id: int, current_user: models.User = Depends(
 async def get_centinela_files(device_id: int, path: str = "C:\\", current_user: models.User = Depends(get_current_user)):
     """ Solicita al agente listar un directorio y devuelve la lista de archivos. """
     if device_id in manager.active_connections:
-        # Limpiar cachÃ© previa para forzar lectura fresca
+        # Limpiar caché previa para forzar lectura fresca
         if device_id in manager.client_files:
             del manager.client_files[device_id]
             
@@ -2386,14 +3431,14 @@ async def get_centinela_files(device_id: int, path: str = "C:\\", current_user: 
             "path": path
         })
         
-        # Esperar brevemente a que el agente responda vÃ­a WebSocket (mÃ¡ximo 1.5s)
+        # Esperar brevemente a que el agente responda vía WebSocket (máximo 1.5s)
         for _ in range(15):
             await asyncio.sleep(0.1)
             cached = manager.client_files.get(device_id)
             if cached and cached.get("type") == "dir_list" and cached.get("path") == path:
                 return cached
                 
-        # Retornar lo que tengamos en cache si no llegÃ³ a tiempo
+        # Retornar lo que tengamos en cache si no llegó a tiempo
         cached = manager.client_files.get(device_id)
         if cached:
             return cached
@@ -2440,7 +3485,7 @@ async def request_file_download(device_id: int, path: str, db: Session = Depends
 
 @app.post("/api/centinelas/devices/{device_id}/files/receive", tags=["Centinela"])
 async def receive_file_from_agent(device_id: int, file: UploadFile = File(...)):
-    """ Endpoint donde el agente sube el archivo solicitado por el tÃ©cnico. """
+    """ Endpoint donde el agente sube el archivo solicitado por el técnico. """
     temp_dir = "temp_files"
     if not os.path.exists(temp_dir): os.makedirs(temp_dir)
     
@@ -2453,7 +3498,7 @@ async def receive_file_from_agent(device_id: int, file: UploadFile = File(...)):
 
 @app.post("/api/centinelas/devices/{device_id}/files/upload", tags=["Centinela"])
 async def upload_file_to_agent(device_id: int, file: UploadFile = File(...), dest_path: str = "C:\\ApolloTemp", db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ El tÃ©cnico sube un archivo para enviar a la PC del cliente. """
+    """ El técnico sube un archivo para enviar a la PC del cliente. """
     temp_dir = "temp_files"
     if not os.path.exists(temp_dir): os.makedirs(temp_dir)
     
@@ -2476,7 +3521,7 @@ async def upload_file_to_agent(device_id: int, file: UploadFile = File(...), des
 
 @app.post("/api/centinelas/devices/{device_id}/verify-password", tags=["Centinela"])
 async def verify_remote_password(device_id: int, data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Verifica el PIN de un dispositivo y registra el inicio de sesiÃ³n del tÃ©cnico. """
+    """ Verifica el PIN de un dispositivo y registra el inicio de sesión del técnico. """
     try:
         # LOGS DE DEPURACION AL DISCO Y CONSOLA
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_verify.log")
@@ -2503,9 +3548,9 @@ async def verify_remote_password(device_id: int, data: dict, db: Session = Depen
             device.current_technician_id = current_user.id
             device.session_start = datetime.utcnow()
             device.last_support_date = datetime.utcnow()
-            db.add(models.AccessLog(technician_id=current_user.id, client_id=device.client_id, action=f"CONEXIÃ“N REMOTA: {device.device_name}"))
+            db.add(models.AccessLog(technician_id=current_user.id, client_id=device.client_id, action=f"CONEXIÓN REMOTA: {device.device_name}"))
             
-            # Cerrar cualquier sesiÃ³n previa de este tÃ©cnico en este dispositivo que haya quedado colgada (sin end_time)
+            # Cerrar cualquier sesión previa de este técnico en este dispositivo que haya quedado colgada (sin end_time)
             if hasattr(models, "SupportSession"):
                 previous_active = db.query(models.SupportSession).filter(
                     models.SupportSession.device_id == device_id,
@@ -2515,7 +3560,7 @@ async def verify_remote_password(device_id: int, data: dict, db: Session = Depen
                 for s in previous_active:
                     s.end_time = datetime.utcnow()
                 
-                # Crear la nueva sesiÃ³n de soporte activo
+                # Crear la nueva sesión de soporte activo
                 new_session = models.SupportSession(
                     device_id=device_id,
                     technician_id=current_user.id,
@@ -2532,12 +3577,12 @@ async def verify_remote_password(device_id: int, data: dict, db: Session = Depen
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write("WARNING: SupportSession class is missing from models module. Skipping sessions table write.\n")
             
-            # Notificar al Agente que un tÃ©cnico ha entrado
-            if device_id in manager.active_connections:
-                await manager.send_json_safe(device_id, {
-                    "type": "technician_joined", 
-                    "name": current_user.full_name or current_user.nombre
-                })
+            # Notificar al Agente que un técnico ha entrado (todas las sesiones WS vivas)
+            await manager.send_json_safe(device_id, {
+                "type": "technician_joined",
+                "name": current_user.full_name or current_user.nombre,
+            })
+            await manager.send_json_safe(device_id, {"type": "refresh_frame"})
             return {"status": "ok", "session_id": session_id}
         else:
             raise HTTPException(status_code=400, detail="PIN de acceso remoto incorrecto.")
@@ -2559,17 +3604,17 @@ async def verify_remote_password(device_id: int, data: dict, db: Session = Depen
 
 @app.post("/api/centinelas/devices/{device_id}/end-session", tags=["Centinela"])
 async def end_remote_session(device_id: int, payload: dict = None, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Finaliza la sesiÃ³n actual de un tÃ©cnico en una PC y graba el reporte con IA. """
+    """ Finaliza la sesión actual de un técnico en una PC y graba el reporte con IA. """
     comments = payload.get("comment", "") if payload else ""
     device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
     
     if device:
         device.current_technician_id = None
         device.session_start = None
-        db.add(models.AccessLog(technician_id=current_user.id, client_id=device.client_id, action=f"SESIÃ“N FINALIZADA: {device.device_name}"))
+        db.add(models.AccessLog(technician_id=current_user.id, client_id=device.client_id, action=f"SESIÓN FINALIZADA: {device.device_name}"))
         db.commit()
         
-    # Buscar sesiÃ³n activa de soporte
+    # Buscar sesión activa de soporte
     session = db.query(models.SupportSession).filter(
         models.SupportSession.device_id == device_id,
         models.SupportSession.technician_id == current_user.id,
@@ -2582,7 +3627,7 @@ async def end_remote_session(device_id: int, payload: dict = None, db: Session =
         duration = session.end_time - session.start_time
         duration_seconds = int(duration.total_seconds())
         
-        # Generar reporte automÃ¡tico con IA o Fallback offline
+        # Generar reporte automático con IA o Fallback offline
         import json
         try:
             cmds_list = json.loads(session.commands_run) if session.commands_run else []
@@ -2600,13 +3645,13 @@ async def end_remote_session(device_id: int, payload: dict = None, db: Session =
         if gemini_key:
             try:
                 prompt = f"""
-ActÃºa como un Coordinador TÃ©cnico de TI Inteligente. Resume de forma ejecutiva en un reporte estructurado y elegante en espaÃ±ol lo que un operador de soporte tÃ©cnico realizÃ³ en una PC cliente de Apollo ERP basÃ¡ndote en las siguientes acciones:
+Actúa como un Coordinador Técnico de TI Inteligente. Resume de forma ejecutiva en un reporte estructurado y elegante en español lo que un operador de soporte técnico realizó en una PC cliente de Apollo ERP basándote en las siguientes acciones:
 
 - Comandos Ejecutados: {cmds_desc}
 - Archivos Transferidos: {files_desc}
 - Comentario Manual del Operador: "{comments}"
 
-Instrucciones: Genera una lista compacta y profesional en espaÃ±ol (en formato Markdown, mÃ¡x 4 viÃ±etas) resumiendo las intervenciones clave y confirmando la resoluciÃ³n. No uses preÃ¡mbulos.
+Instrucciones: Genera una lista compacta y profesional en español (en formato Markdown, máx 4 viñetas) resumiendo las intervenciones clave y confirmando la resolución. No uses preámbulos.
 """
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
                 headers = {"Content-Type": "application/json"}
@@ -2622,25 +3667,25 @@ Instrucciones: Genera una lista compacta y profesional en espaÃ±ol (en formato
                         ai_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                         session.ai_report = ai_text
                     else:
-                        session.ai_report = f"GeneraciÃ³n automÃ¡tica por IA: El operador ejecutÃ³ {cmds_desc} y transfiriÃ³ {files_desc}."
+                        session.ai_report = f"Generación automática por IA: El operador ejecutó {cmds_desc} y transfirió {files_desc}."
             except Exception as e:
-                session.ai_report = f"GeneraciÃ³n automÃ¡tica (Falla de API): El operador ejecutÃ³ {cmds_desc} y transfiriÃ³ {files_desc}."
+                session.ai_report = f"Generación automática (Falla de API): El operador ejecutó {cmds_desc} y transfirió {files_desc}."
         else:
             # Fallback offline
             bullet_points = []
             if "spooler" in cmds_desc.lower() or "stop" in cmds_desc.lower():
-                bullet_points.append("* ðŸ”„ **Reinicio del Spooler de Windows:** Se restableciÃ³ la cola de impresiÃ³n de Windows para liberar documentos retenidos.")
+                bullet_points.append("* ðŸ”„ **Reinicio del Spooler de Windows:** Se restableció la cola de impresión de Windows para liberar documentos retenidos.")
             if "temp" in cmds_desc.lower() or "del" in cmds_desc.lower():
-                bullet_points.append("* ðŸ§¹ **Limpieza del Sistema:** Se eliminaron archivos temporales y de cachÃ© en %TEMP% para corregir bloqueos.")
+                bullet_points.append("* ðŸ§¹ **Limpieza del Sistema:** Se eliminaron archivos temporales y de caché en %TEMP% para corregir bloqueos.")
             if files_desc != "Ninguno":
                 bullet_points.append(f"* ðŸ“ **Transferencia de Archivos:** Se gestionaron transferencias de archivos: {files_desc}.")
             if comments:
-                bullet_points.append(f"* ðŸ’¬ **Notas del TÃ©cnico:** \"{comments}\"")
+                bullet_points.append(f"* ðŸ’¬ **Notas del Técnico:** \"{comments}\"")
                 
             if not bullet_points:
-                bullet_points.append("* ðŸ” **Monitoreo Remoto:** Se mantuvo sesiÃ³n activa de inspecciÃ³n de la terminal sin comandos intrusivos.")
+                bullet_points.append("* ðŸ” **Monitoreo Remoto:** Se mantuvo sesión activa de inspección de la terminal sin comandos intrusivos.")
                 if comments:
-                    bullet_points.append(f"* ðŸ’¬ **Notas del TÃ©cnico:** \"{comments}\"")
+                    bullet_points.append(f"* ðŸ’¬ **Notas del Técnico:** \"{comments}\"")
                     
             session.ai_report = "\n".join(bullet_points)
             
@@ -2656,9 +3701,110 @@ Instrucciones: Genera una lista compacta y profesional en espaÃ±ol (en formato
         }
     return {"status": "ok"}
 
+
+@app.post("/api/centinelas/devices/{device_id}/release-session", tags=["Centinela"])
+async def release_device_session(
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Libera sesión remota colgada: quita técnico asignado y cierra SupportSessions abiertas."""
+    device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+
+    now = datetime.utcnow()
+    open_sessions = db.query(models.SupportSession).filter(
+        models.SupportSession.device_id == device_id,
+        models.SupportSession.end_time == None,
+    ).all()
+    for session in open_sessions:
+        session.end_time = now
+        if not session.comments:
+            session.comments = (
+                f"Liberado por {current_user.full_name or current_user.nombre or current_user.email}"
+            )
+
+    prev_tech = device.current_technician_id
+    device.current_technician_id = None
+    device.session_start = None
+
+    db.add(models.AccessLog(
+        technician_id=current_user.id,
+        client_id=device.client_id,
+        action=f"LIBERAR SESIÓN: {device.device_name} (tech previo={prev_tech})",
+    ))
+    db.commit()
+
+    manager.requested_sessions.pop(device_id, None)
+    manager.switch_requested_at.pop(device_id, None)
+    if device_id in manager.device_viewers:
+        manager.device_viewers[device_id].clear()
+
+    await manager.send_json_safe(device_id, {"type": "active_technicians", "technicians": []})
+    backend_remote_log(
+        device_id,
+        f"[ADMIN] Sesión liberada por {current_user.email} (cerradas={len(open_sessions)})",
+        "INFO",
+    )
+
+    return {
+        "status": "success",
+        "closed_sessions": len(open_sessions),
+        "message": "Sesión liberada correctamente",
+    }
+
+
+@app.post("/api/centinelas/devices/{device_id}/force-refresh", tags=["Centinela"])
+async def force_refresh_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Cancela switch pendiente y fuerza al agente a reanudar captura de pantalla."""
+    device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+
+    manager.requested_sessions.pop(device_id, None)
+    manager.switch_requested_at.pop(device_id, None)
+    manager.client_frames.pop(device_id, None)
+
+    ws_sessions = list(manager.device_sessions.get(device_id, {}).keys())
+    tech_name = current_user.full_name or current_user.nombre or current_user.email or "Soporte"
+
+    sent_join = await manager.send_json_safe(device_id, {
+        "type": "technician_joined",
+        "name": tech_name,
+    })
+    await manager.send_json_safe(device_id, {
+        "type": "active_technicians",
+        "technicians": [tech_name],
+    })
+    sent_refresh = await manager.send_json_safe(device_id, {"type": "refresh_frame"})
+    await manager.send_json_safe(device_id, {"type": "wake_screen"})
+
+    backend_remote_log(
+        device_id,
+        f"[ADMIN] Force refresh por {current_user.email} | ws_sessions={ws_sessions} sent={bool(sent_join or sent_refresh)}",
+        "INFO",
+    )
+
+    return {
+        "status": "success",
+        "agent_ws_sessions": ws_sessions,
+        "commands_sent": bool(sent_join or sent_refresh),
+        "message": (
+            "Comandos enviados al agente"
+            if (sent_join or sent_refresh)
+            else "Agente sin WebSocket activo — reiniciar Centinela en la PC cliente"
+        ),
+    }
+
+
 @app.get("/api/centinelas/devices/{device_id}/last-session", tags=["Centinela"])
 def get_device_last_session(device_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Obtiene la Ãºltima sesiÃ³n de soporte completada para un dispositivo especÃ­fico. """
+    """ Obtiene la última sesión de soporte completada para un dispositivo específico. """
     session = db.query(models.SupportSession).filter(
         models.SupportSession.device_id == device_id,
         models.SupportSession.end_time != None
@@ -2680,7 +3826,7 @@ def get_device_last_session(device_id: int, db: Session = Depends(get_db), curre
 
 @app.patch("/api/centinelas/devices/{device_id}", tags=["Centinela"])
 async def update_device_settings(device_id: int, data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """ Permite al tÃ©cnico cambiar el PIN u otros ajustes de una PC especÃ­fica. """
+    """ Permite al técnico cambiar el PIN u otros ajustes de una PC específica. """
     device = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.id == device_id).first()
     if not device: raise HTTPException(status_code=404, detail="PC no encontrada")
     

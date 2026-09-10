@@ -1,0 +1,63 @@
+ApolloSupport — Agenda (grabaciones + videoconferencias) — Deploy servidor
+Fecha: 2026-09-10
+Puente: \\192.168.11.20\Puente\ApolloSupport  (Y:\ApolloSupport)
+
+================================================================================
+QUÉ TRAE
+================================================================================
+1) Tab "Agenda" en el portal:
+   - Reuniones Jitsi (URL shareable)
+   - Grabaciones programadas de control remoto
+   - Biblioteca de videos (fecha, cliente, PC, técnico, player)
+
+2) API /api/agenda/* + worker asyncio (alertas + jobs de grabación)
+
+3) Compartir reunión: copiar URL, mailto, WhatsApp (wa.me), aviso al agente Centinela
+
+================================================================================
+PASOS EN SERVIDOR SUPPORT
+================================================================================
+1. Crear carpeta de grabaciones:
+     mkdir C:\ApolloSupport\backend\recordings
+
+2. Copiar desde el puente:
+     backend\main.py
+     backend\models.py
+     backend\schemas.py
+     backend\agenda.py
+     backend\session_recorder.py
+     backend\.env.example   (opcional, referencia)
+     frontend\dist\         (carpeta completa)
+
+3. (Opcional) En C:\ApolloSupport\backend\.env agregar:
+     JITSI_BASE_URL=https://meet.jit.si
+     RECORDINGS_DIR=C:\ApolloSupport\backend\recordings
+     RECORDINGS_RETENTION_DAYS=30
+     SMTP_HOST=...
+     SMTP_PORT=587
+     SMTP_USER=...
+     SMTP_PASSWORD=...
+     SMTP_FROM=...
+
+4. Instalar ffmpeg en el PATH del servidor (recomendado para MP4).
+   Sin ffmpeg se guarda el último frame como evidencia.
+
+5. Reiniciar ApolloBackend:
+     nssm restart ApolloBackend
+
+6. Portal: Ctrl+F5 → menú "Agenda"
+
+================================================================================
+VERIFICAR
+================================================================================
+  - GET http://127.0.0.1:8001/api/agenda/meetings  (con Bearer token)
+  - Crear reunión de prueba → botones Copiar / Mail / WhatsApp / Avisar agente
+  - Programar grabación corta (2–5 min) con un device online → aparece en Biblioteca
+
+================================================================================
+NOTAS
+================================================================================
+- Las tablas scheduled_recordings, scheduled_meetings, notification_outbox
+  se crean solas con create_all al arrancar el backend.
+- WhatsApp usa wa.me (abre WhatsApp Web/App); no requiere API Business.
+- Mail requiere SMTP configurado; si no hay SMTP, el botón mailto sigue funcionando.

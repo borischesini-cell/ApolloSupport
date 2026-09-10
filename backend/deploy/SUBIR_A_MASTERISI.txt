@@ -1,0 +1,31 @@
+================================================================================
+  SUBIR A MASTERISI.COM.AR — Activar dispositivos móviles / TCK
+================================================================================
+
+El listado de dispositivos funciona con android_proxy.php (viejo).
+Para ACTIVAR/DESACTIVAR hace falta UN archivo nuevo (no reemplaza el viejo):
+
+  Archivo local (puente Y:):
+    Y:\ApolloSupport\backend\deploy\android_proxy_toggle.php
+
+  Destino en el hosting masterisi (carpeta WebService):
+    public_html/WebService/android_proxy_toggle.php
+    public_html/WebService/android_proxy.php   (opcional, proxy completo)
+
+  URLs que usa el backend (3.2.6h+):
+    https://www.masterisi.com.ar/WebService/android_proxy.php
+    https://www.masterisi.com.ar/WebService/android_proxy_toggle.php
+
+Pasos:
+  1. Entrar al FTP / cPanel de masterisi.com.ar
+  2. Subir android_proxy_toggle.php
+  3. Probar en el navegador (solo admins):
+     https://www.masterisi.com.ar/WebService/android_proxy_toggle.php?key=Apollo_Masterisi_Proxy_2025_SecureKey&id=1&status=0
+     → Debe responder JSON (success o not_found), NO "404" ni HTML de error
+
+  4. En el servidor Support: copiar backend\erp_licensing.py y reiniciar ApolloBackend
+
+Opcional — reemplazar proxy completo (summary + client + toggle en un solo archivo):
+    Y:\ApolloSupport\backend\deploy\android_proxy.php  →  android_proxy.php
+
+================================================================================

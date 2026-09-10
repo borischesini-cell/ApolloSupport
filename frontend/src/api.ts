@@ -112,13 +112,17 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
 
     ws.onopen = () => {
       if (!mountedRef.current) { ws.close(); return; }
-      backoffRef.current = 1000;   // Resetear backoff en conexión exitosa
+      backoffRef.current = 500;
       failCountRef.current = 0;
 
-      // Ping periódico cada 25s para mantener viva la conexión
+      try {
+        ws.send(JSON.stringify({ type: 'refresh_frame' }));
+        ws.send(JSON.stringify({ type: 'get_sessions' }));
+      } catch { /* */ }
+
       pingTimerRef.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send('ping');
-      }, 10000);
+      }, 20000);
     };
 
     ws.onmessage = async (event) => {
@@ -126,7 +130,6 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
       
       // Manejar chunks binarios de HQ (H.264)
       if (event.data instanceof ArrayBuffer) {
-        console.log('[WS] Recibido ArrayBuffer binario. Tamaño:', event.data.byteLength, 'onHqChunk:', !!onHqChunk);
         if (onHqChunk) {
             onHqChunk(event.data);
             
@@ -192,9 +195,9 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
       } catch { /* */ }
       if (!mountedRef.current || !enabled) return;
 
-      const cap = Math.min(backoffRef.current, 30000);
-      const delay = cap + Math.floor(Math.random() * 600);
-      backoffRef.current = Math.min(backoffRef.current * 2, 30000);
+      const cap = Math.min(backoffRef.current, 3000);
+      const delay = cap + Math.floor(Math.random() * 300);
+      backoffRef.current = Math.min(backoffRef.current * 1.5, 3000);
 
       reconnectTimerRef.current = setTimeout(() => {
         if (mountedRef.current && enabled) connect();
@@ -225,7 +228,22 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
 }
 
 
-const getAuthHeaders = () => ({
+const parseApiErrorDetail = (detail: unknown): string => {
+    if (typeof detail === 'string') return detail;
+    if (Array.isArray(detail)) {
+        return detail.map((item: any) => item?.msg || JSON.stringify(item)).join('; ');
+    }
+    return 'Error en la operación';
+};
+
+const parseJsonOrThrow = async (response: Response) => {
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(parseApiErrorDetail((data as any).detail));
+    return data;
+};
+
+export const getAuthHeaders = () => ({
     'Authorization': `Bearer ${localStorage.getItem('token')}`,
     'Content-Type': 'application/json'
 });
@@ -282,8 +300,7 @@ export const createClient = async (data: any) => {
         headers: getAuthHeaders(),
         body: JSON.stringify(data)
     });
-    if (response.status === 401) throw new Error('Sesión Expirada');
-    return await response.json();
+    return await parseJsonOrThrow(response);
 };
 
 export const updateClient = async (clientId: number, data: any) => {
@@ -292,8 +309,7 @@ export const updateClient = async (clientId: number, data: any) => {
         headers: getAuthHeaders(),
         body: JSON.stringify(data)
     });
-    if (response.status === 401) throw new Error('Sesión Expirada');
-    return await response.json();
+    return await parseJsonOrThrow(response);
 };
 
 export const toggleClientStatus = async (clientId: number) => {
@@ -311,7 +327,23 @@ export const syncClientsFromDbf = async () => {
         headers: getAuthHeaders()
     });
     if (response.status === 401) throw new Error('Sesión Expirada');
-    if (!response.ok) throw new Error('Error al sincronizar clientes con la base de datos DBF');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al sincronizar clientes con la base de datos DBF');
+    }
+    return await response.json();
+};
+
+export const syncSaldosFromErp = async () => {
+    const response = await fetch(`${API_URL}/clients/sync-saldos-erp`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al sincronizar saldos ERP');
+    }
     return await response.json();
 };
 
@@ -322,6 +354,131 @@ export const getClientBalance = async (clientIdOrCode: string | number) => {
     const response = await fetch(`${API_URL}/erp/clientes/${clientIdOrCode}/saldo`, { headers: getAuthHeaders() });
     if (response.status === 401) throw new Error('Sesión Expirada');
     if (!response.ok) throw new Error('Error al consultar saldo en el ERP');
+    return await response.json();
+};
+
+export const getEstadosCuentaCorriente = async (soloActivos = false) => {
+    const response = await fetch(
+        `${API_URL}/estados-cuenta-corriente?solo_activos=${soloActivos ? 'true' : 'false'}`,
+        { headers: getAuthHeaders() }
+    );
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) throw new Error('Error al listar estados de cuenta corriente');
+    return await response.json();
+};
+
+export const createEstadoCuentaCorriente = async (payload: { codigo: string; descripcion: string; activo?: boolean }) => {
+    const response = await fetch(`${API_URL}/estados-cuenta-corriente`, {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al crear estado');
+    }
+    return await response.json();
+};
+
+export const updateEstadoCuentaCorriente = async (id: number, payload: { descripcion?: string; activo?: boolean }) => {
+    const response = await fetch(`${API_URL}/estados-cuenta-corriente/${id}`, {
+        method: 'PUT',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al actualizar estado');
+    }
+    return await response.json();
+};
+
+export const deleteEstadoCuentaCorriente = async (id: number) => {
+    const response = await fetch(`${API_URL}/estados-cuenta-corriente/${id}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al eliminar estado');
+    }
+    return await response.json();
+};
+
+export const syncEstadosCuentaCorrienteFromErp = async () => {
+    const response = await fetch(`${API_URL}/estados-cuenta-corriente/sync-erp`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al sincronizar estados desde el ERP');
+    }
+    return await response.json();
+};
+
+export const getClientLicFacturadas = async (clientIdOrCode: string | number) => {
+    const response = await fetch(`${API_URL}/erp/clientes/${clientIdOrCode}/lic-facturadas`, { headers: getAuthHeaders() });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al consultar licencias facturadas');
+    }
+    return await response.json();
+};
+
+export const getActivationRequests = async (pendingOnly = true) => {
+    const response = await fetch(
+        `${API_URL}/erp-licenses/activation-requests?pending_only=${pendingOnly ? 'true' : 'false'}`,
+        { headers: getAuthHeaders() }
+    );
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) throw new Error('Error al consultar activaciones pendientes');
+    return await response.json();
+};
+
+export const resolveActivationRequest = async (
+    keyId: number,
+    payload: { state: string; message?: string; new_date?: string }
+) => {
+    const response = await fetch(`${API_URL}/erp-licenses/activation-requests/${keyId}/resolve`, {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al resolver la solicitud');
+    }
+    return await response.json();
+};
+
+export const getPendingExtensions = async (pendingOnly = true) => {
+    const response = await fetch(
+        `${API_URL}/erp-licenses/extensions?pending_only=${pendingOnly ? 'true' : 'false'}`,
+        { headers: getAuthHeaders() }
+    );
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) throw new Error('Error al consultar extensiones pendientes');
+    return await response.json();
+};
+
+export const approveExtension = async (keyId: number, newDate?: string) => {
+    const response = await fetch(`${API_URL}/erp-licenses/extensions/${keyId}/approve`, {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_date: newDate || null }),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al generar la extensión');
+    }
     return await response.json();
 };
 
@@ -356,6 +513,25 @@ export const getActiveCentinelas = async () => {
     const response = await fetch(`${API_URL}/centinelas/activos`, { headers: getAuthHeaders() });
     if (response.status === 401) throw new Error('Sesión Expirada');
     return await response.json();
+};
+
+export type WindowsSessionInfo = {
+  id: number;
+  name: string;
+  username: string;
+  state: string;
+  current: boolean;
+};
+
+export const fetchWindowsSessions = async (deviceId: number): Promise<WindowsSessionInfo[]> => {
+  const response = await fetch(
+    `${API_URL}/centinelas/devices/${deviceId}/windows-sessions?refresh=1&t=${Date.now()}`,
+    { headers: getAuthHeaders() }
+  );
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) return [];
+  const data = await response.json();
+  return (data.sessions as WindowsSessionInfo[]) ?? [];
 };
 
 export const getCentinelaFrame = async (clientId: number) => {
@@ -423,13 +599,21 @@ export const getPendingCentinelas = async () => {
     return [];
 };
 
+export const toggleAndroidDevice = async (deviceId: number, habilitado: boolean) => {
+    const response = await fetch(`${API_URL}/android-devices/toggle`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ id: deviceId, habilitado: habilitado ? 1 : 0 }),
+    });
+    return await parseJsonOrThrow(response);
+};
+
 export const assignCentinelaLicense = async (deviceId: number, clientId: number) => {
     const response = await fetch(`${API_URL}/centinelas/devices/${deviceId}/assign/${clientId}`, {
         method: 'POST',
         headers: getAuthHeaders()
     });
-    if (response.status === 401) throw new Error('Sesión Expirada');
-    return response.ok;
+    return await parseJsonOrThrow(response);
 };
 
 export const getCentinelaClipboard = async (deviceId: number) => {
@@ -666,9 +850,9 @@ export function useHqViewerWebSocket({ deviceId, enabled, onChunk, onStateChange
       if (pingTimerRef.current) { clearInterval(pingTimerRef.current); pingTimerRef.current = null; }
       if (onStateChangeRef.current) onStateChangeRef.current('closed');
       if (!mountedRef.current || !enabled) return;
-      const cap = Math.min(backoffRef.current, 30000);
-      const delay = cap + Math.floor(Math.random() * 600);
-      backoffRef.current = Math.min(backoffRef.current * 2, 30000);
+      const cap = Math.min(backoffRef.current, 3000);
+      const delay = cap + Math.floor(Math.random() * 300);
+      backoffRef.current = Math.min(backoffRef.current * 1.5, 3000);
       console.log(`[HQ-WS] Intentando reconectar en ${delay}ms...`);
       reconnectTimerRef.current = setTimeout(() => {
         if (mountedRef.current && enabled) connect();
@@ -732,4 +916,208 @@ export const forceCentinelaUpdate = async (deviceId: string | number) => {
     });
     if (!response.ok) throw new Error('Error al forzar actualizacion');
     return response.json();
+};
+
+/** Libera sesión remota colgada (quita "Ocupado por..." y cierra SupportSessions abiertas). */
+export const releaseCentinelaSession = async (deviceId: number) => {
+    const response = await fetch(`${API_URL}/centinelas/devices/${deviceId}/release-session`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al liberar sesión');
+    }
+    return response.json();
+};
+
+/** Cancela switch pendiente y fuerza refresh_frame / wake_screen en el agente. */
+export const forceCentinelaRefresh = async (deviceId: number) => {
+    const response = await fetch(`${API_URL}/centinelas/devices/${deviceId}/force-refresh`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al forzar refresh del agente');
+    }
+    return response.json();
+};
+
+// ==========================================
+// AGENDA: REUNIONES + GRABACIONES
+// ==========================================
+export type ScheduledMeeting = {
+  id: number;
+  client_id: number;
+  host_user_id: number;
+  title: string;
+  agenda?: string | null;
+  starts_at: string;
+  duration_minutes: number;
+  join_url: string;
+  status: string;
+  notify_minutes_before: number;
+  client_email?: string | null;
+  client_phone?: string | null;
+  alert_sent_at?: string | null;
+  client_name?: string | null;
+  host_name?: string | null;
+};
+
+export type ScheduledRecording = {
+  id: number;
+  client_id: number;
+  device_id: number;
+  technician_id: number;
+  scheduled_at: string;
+  duration_minutes: number;
+  status: string;
+  file_path?: string | null;
+  file_size?: number | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  error_message?: string | null;
+  notes?: string | null;
+  client_name?: string | null;
+  device_name?: string | null;
+  assist_id?: string | null;
+  technician_name?: string | null;
+  has_video?: boolean;
+  duration_seconds?: number | null;
+};
+
+export type MeetingShare = {
+  join_url: string;
+  message: string;
+  mailto?: string | null;
+  wa_url?: string | null;
+  email?: string | null;
+  phone?: string | null;
+};
+
+export const listAgendaMeetings = async (status?: string): Promise<ScheduledMeeting[]> => {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  const response = await fetch(`${API_URL}/agenda/meetings${q}`, { headers: getAuthHeaders() });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) throw new Error('Error al listar reuniones');
+  return response.json();
+};
+
+export const createAgendaMeeting = async (payload: {
+  client_id: number;
+  title: string;
+  agenda?: string;
+  starts_at: string;
+  duration_minutes?: number;
+  notify_minutes_before?: number;
+  client_email?: string;
+  client_phone?: string;
+}): Promise<ScheduledMeeting> => {
+  const response = await fetch(`${API_URL}/agenda/meetings`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Error al crear reunión');
+  }
+  return response.json();
+};
+
+export const cancelAgendaMeeting = async (id: number) => {
+  const response = await fetch(`${API_URL}/agenda/meetings/${id}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) throw new Error('Error al cancelar reunión');
+  return response.json();
+};
+
+export const shareAgendaMeeting = async (id: number): Promise<MeetingShare> => {
+  const response = await fetch(`${API_URL}/agenda/meetings/${id}/share`, { headers: getAuthHeaders() });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) throw new Error('Error al obtener datos de compartir');
+  return response.json();
+};
+
+export const notifyAgendaMeeting = async (id: number) => {
+  const response = await fetch(`${API_URL}/agenda/meetings/${id}/notify`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+  });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) throw new Error('Error al notificar');
+  return response.json();
+};
+
+export const listAgendaRecordings = async (status?: string): Promise<ScheduledRecording[]> => {
+  const q = status ? `?status=${encodeURIComponent(status)}` : '';
+  const response = await fetch(`${API_URL}/agenda/recordings${q}`, { headers: getAuthHeaders() });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) throw new Error('Error al listar grabaciones');
+  return response.json();
+};
+
+export const listAgendaRecordingLibrary = async (): Promise<ScheduledRecording[]> => {
+  const response = await fetch(`${API_URL}/agenda/recordings/library`, { headers: getAuthHeaders() });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) throw new Error('Error al cargar biblioteca de videos');
+  return response.json();
+};
+
+export const createAgendaRecording = async (payload: {
+  client_id: number;
+  device_id: number;
+  technician_id: number;
+  scheduled_at: string;
+  duration_minutes?: number;
+  notes?: string;
+}): Promise<ScheduledRecording> => {
+  const response = await fetch(`${API_URL}/agenda/recordings`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Error al programar grabación');
+  }
+  return response.json();
+};
+
+export const cancelAgendaRecording = async (id: number) => {
+  const response = await fetch(`${API_URL}/agenda/recordings/${id}/cancel`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+  });
+  if (response.status === 401) throw new Error('Sesión Expirada');
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Error al cancelar grabación');
+  }
+  return response.json();
+};
+
+export const agendaRecordingDownloadUrl = (id: number) =>
+  `${API_URL}/agenda/recordings/${id}/download`;
+
+// ==========================================
+// APOLLOIA BILLING
+// ==========================================
+export const getIaBillingMonth = async (desde: string, hasta: string, serial?: string) => {
+    const params = new URLSearchParams({ desde, hasta });
+    if (serial) params.set('serial', serial);
+    const response = await fetch(`${API_URL}/ia/billing-month?${params.toString()}`, {
+        headers: getAuthHeaders(),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) throw new Error('Error al obtener consumo ApolloIA');
+    return await response.json();
 };

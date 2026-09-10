@@ -229,24 +229,24 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
         <div className="min-h-screen flex items-center justify-center bg-[#0a0f1a] bg-[url('https://images.unsplash.com/photo-1550751827-4bd374c3f58b?q=80&w=2070&auto=format&fit=crop')] bg-cover bg-center">
             <div className="absolute inset-0 bg-[#0a0f1a]/85 backdrop-blur-md"></div>
 
-            <div className="relative z-10 w-full max-w-md p-10 rounded-[2rem] bg-[#1e293b]/60 backdrop-blur-xl border border-white/10 shadow-2xl animate-in zoom-in-95 duration-500">
-                <div className="text-center mb-8">
-                    <div className="w-16 h-16 mx-auto bg-gradient-to-br from-brand-400 to-orange-600 rounded-2xl flex items-center justify-center shadow-lg shadow-brand-500/40 mb-5">
-                        <Lock className="text-white" size={32} />
+            <div className="relative z-10 w-full max-w-[340px] px-6 pt-7 pb-6 rounded-3xl bg-[#1e293b]/60 backdrop-blur-xl border border-white/10 shadow-2xl animate-in zoom-in-95 duration-500">
+                <div className="text-center mb-5">
+                    <div className="w-14 h-14 mx-auto bg-gradient-to-br from-brand-400 to-orange-600 rounded-2xl flex items-center justify-center shadow-lg shadow-brand-500/40 mb-4">
+                        <Lock className="text-white" size={28} />
                     </div>
-                    <h2 className="text-3xl font-extrabold tracking-tight">
+                    <h2 className="text-2xl font-extrabold tracking-tight">
                         <span className="text-white">Apollo</span>
                         <span className="text-brand-500">Support</span>
                     </h2>
-                    <p className="text-slate-400 font-medium mt-2 text-sm">Autenticación Segura (Master IS)</p>
+                    <p className="text-slate-400 font-medium mt-1.5 text-sm">Autenticación Segura (Master IS)</p>
                 </div>
 
-                <form onSubmit={handleSubmit} className="space-y-5">
+                <form onSubmit={handleSubmit} className="space-y-5 pt-3">
                     {error && <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/50 text-red-500 text-sm font-bold text-center animate-in slide-in-from-top-2">{error}</div>}
 
                     {/* Correo Electrónico Oficial con Autocompletado / Combobox premium */}
-                    <div className="relative">
-                        <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Correo Electrónico Oficial</label>
+                    <div className="relative pt-1">
+                        <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2.5">Correo Electrónico Oficial</label>
                         <div className="relative">
                             <input
                                 type="email" required
@@ -262,7 +262,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
                                 aria-expanded={showSuggestions}
                                 aria-controls="suggestions-list"
                                 role="combobox"
-                                className="w-full bg-slate-900/50 border border-slate-700 text-white rounded-xl p-3 pr-16 focus:outline-none focus:ring-2 focus:ring-brand-500 transition-all placeholder:text-slate-500 text-sm"
+                                className="w-full bg-slate-900/50 border border-slate-700 text-white rounded-xl px-3 py-3.5 pr-16 leading-5 focus:outline-none focus:ring-2 focus:ring-brand-500 transition-all placeholder:text-slate-500 text-sm"
                                 placeholder="ej: soporte@masteris.com"
                                 autoComplete="off"
                             />
@@ -340,12 +340,12 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
                     </div>
 
                     <div>
-                        <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Contraseña de Agente</label>
+                        <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2.5">Contraseña de Agente</label>
                         <div className="relative">
                             <input
                                 type={showPassword ? "text" : "password"} required
                                 value={password} onChange={(e) => setPassword(e.target.value)}
-                                className="w-full bg-slate-900/50 border border-slate-700 text-white rounded-xl p-3 pr-11 focus:outline-none focus:ring-2 focus:ring-brand-500 transition-all placeholder:text-slate-500 text-sm"
+                                className="w-full bg-slate-900/50 border border-slate-700 text-white rounded-xl px-3 py-3.5 pr-11 leading-5 focus:outline-none focus:ring-2 focus:ring-brand-500 transition-all placeholder:text-slate-500 text-sm"
                                 placeholder="••••••••"
                             />
                             <button
@@ -384,7 +384,7 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
 
                     <button
                         type="submit" disabled={loading}
-                        className="w-full bg-gradient-to-r from-brand-500 to-orange-600 hover:from-brand-600 hover:to-orange-700 text-white font-extrabold pb-3.5 pt-4 rounded-xl shadow-[0_0_20px_rgba(245,158,11,0.4)] transition-all transform hover:-translate-y-1 mt-4 disabled:opacity-50 disabled:hover:translate-y-0 tracking-wide text-sm"
+                        className="w-full bg-gradient-to-r from-brand-500 to-orange-600 hover:from-brand-600 hover:to-orange-700 text-white font-extrabold py-3.5 rounded-xl shadow-[0_0_20px_rgba(245,158,11,0.4)] transition-all transform hover:-translate-y-1 mt-2 disabled:opacity-50 disabled:hover:translate-y-0 tracking-wide text-sm"
                     >
                         {loading ? 'Verificando seguridad...' : 'INGRESAR'}
                     </button>

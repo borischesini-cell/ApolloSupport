@@ -1,0 +1,21 @@
+ApolloSupport — Novedades 3.2.6c
+Fecha: 2026-08-20
+
+1) Estados de Cuenta Corriente (ClasiCli)
+   - ABM en Base Clientes → botón "Estados Cta"
+   - Sync desde ERP Ventas\ClasiCli
+   - Dropdown en ficha del cliente + columna/filtro en lista
+
+2) Demora de cartel 15 / 30 / 180 s (m_showmode)
+   - Visible en lista junto al tipo de cartel
+   - Visible por serial en Activaciones ERP
+   - Masivo "Poner cartel" pregunta demora; default KEEP (no pisa)
+   - Monitoreo: atajos 15s / 30s / 180s
+
+3) Saldo ERP = Clientes:CSaldo
+   - Antes mostraba CSALDO viejo de CLIGESCO.DBF
+   - Ahora "Sincronizar ERP" también refresca CSaldo/CULPA por CCLIFAC
+   - Endpoint: POST /api/clients/sync-saldos-erp
+   - Ej.: ARENERA DON ANTONIO (0332 / fac 0000131): 25459 → 185159.33
+
+Reiniciar backend + publicar frontend/dist.

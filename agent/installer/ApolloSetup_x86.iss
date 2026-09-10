@@ -4,7 +4,7 @@
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.1.23"
+#define MyAppVersion   "3.2.6"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"
@@ -87,19 +87,18 @@ Root: HKLM; Subkey: "Software\MasterIS\ApolloSupport"; ValueType: string; ValueN
 Root: HKLM; Subkey: "Software\MasterIS\ApolloSupport"; ValueType: string; ValueName: "Publisher";   ValueData: "{#MyAppPublisher}"
 
 [Run]
-; 1. Registrar el SERVICE EXE como Windows Service
+; 1. Registrar el SERVICE EXE como Windows Service (start= auto)
 Filename: "{sys}\sc.exe"; Parameters: "create ""{#ServiceName}"" binPath= ""\""{app}\{#ServiceExe}\"""" start= auto obj= LocalSystem DisplayName= ""{#ServiceDisplay}"""; Flags: runhidden waituntilterminated; StatusMsg: "{cm:Installing}"
+Filename: "{sys}\sc.exe"; Parameters: "config ""{#ServiceName}"" start= auto"; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "failure ""{#ServiceName}"" reset= 86400 actions= restart/5000/restart/10000/restart/30000"; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "description ""{#ServiceName}"" ""Agente Apollo Centinela - Master IS. Mantiene la conexion con el servidor de soporte 24/7."""; Flags: runhidden waituntilterminated
 
 ; 2. Iniciar el servicio
 Filename: "{sys}\sc.exe"; Parameters: "start ""{#ServiceName}"""; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StartingSvc}"
 
-; 3. Dar tiempo al servicio para inicializarse
-Filename: "{sys}\cmd.exe"; Parameters: "/c timeout /t 4 /nobreak"; Flags: runhidden waituntilterminated; StatusMsg: "Iniciando agente..."
-
-; 4. Lanzar el companion como el USUARIO ORIGINAL
-Filename: "{app}\{#CompanionExe}"; Flags: nowait shellexec runasoriginaluser; StatusMsg: "Iniciando tray icon..."
+; 3. Esperar al monitor + lanzar UI visible (mutex evita duplicado)
+Filename: "{sys}\cmd.exe"; Parameters: "/c timeout /t 8 /nobreak"; Flags: runhidden waituntilterminated; StatusMsg: "Iniciando agente..."
+Filename: "{app}\{#CompanionExe}"; Description: "Iniciar Apollo Centinela"; Flags: nowait postinstall skipifsilent runascurrentuser; StatusMsg: "Iniciando agente..."
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM ""{#CompanionExe}""";  Flags: runhidden waituntilterminated; RunOnceId: "KillCompanion"
@@ -115,35 +114,4 @@ spanish.WelcomeLabel2=Este asistente instalara [name/ver] en su equipo.%n%nSe re
 spanish.FinishedLabel=Apollo Centinela instalado correctamente.%n%nEl equipo ahora aparece como "en linea" en el panel de soporte de Master IS.
 
 [Code]
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  ResultCode: Integer;
-begin
-  Result := '';
-
-  Exec(ExpandConstant('{sys}\sc.exe'), 'stop "ApolloCentinela"', '',
-    SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "ApolloCentinela.exe"', '',
-    SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "Apollo_Centinela.exe"', '',
-    SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "ApolloCentinelaService.exe"', '',
-    SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  Exec(ExpandConstant('{sys}\sc.exe'), 'delete "ApolloCentinela"', '',
-    SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  Sleep(3000);
-end;
-
-function InitializeSetup(): Boolean;
-begin
-  Result := True;
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-end;
+#include "CentinelaInstallCode.iss"

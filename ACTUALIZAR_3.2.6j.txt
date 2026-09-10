@@ -1,0 +1,58 @@
+ApolloSupport — Actualización 3.2.6j
+Fecha: 2026-08-31
+Puente: Y:\ApolloSupport  (\\192.168.11.20\Puente\ApolloSupport)
+
+================================================================================
+QUÉ TRAE
+================================================================================
+1) Teclado/mouse remoto (foco UI + routing WS + inyección agente)
+2) Un companion por PC (mata duplicados Consola/AnyDesk)
+3) Dedup: no muestra el mismo PC en "Espera de Licencia" y asignado
+4) Centinela compilado v3.2.6 + instaladores
+
+Detalle: NOVEDADES_3.2.6j.txt
+
+================================================================================
+PASOS EN SERVIDOR SUPPORT (portal)
+================================================================================
+1. Copiar desde el puente:
+     backend\main.py
+     backend\models.py
+     backend\schemas.py
+     backend\updates\version.json
+     frontend\dist\   (carpeta completa)
+
+2. Reiniciar servicio ApolloBackend
+
+3. Hard refresh del portal (Ctrl+F5) o vaciar SW si pide update
+
+Verificar:
+  - Terminal Remota: ServidorWS2022 solo bajo Schanton (no arriba pendiente)
+  - Control remoto: clic en pantalla + teclado / botón Enter
+
+================================================================================
+PASOS EN PCs CLIENTES (agente Centinela)
+================================================================================
+Instaladores en:
+  Y:\ApolloSupport\agent\installer_output\
+
+  ApolloSetup_v3.2.6.exe       ← unificado (recomendado)
+  ApolloSetup_v3.2.6_x64.exe
+  ApolloSetup_v3.2.6_x86.exe
+
+Binarios sueltos (si actualizan a mano / OTA):
+  Y:\ApolloSupport\agent\dist\
+    ApolloCentinela_x64.exe / _x86.exe
+    ApolloCentinelaService_x64.exe / _x86.exe
+
+Tras instalar: un solo ApolloCentinela.exe en tasklist.
+Si hay TeamViewer, cerrarlo para probar teclado.
+
+================================================================================
+CHECKLIST RÁPIDO
+================================================================================
+[ ] main.py + dist portal en Support + reinicio ApolloBackend
+[ ] Portal muestra v3.2.6 build 2026-08-31
+[ ] Pending fantasma 456 453 desapareció
+[ ] Instalar ApolloSetup_v3.2.6 en PCs con teclado roto / Bonnin / Schanton
+[ ] Probar teclado + mouse en control remoto

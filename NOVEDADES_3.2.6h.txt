@@ -1,0 +1,18 @@
+ApolloSupport — Novedades 3.2.6h
+Fecha: 2026-08-26
+
+Proxy dispositivos móviles — ruta WebService
+--------------------------------------------
+Los PHP quedaron en:
+  masterisi.com.ar/public_html/WebService/
+
+Backend actualizado para usar:
+  /WebService/android_proxy.php
+  /WebService/android_proxy_toggle.php
+
+Despliegue Support:
+  - Copiar backend\erp_licensing.py
+  - Reiniciar ApolloBackend
+
+Verificación:
+  Activar TCK cliente 1217 (KeyId 995608) → toast verde.

@@ -1,20 +1,29 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Ticket, Users, Settings, Bell, Search, Moon, Sun, Monitor, MessageSquare, X, LogOut, ArrowUpRight, Sparkles, FileText, Clipboard, Plus, Folder, Trash2, Menu, DollarSign, CheckCircle2, AlertCircle, Activity, UserPlus, Shield, Phone, MapPin, Mail, Lock, Key, Camera, Edit2, Maximize2, Minimize, Terminal } from 'lucide-react';
+import { Ticket, Users, Settings, Bell, Search, Moon, Sun, Monitor, MessageSquare, X, LogOut, ArrowUpRight, Sparkles, FileText, Clipboard, Plus, Folder, Trash2, Menu, DollarSign, CheckCircle2, AlertCircle, Activity, UserPlus, Shield, Phone, MapPin, Mail, Lock, Key, Camera, Edit2, Maximize2, Minimize, Terminal, Smartphone, Power, Clock, CalendarDays, Unlock, RefreshCw, Video } from 'lucide-react';
 import {
   API_URL, getTickets, getClients, createTicket, createClient, updateClient,
-  toggleClientStatus, getActiveCentinelas, forceCentinelaUpdate, fetchAiAnalysis, getCentinelaFrame,
+  toggleClientStatus, getActiveCentinelas, forceCentinelaUpdate, releaseCentinelaSession, forceCentinelaRefresh,
+  fetchAiAnalysis, getCentinelaFrame, fetchWindowsSessions,
   getCentinelaAlerts, runCentinelaCommand, sendCentinelaControl, getAreas,
   addIntervention, uploadFile, deleteCentinelaDevice, getCentinelaClipboard,
   syncClientsFromDbf, updateCentinelaDeviceNotes, getPendingCentinelas, assignCentinelaLicense,
   getUsers, createUser, updateUser, toggleUserStatus, updateUserStatus, logoutUser,
-  getClientBalance, getClientExtracto, viewVoucherPdf,
+  getClientBalance, getClientExtracto, viewVoucherPdf, getClientLicFacturadas,
+  getActivationRequests, resolveActivationRequest, getPendingExtensions, approveExtension,
+  getEstadosCuentaCorriente, createEstadoCuentaCorriente, updateEstadoCuentaCorriente,
+  deleteEstadoCuentaCorriente, syncEstadosCuentaCorrienteFromErp,
   useViewerWebSocket, type ConnectionQuality, useHqViewerWebSocket,
   REMOTE_STREAM_WORKABLE_FPS, REMOTE_STREAM_COMFORTABLE_FPS, connectionQualityFromFps,
-  getCentinelaLogs, clearCentinelaLogs,
+  getCentinelaLogs, clearCentinelaLogs, toggleAndroidDevice,
 } from './api';
 import Login from './Login';
+import AgendaPanel from './AgendaPanel';
 // @ts-ignore
 import JMuxer from 'jmuxer';
+import { H264WebCodecsPlayer, isWebCodecsH264Supported } from './h264WebCodecs';
+import { APP_VERSION, APP_BUILD, APP_VERSION_TAG, APP_VERSION_LABEL } from './version';
+
+const WEBCODECS_H264 = isWebCodecsH264Supported();
 
 const triggerPushNotification = (title: string, body: string, url: string = '/') => {
   if ('Notification' in window && Notification.permission === 'granted') {
@@ -59,6 +68,18 @@ const stripRtf = (rtf: string): string => {
   // Strip any remaining curly braces
   text = text.replace(/{|}/g, "");
   return text.trim();
+};
+
+const formatFechaLocal = (raw?: string | null) => {
+  if (!raw) return null;
+  const iso = String(raw).slice(0, 10);
+  const parts = iso.split('-');
+  if (parts.length === 3 && parts[0].length === 4) {
+    return `${Number(parts[2])}/${Number(parts[1])}/${parts[0]}`;
+  }
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return String(raw);
+  return d.toLocaleDateString('es-AR');
 };
 
 const renderLastErpUpdate = (lastErpUpdateStr: string | null, telemetry: any) => {
@@ -209,6 +230,88 @@ function streamTierForManualPreset(p: Exclude<StreamPreset, 'auto'>): number {
   }
 }
 
+type ToastKind = 'success' | 'error' | 'info' | 'warning';
+
+const TOAST_META: Record<ToastKind, { bar: string; border: string; ring: string; title: string }> = {
+  success: { bar: 'bg-emerald-600', border: 'border-emerald-500', ring: 'ring-emerald-500/10', title: 'Listo' },
+  error: { bar: 'bg-red-600', border: 'border-red-500', ring: 'ring-red-500/10', title: 'Error' },
+  info: { bar: 'bg-indigo-600', border: 'border-indigo-500', ring: 'ring-indigo-500/10', title: 'Aviso' },
+  warning: { bar: 'bg-amber-600', border: 'border-amber-500', ring: 'ring-amber-500/10', title: 'Atención' },
+};
+
+function formatAssistId(id: string | number | null | undefined): string {
+  const s = String(id ?? '').trim();
+  if (!s) return '';
+  if (/^\d{6}$/.test(s)) return `${s.slice(0, 3)} ${s.slice(3)}`;
+  return s;
+}
+
+/** ID que dicta ApolloSoporte (assist_id). No confundir con id interno de DB ni RustDesk. */
+function deviceAssistLabel(dev: any): string {
+  return formatAssistId(dev?.assist_id || '');
+}
+
+function parseUserAgentShort(ua: string): string {
+  if (!ua?.trim()) return '';
+  let browser = 'Navegador';
+  if (/Edg\//i.test(ua)) browser = 'Edge';
+  else if (/Chrome\//i.test(ua)) browser = 'Chrome';
+  else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+  else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) browser = 'Safari';
+  let os = '';
+  if (/Windows NT 10/i.test(ua)) os = 'Windows 10/11';
+  else if (/Windows NT 6\.3/i.test(ua)) os = 'Windows 8.1';
+  else if (/Windows/i.test(ua)) os = 'Windows';
+  else if (/Android/i.test(ua)) os = 'Android';
+  else if (/iPhone|iPad/i.test(ua)) os = 'iOS';
+  else if (/Mac OS X/i.test(ua)) os = 'macOS';
+  else if (/Linux/i.test(ua)) os = 'Linux';
+  const ver = ua.match(/Chrome\/([\d.]+)/i)?.[1] || ua.match(/Firefox\/([\d.]+)/i)?.[1];
+  const browserLabel = ver ? `${browser} ${ver.split('.')[0]}` : browser;
+  return os ? `${browserLabel} · ${os}` : browserLabel;
+}
+
+function isLikelyUserAgent(text: string): boolean {
+  return /Mozilla\/5\.0/i.test(text || '');
+}
+
+function androidDevicePrimaryLabel(dev: any): string {
+  const user = (dev.usuario_asignado || '').trim();
+  if (user) return user;
+  const modelo = (dev.modelo || '').trim();
+  if (dev.app === 'TCK' && isLikelyUserAgent(modelo)) return parseUserAgentShort(modelo);
+  if (modelo && modelo.length <= 48 && !isLikelyUserAgent(modelo)) return modelo;
+  const imei = (dev.imei_serial || '').trim();
+  if (imei) return `HW ${imei}`;
+  const aid = (dev.android_id || '').trim();
+  if (aid) return `ID ${aid.length > 20 ? `${aid.slice(0, 20)}…` : aid}`;
+  return dev.app_nombre || dev.app || 'Dispositivo';
+}
+
+function androidDeviceIdentityLines(dev: any): { label: string; value: string; mono?: boolean }[] {
+  const lines: { label: string; value: string; mono?: boolean }[] = [];
+  if (dev.id != null) lines.push({ label: 'Registro', value: `#${dev.id}`, mono: true });
+  const serial = (dev.serial_gescom || '').trim();
+  if (serial) lines.push({ label: 'Serial GesCom', value: serial, mono: true });
+  const aid = (dev.android_id || '').trim();
+  if (aid) lines.push({ label: 'Android / Nodo ID', value: aid, mono: true });
+  const imei = (dev.imei_serial || '').trim();
+  if (imei) lines.push({ label: 'IMEI / Serial HW', value: imei, mono: true });
+  const tel = (dev.telefono || '').trim();
+  if (tel) lines.push({ label: 'Teléfono', value: tel });
+  const google = (dev.cuenta_google || '').trim();
+  if (google) lines.push({ label: 'Cuenta Google', value: google });
+  const user = (dev.usuario_asignado || '').trim();
+  if (user) lines.push({ label: 'Usuario / Vendedor', value: user });
+  const modelo = (dev.modelo || '').trim();
+  if (modelo && (dev.app === 'TCK' || isLikelyUserAgent(modelo))) {
+    lines.push({ label: 'User-Agent', value: modelo, mono: true });
+  } else if (modelo) {
+    lines.push({ label: 'Modelo / SO', value: modelo });
+  }
+  return lines;
+}
+
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('token'));
   const [userProfile, setUserProfile] = useState<any>(null);
@@ -330,6 +433,7 @@ export default function App() {
   const [showBannerConfigModal, setShowBannerConfigModal] = useState(false);
   const [bannerForm, setBannerForm] = useState({
     serial: '',
+    client_codes: [] as string[],
     m_down: false,
     m_newdate: '',
     m_tipmsg: 1,
@@ -337,6 +441,19 @@ export default function App() {
     m_text: ''
   });
   const [showNewSerialForm, setShowNewSerialForm] = useState(false);
+  const [licensePanelSummary, setLicensePanelSummary] = useState<Record<string, any>>({});
+  const [selectedClientCodes, setSelectedClientCodes] = useState<string[]>([]);
+  const [cartelFilter, setCartelFilter] = useState<string>('all'); // all | con | sin | tipmsg number
+  const [estadoCtaFilter, setEstadoCtaFilter] = useState<string>('all'); // all | sin | codigo
+  const [showAvisoPreview, setShowAvisoPreview] = useState(false);
+  const [showAvisosCatalog, setShowAvisosCatalog] = useState(false);
+  const [avisoEdit, setAvisoEdit] = useState({ m_num: 0, m_des: '', m_text: '' });
+  const [estadosCta, setEstadosCta] = useState<any[]>([]);
+  const [showEstadosCtaModal, setShowEstadosCtaModal] = useState(false);
+  const [estadoCtaEdit, setEstadoCtaEdit] = useState<{ id?: number; codigo: string; descripcion: string; activo: boolean }>({
+    codigo: '', descripcion: '', activo: true,
+  });
+  const [estadosCtaLoading, setEstadosCtaLoading] = useState(false);
   const [newSerialForm, setNewSerialForm] = useState({
     l_number: '',
     l_date: '',
@@ -347,6 +464,243 @@ export default function App() {
     l_tele: '',
     l_locali: ''
   });
+  const [erpModules, setErpModules] = useState<any[]>([]);
+  const [serialAllModules, setSerialAllModules] = useState(false);
+  const [serialModuleNums, setSerialModuleNums] = useState<string[]>([]);
+  const [showReportsModal, setShowReportsModal] = useState(false);
+  const [reportsSerial, setReportsSerial] = useState('');
+  const [reportsFrom, setReportsFrom] = useState('');
+  const [reportsTo, setReportsTo] = useState('');
+  const [erpReports, setErpReports] = useState<any[]>([]);
+  const [erpReportsLoading, setErpReportsLoading] = useState(false);
+  const [selectedReportId, setSelectedReportId] = useState<number | null>(null);
+  const [reportNodes, setReportNodes] = useState<any>(null);
+  const [reportSystem, setReportSystem] = useState<any[]>([]);
+  const [reportDetailTab, setReportDetailTab] = useState<'nodes' | 'system' | null>(null);
+
+  // === ESTADOS PARA DISPOSITIVOS MÓVILES ANDROID (misi_licand) ===
+  const [androidSummary, setAndroidSummary] = useState<any[]>([]);
+  const [androidSummaryLoading, setAndroidSummaryLoading] = useState(false);
+  const [androidSelectedClient, setAndroidSelectedClient] = useState<any | null>(null);
+  const [androidClientDevices, setAndroidClientDevices] = useState<any[]>([]);
+  const [androidClientDevicesLoading, setAndroidClientDevicesLoading] = useState(false);
+  const [androidSearchTerm, setAndroidSearchTerm] = useState('');
+  const [androidFilterApp, setAndroidFilterApp] = useState('all');
+  const [androidFilterHabilitado, setAndroidFilterHabilitado] = useState('all');
+  const [androidDeviceDetailModal, setAndroidDeviceDetailModal] = useState<any | null>(null);
+  const [androidToggleConfirm, setAndroidToggleConfirm] = useState<{ dev: any; habilitado: boolean } | null>(null);
+  const [androidToggleBusy, setAndroidToggleBusy] = useState(false);
+
+  const [toast, setToast] = useState<{ message: string; kind: ToastKind } | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const showToast = useCallback((message: string, kind: ToastKind = 'info', autoHideMs = 4500) => {
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    setToast({ message, kind });
+    if (autoHideMs > 0) {
+      toastTimerRef.current = window.setTimeout(() => setToast(null), autoHideMs);
+    }
+  }, []);
+  const setShowNotification = useCallback((message: string | null) => {
+    if (message === null) setToast(null);
+    else showToast(message, 'success');
+  }, [showToast]);
+
+  // Lic Facturadas (LisArtC)
+  const [licFactModal, setLicFactModal] = useState<{
+    isOpen: boolean;
+    client: any;
+    items: any[];
+    loading: boolean;
+  }>({ isOpen: false, client: null, items: [], loading: false });
+
+  // Activaciones pendientes / Extensiones OnLine
+  const [actiRequests, setActiRequests] = useState<any[]>([]);
+  const [actiRequestsLoading, setActiRequestsLoading] = useState(false);
+  const [actiShowAll, setActiShowAll] = useState(false);
+  const [extensiones, setExtensiones] = useState<any[]>([]);
+  const [extensionesLoading, setExtensionesLoading] = useState(false);
+  const [extShowAll, setExtShowAll] = useState(false);
+
+  const loadAndroidSummary = async () => {
+    setAndroidSummaryLoading(true);
+    try {
+      const token = localStorage.getItem('token');
+      const resp = await fetch(`${API_URL}/android-devices/summary`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        setAndroidSummary(data);
+      }
+    } catch (e) {
+      console.error('Error cargando resumen de dispositivos Android:', e);
+    } finally {
+      setAndroidSummaryLoading(false);
+    }
+  };
+
+  const loadAndroidClientDevices = async (clientCode: string) => {
+    setAndroidClientDevicesLoading(true);
+    try {
+      const token = localStorage.getItem('token');
+      const resp = await fetch(`${API_URL}/android-devices/client/${clientCode}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        setAndroidClientDevices(data);
+      }
+    } catch (e) {
+      console.error('Error cargando dispositivos del cliente:', e);
+    } finally {
+      setAndroidClientDevicesLoading(false);
+    }
+  };
+
+  const handleToggleAndroidDevice = (dev: any, habilitado: boolean) => {
+    setAndroidToggleConfirm({ dev, habilitado });
+  };
+
+  const executeAndroidDeviceToggle = async () => {
+    if (!androidToggleConfirm || androidToggleBusy) return;
+    const { dev, habilitado } = androidToggleConfirm;
+    setAndroidToggleBusy(true);
+    try {
+      await toggleAndroidDevice(dev.id, habilitado);
+      setAndroidDeviceDetailModal((prev: any) => prev && prev.id === dev.id ? { ...prev, habilitado } : prev);
+      setAndroidClientDevices(prev => prev.map(d => d.id === dev.id ? { ...d, habilitado } : d));
+      loadAndroidSummary();
+      setAndroidToggleConfirm(null);
+      showToast(
+        habilitado ? 'Dispositivo activado correctamente.' : 'Dispositivo desactivado.',
+        'success'
+      );
+    } catch (e: any) {
+      showToast(e.message || 'No se pudo cambiar el estado del dispositivo.', 'error', 8000);
+    } finally {
+      setAndroidToggleBusy(false);
+    }
+  };
+
+  const handleOpenLicFacturadas = async (client: any) => {
+    if (!client?.cclifac) {
+      showToast('Este cliente no posee código de facturación (CCLIFAC) del ERP.', 'warning');
+      return;
+    }
+    setLicFactModal({ isOpen: true, client, items: [], loading: true });
+    try {
+      const res = await getClientLicFacturadas(client.id);
+      setLicFactModal(prev => ({ ...prev, items: res.items || [], loading: false }));
+    } catch (e: any) {
+      setLicFactModal(prev => ({ ...prev, loading: false }));
+      alert(e.message || 'Error al consultar licencias facturadas');
+    }
+  };
+
+  const loadActiRequests = async (showAll = actiShowAll) => {
+    setActiRequestsLoading(true);
+    try {
+      const data = await getActivationRequests(!showAll);
+      setActiRequests(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      console.error(e);
+      alert(e.message || 'Error cargando activaciones pendientes');
+    } finally {
+      setActiRequestsLoading(false);
+    }
+  };
+
+  const handleResolveActiRequest = async (req: any, state: string) => {
+    let message: string | undefined;
+    let new_date: string | undefined;
+    if (state === '3') {
+      const msg = window.prompt('Mensaje a mostrar al cliente:', req.r_message || '');
+      if (msg === null) return;
+      message = msg;
+    }
+    if (state === '4') {
+      const d = window.prompt('Nueva fecha de expiración (YYYY-MM-DD):', new Date().toISOString().slice(0, 10));
+      if (!d) return;
+      new_date = d;
+    }
+    const labels: Record<string, string> = {
+      '0': 'dejar pendiente',
+      '1': 'activar',
+      '2': 'denegar',
+      '3': 'activar con mensaje',
+      '4': 'activar con nueva fecha',
+    };
+    if (!window.confirm(`¿Confirma ${labels[state] || state} para serial ${req.r_number}?`)) return;
+    try {
+      await resolveActivationRequest(req.KeyID, { state, message, new_date });
+      setShowNotification(`Solicitud ${req.KeyID}: ${labels[state] || state}`);
+      setTimeout(() => setShowNotification(null), 3000);
+      loadActiRequests();
+    } catch (e: any) {
+      alert(e.message || 'Error al resolver solicitud');
+    }
+  };
+
+  const loadExtensiones = async (showAll = extShowAll) => {
+    setExtensionesLoading(true);
+    try {
+      const data = await getPendingExtensions(!showAll);
+      setExtensiones(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      console.error(e);
+      alert(e.message || 'Error cargando extensiones');
+    } finally {
+      setExtensionesLoading(false);
+    }
+  };
+
+  const handleApproveExtension = async (ext: any) => {
+    const suggested = ext.suggested_newdate || '';
+    const d = window.prompt('Nueva fecha de vencimiento (YYYY-MM-DD):', suggested);
+    if (d === null) return;
+    if (!window.confirm(`¿Generar extensión para ${ext.e_number} hasta ${d || suggested}?`)) return;
+    try {
+      await approveExtension(ext.KeyID, d || undefined);
+      setShowNotification(`Extensión generada: ${ext.e_number}`);
+      setTimeout(() => setShowNotification(null), 3000);
+      loadExtensiones();
+    } catch (e: any) {
+      alert(e.message || 'Error al generar extensión');
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'android_devices') {
+      loadAndroidSummary();
+    }
+    if (activeTab === 'acti_pending') {
+      loadActiRequests();
+    }
+    if (activeTab === 'extensiones') {
+      loadExtensiones();
+    }
+    if (activeTab === 'clients') {
+      loadLicensePanelSummary();
+      loadErpTemplates();
+      loadErpModules();
+      loadEstadosCta(false);
+    }
+  }, [activeTab]);
+
+  const loadLicensePanelSummary = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/erp-licenses/summary`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setLicensePanelSummary(data || {});
+      }
+    } catch (e) {
+      console.error("Error loading license panel summary:", e);
+    }
+  };
 
   const loadErpTemplates = async () => {
     try {
@@ -360,6 +714,178 @@ export default function App() {
       }
     } catch (e) {
       console.error("Error loading ERP templates:", e);
+    }
+  };
+
+  const loadErpModules = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/erp-licenses/modules`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setErpModules(data);
+        return data;
+      }
+    } catch (e) {
+      console.error("Error loading ERP modules:", e);
+    }
+    return [] as any[];
+  };
+
+  const suggestNextGesactiCode = async (version: string) => {
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/clients/next-code?version=${encodeURIComponent(version || 'E')}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.codigo) setClientForm(prev => ({ ...prev, codigo: data.codigo, version_apollo: version }));
+      }
+    } catch (e) {
+      console.error("Error suggesting client code:", e);
+    }
+  };
+
+  const applySerialPreset = (preset: string) => {
+    if (preset === 'TODOS') {
+      setSerialAllModules(true);
+      return;
+    }
+    setSerialAllModules(false);
+    const key = ({
+      E: 'm_erp', C: 'm_commerce', S: 'm_single', L: 'm_little', R: 'm_clock', P: 'm_pharmakos'
+    } as Record<string, string>)[preset];
+    if (!key) return;
+    setSerialModuleNums(erpModules.filter((m: any) => m[key] && m.m_exe !== 'GESACTI').map((m: any) => m.m_num));
+  };
+
+  const handleGenerateGesactiSerial = async () => {
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/erp-licenses/generate-serial`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({
+          client_code: /^\d+$/.test((clientForm.codigo || '').trim())
+            ? (clientForm.codigo || '').trim().padStart(4, '0')
+            : (clientForm.codigo || '').trim().toUpperCase(),
+          expiry_date: newSerialForm.l_date,
+          module_nums: serialModuleNums,
+          all_modules: serialAllModules,
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'No se pudo generar el serial');
+      setNewSerialForm(prev => ({ ...prev, l_number: data.l_number }));
+      try { await navigator.clipboard.writeText(data.l_number); } catch (_) { /* ignore */ }
+      setShowNotification(`Serial GesActi: ${data.l_number} (copiado al portapapeles)`);
+      setTimeout(() => setShowNotification(null), 5000);
+    } catch (e: any) {
+      alert(e.message || 'Error al generar serial');
+    }
+  };
+
+  const previewAvisoText = () => {
+    const custom = (bannerForm.m_text || '').trim();
+    if (custom) return custom;
+    const tpl = erpTemplates.find((t: any) => Number(t.m_num ?? t.id) === Number(bannerForm.m_tipmsg));
+    return ((tpl?.m_text || tpl?.text || '') as string).replace(/CRLF/g, '\n') || '(sin texto de cartel)';
+  };
+
+  const saveAvisoTemplate = async () => {
+    if (!avisoEdit.m_num || !avisoEdit.m_des) {
+      alert("Indicá número y nombre del cartel.");
+      return;
+    }
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/erp-licenses/templates`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify(avisoEdit)
+      });
+      if (!response.ok) throw new Error('No se pudo guardar el cartel');
+      await loadErpTemplates();
+      setShowNotification("Cartel de aviso guardado en misi_messages.");
+      setTimeout(() => setShowNotification(null), 3000);
+      setAvisoEdit({ m_num: 0, m_des: '', m_text: '' });
+    } catch (e: any) {
+      alert(e.message || "Error al guardar cartel");
+    }
+  };
+
+  const openReportsForSerial = (serial: string) => {
+    const to = new Date();
+    const from = new Date();
+    from.setDate(from.getDate() - 90);
+    const fmt = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    setReportsSerial(serial);
+    setReportsFrom(fmt(from));
+    setReportsTo(fmt(to));
+    setErpReports([]);
+    setSelectedReportId(null);
+    setReportNodes(null);
+    setReportSystem([]);
+    setReportDetailTab(null);
+    setShowReportsModal(true);
+  };
+
+  const loadErpReports = async () => {
+    if (!reportsSerial) return;
+    setErpReportsLoading(true);
+    setSelectedReportId(null);
+    setReportNodes(null);
+    setReportSystem([]);
+    setReportDetailTab(null);
+    try {
+      const token = localStorage.getItem('token');
+      const q = new URLSearchParams();
+      if (reportsFrom) q.set('date_from', reportsFrom);
+      if (reportsTo) q.set('date_to', reportsTo);
+      const response = await fetch(`${API_URL}/erp-licenses/reports/${encodeURIComponent(reportsSerial)}?${q}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) setErpReports(await response.json());
+      else alert('No se pudieron cargar los reportes.');
+    } catch (e) {
+      alert('Error de comunicación al cargar reportes.');
+    } finally {
+      setErpReportsLoading(false);
+    }
+  };
+
+  const loadReportNodes = async (reportId: number) => {
+    setSelectedReportId(reportId);
+    setReportDetailTab('nodes');
+    setReportSystem([]);
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/erp-licenses/reports/${reportId}/nodes`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) setReportNodes(await response.json());
+      else alert('No hay nodos para este reporte.');
+    } catch (e) {
+      alert('Error al cargar nodos del reporte.');
+    }
+  };
+
+  const loadReportSystem = async (reportId: number) => {
+    setSelectedReportId(reportId);
+    setReportDetailTab('system');
+    setReportNodes(null);
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/erp-licenses/reports/${reportId}/system`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) setReportSystem(await response.json());
+      else alert('No hay datos System para este reporte.');
+    } catch (e) {
+      alert('Error al cargar System del reporte.');
     }
   };
 
@@ -436,7 +962,9 @@ export default function App() {
     e.preventDefault();
     try {
       const token = localStorage.getItem('token');
-      const response = await fetch(`${API_URL}/erp-licenses/management`, {
+      const isBulk = (bannerForm.client_codes || []).length > 0;
+      const url = isBulk ? `${API_URL}/erp-licenses/management/bulk` : `${API_URL}/erp-licenses/management`;
+      const response = await fetch(url, {
         method: "POST",
         headers: {
           'Content-Type': 'application/json',
@@ -445,15 +973,191 @@ export default function App() {
         body: JSON.stringify(bannerForm)
       });
       if (response.ok) {
-        setShowNotification("Configuración de cartel/bloqueo guardada con éxito.");
+        const res = await response.json().catch(() => ({}));
+        const extra = isBulk && res.aplicadas != null ? ` (${res.aplicadas} licencias)` : '';
+        setShowNotification(`Configuración de cartel/bloqueo guardada${extra}.`);
         setTimeout(() => setShowNotification(null), 3000);
         setShowBannerConfigModal(false);
-        loadErpLicenses(clientForm.codigo);
+        setBannerForm(prev => ({ ...prev, client_codes: [] }));
+        if (clientForm.codigo) loadErpLicenses(clientForm.codigo);
+        loadLicensePanelSummary();
       } else {
         alert("Error al guardar la configuración.");
       }
     } catch (e) {
       alert("Error de comunicación.");
+    }
+  };
+
+  const SHOWMODE_SECONDS: Record<string, number> = {
+    '02': 5, '03': 15, '04': 30, '05': 180, '06': 60, '07': 120, '08': 240, '09': 300,
+  };
+
+  const formatShowmodeLabel = (code?: string | null) => {
+    const c = String(code || '').trim().padStart(2, '0');
+    if (!c || c === '00') return '';
+    if (c === '01') return 'OK';
+    const sec = SHOWMODE_SECONDS[c];
+    return sec ? `${sec}s` : c;
+  };
+
+  const parseShowmodeInput = (raw: string): string | null => {
+    const t = String(raw || '').trim().toLowerCase();
+    if (!t || t === 'keep' || t === 'mantener' || t === 'm') return 'keep';
+    if (t === '15' || t === '03') return '03';
+    if (t === '30' || t === '04') return '04';
+    if (t === '180' || t === '05') return '05';
+    if (t === '01' || t === 'ok' || t === 'aceptar') return '01';
+    if (/^\d{2}$/.test(t) && SHOWMODE_SECONDS[t] !== undefined) return t;
+    return null;
+  };
+
+  const applyBulkCartelToMarked = async (m_tipmsg: number, m_text: string = '') => {
+    if (selectedClientCodes.length === 0) {
+      alert('Marcá al menos un cliente.');
+      return;
+    }
+    const tpl = erpTemplates.find((t: any) => Number(t.m_num ?? t.id) === Number(m_tipmsg));
+    const label = m_tipmsg <= 1
+      ? 'quitar el cartel (sin aviso)'
+      : `poner cartel ${m_tipmsg}${tpl ? ` — ${tpl.m_des || tpl.label}` : ''}`;
+
+    // Demora: por defecto mantener 15/30/180 actuales para no pisarlos en cambios masivos
+    let m_showmode: string = 'keep';
+    if (m_tipmsg > 1) {
+      const actuales = Array.from(new Set(
+        selectedClientCodes.flatMap(code => {
+          const s = licensePanelSummary[code] || {};
+          return Array.isArray(s.showmodes) && s.showmodes.length ? s.showmodes : (s.m_showmode ? [s.m_showmode] : []);
+        }).map((x: any) => formatShowmodeLabel(String(x))).filter(Boolean)
+      ));
+      const hint = actuales.length ? `\nDemoras actuales en marcados: ${actuales.join(', ')}` : '';
+      const ans = window.prompt(
+        `${label}\n\nDemora del cartel (Enter = MANTENER actual; no pisa 15/30/180):${hint}\n\nEscribí: keep | 15 | 30 | 180`,
+        'keep'
+      );
+      if (ans === null) return;
+      const parsed = parseShowmodeInput(ans);
+      if (!parsed) {
+        alert('Demora inválida. Usá keep, 15, 30 o 180.');
+        return;
+      }
+      m_showmode = parsed;
+    }
+
+    if (!window.confirm(`¿${label} en las licencias activas de ${selectedClientCodes.length} cliente(s) marcado(s)?\nDemora: ${m_showmode === 'keep' ? 'mantener actual' : formatShowmodeLabel(m_showmode)}`)) return;
+    try {
+      const token = localStorage.getItem('token');
+      const response = await fetch(`${API_URL}/erp-licenses/management/bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({
+          client_codes: selectedClientCodes,
+          m_down: false,
+          m_newdate: '',
+          m_tipmsg,
+          m_showmode,
+          m_text: m_text || (m_tipmsg > 1 ? ((tpl?.m_text || tpl?.text || '') as string).replace(/CRLF/g, '\n') : ''),
+        })
+      });
+      const res = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(res.detail || 'Error al aplicar carteles');
+      setShowNotification(`Cartel aplicado a ${res.aplicadas ?? selectedClientCodes.length} licencia(s).`);
+      setTimeout(() => setShowNotification(null), 3500);
+      loadLicensePanelSummary();
+    } catch (e: any) {
+      alert(e.message || 'Error de comunicación.');
+    }
+  };
+
+  const clientMatchesCartelFilter = (code4: string) => {
+    if (cartelFilter === 'all') return true;
+    const licSum = licensePanelSummary[code4] || {};
+    if (cartelFilter === 'con') return !!licSum.cartel;
+    if (cartelFilter === 'sin') return !licSum.cartel;
+    const tip = Number(cartelFilter);
+    if (!Number.isFinite(tip)) return true;
+    const tips: number[] = Array.isArray(licSum.tipmsgs) && licSum.tipmsgs.length
+      ? licSum.tipmsgs.map(Number)
+      : [Number(licSum.m_tipmsg || 1)];
+    return tips.includes(tip);
+  };
+
+  const normalizeEstadoCodigo = (cod?: string | null) => {
+    const c = String(cod || '').trim().toUpperCase();
+    if (!c) return '';
+    if (/^\d+$/.test(c) && c.length < 5) return c.padStart(5, '0');
+    return c;
+  };
+
+  const clientMatchesEstadoFilter = (c: any) => {
+    if (estadoCtaFilter === 'all') return true;
+    const cod = normalizeEstadoCodigo(c.clasificacion_codigo);
+    if (estadoCtaFilter === 'sin') return !cod;
+    return cod === estadoCtaFilter;
+  };
+
+  const loadEstadosCta = async (soloActivos = false) => {
+    setEstadosCtaLoading(true);
+    try {
+      const data = await getEstadosCuentaCorriente(soloActivos);
+      setEstadosCta(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      console.error(e);
+    } finally {
+      setEstadosCtaLoading(false);
+    }
+  };
+
+  const handleSyncEstadosCtaErp = async () => {
+    try {
+      const res = await syncEstadosCuentaCorrienteFromErp();
+      setShowNotification(`Estados ERP: +${res.inserted || 0} / upd ${res.updated || 0}`);
+      setTimeout(() => setShowNotification(null), 3500);
+      await loadEstadosCta(false);
+      const refreshed = await getClients();
+      setClients(refreshed);
+    } catch (e: any) {
+      alert(e.message || 'Error sincronizando estados');
+    }
+  };
+
+  const handleSaveEstadoCta = async () => {
+    try {
+      if (estadoCtaEdit.id) {
+        await updateEstadoCuentaCorriente(estadoCtaEdit.id, {
+          descripcion: estadoCtaEdit.descripcion,
+          activo: estadoCtaEdit.activo,
+        });
+      } else {
+        if (!estadoCtaEdit.codigo.trim()) {
+          alert('Indique el código del estado.');
+          return;
+        }
+        await createEstadoCuentaCorriente({
+          codigo: estadoCtaEdit.codigo,
+          descripcion: estadoCtaEdit.descripcion,
+          activo: estadoCtaEdit.activo,
+        });
+      }
+      setEstadoCtaEdit({ codigo: '', descripcion: '', activo: true });
+      await loadEstadosCta(false);
+      setShowNotification('Estado de cuenta corriente guardado.');
+      setTimeout(() => setShowNotification(null), 2500);
+    } catch (e: any) {
+      alert(e.message || 'Error al guardar');
+    }
+  };
+
+  const handleDeleteEstadoCta = async (row: any) => {
+    if (!window.confirm(`¿Eliminar / desactivar estado ${row.codigo}?`)) return;
+    try {
+      const res = await deleteEstadoCuentaCorriente(row.id);
+      setShowNotification(res.message || `Estado ${row.codigo}: ${res.status}`);
+      setTimeout(() => setShowNotification(null), 3000);
+      await loadEstadosCta(false);
+    } catch (e: any) {
+      alert(e.message || 'Error al eliminar');
     }
   };
 
@@ -560,7 +1264,7 @@ export default function App() {
     nombre_fantasia: '',
     identificador_fiscal: '',
     cparte: '',
-    version_apollo: '',
+    version_apollo: 'E',
     telefono: '',
     email: '',
     localidad: '',
@@ -574,7 +1278,9 @@ export default function App() {
     clasificacion_codigo: '',
     clasificacion_nombre: '',
     extracto: '',
-    cclifac: ''
+    cclifac: '',
+    fecha_ultimo_pago: '',
+    activo: true,
   });
 
   useEffect(() => {
@@ -592,7 +1298,6 @@ export default function App() {
 
   // Alertas Proactivas
   const [activeAlerts, setActiveAlerts] = useState<any>({});
-  const [showNotification, setShowNotification] = useState<string | null>(null);
   const [nativeConnectionState, setNativeConnectionState] = useState<'idle' | 'connecting' | 'success' | 'error'>('idle');
 
 
@@ -622,6 +1327,23 @@ export default function App() {
   const [isControlEnabled, setIsControlEnabled] = useState<boolean>(true);
   const [isCapsLockActive, setIsCapsLockActive] = useState<boolean>(false);
   const [focusedSessionId, setFocusedSessionId] = useState<number | null>(null);
+  type WinSession = { id: number; name: string; username: string; state: string; current: boolean };
+  const [winSessions, setWinSessions] = useState<WinSession[]>([]);
+  const [winSessionsByDevice, setWinSessionsByDevice] = useState<Record<number, WinSession[]>>({});
+  const [sessionPickerDeviceId, setSessionPickerDeviceId] = useState<number | null>(null);
+  const [sessionSwitchingDeviceId, setSessionSwitchingDeviceId] = useState<number | null>(null);
+  const [loginDeviceId, setLoginDeviceId] = useState<number | null>(null);
+  const [showSessionPicker, setShowSessionPicker] = useState(false);
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [loginCreds, setLoginCreds] = useState({ username: localStorage.getItem('last_remote_username') || '', password: '', domain: localStorage.getItem('last_remote_domain') || '.' });
+  const [loginError, setLoginError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [sessionSwitching, setSessionSwitching] = useState(false);
+  const sessionSwitchingRef = useRef(false);
+  sessionSwitchingRef.current = sessionSwitching;
+  const [sessionSwitchError, setSessionSwitchError] = useState('');
+  const pendingSwitchWindowsSessionRef = useRef<number | null>(null);
 
   // ─── MULTI-MONITOR ──────────────────────────────────────────────────────────
   // activeMonitor: monitor que el agente está capturando actualmente (1-based)
@@ -718,6 +1440,16 @@ export default function App() {
   const liveCanvasRef       = useRef<HTMLCanvasElement | null>(null);
   const latestLiveFrameRef = useRef<string>('');   // último base64 para re-renders de React
   const rafIdRef         = useRef<number | null>(null);
+  const hqStreamOnCanvasRef = useRef(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const jmuxerRef = useRef<any>(null);
+  const webCodecsPlayerRef = useRef<H264WebCodecsPlayer | null>(null);
+  const hqBufferRef = useRef<Uint8Array>(new Uint8Array(0));
+  const hqPendingChunksRef = useRef<ArrayBuffer[]>([]);
+  const hqPendingWarnedRef = useRef(false);
+  const logFrontendRef = useRef<(msg: string, level?: string) => void>(() => {});
+  const feedHqChunkImplRef = useRef<(chunk: ArrayBuffer) => void>(() => {});
+  const sendViewerCommandRef = useRef<(cmd: Record<string, unknown>) => void>(() => {});
 
   // Callback ref compartido
   const setLiveCanvasRef = (el: HTMLCanvasElement | null) => {
@@ -726,6 +1458,7 @@ export default function App() {
 
   const frameQueueRef = useRef<{base64: string, delta?: import('./api').DeltaMeta}[]>([]);
   const isProcessingQueueRef = useRef(false);
+  const remoteCanvasBaseReadyRef = useRef(false);
 
   const processFrameQueue = () => {
     if (isProcessingQueueRef.current || frameQueueRef.current.length === 0) return;
@@ -741,17 +1474,26 @@ export default function App() {
     img.src = `data:image/webp;base64,${frame.base64}`;
     img.decode().then(() => {
       requestAnimationFrame(() => {
-        if (liveCanvasRef.current) {
-          const ctx = liveCanvasRef.current.getContext('2d', { alpha: false });
+        const canvas = liveCanvasRef.current;
+        if (canvas) {
+          const ctx = canvas.getContext('2d', { alpha: false });
           if (ctx) {
-            if (!frame.delta && liveCanvasRef.current.width !== img.width) {
-              liveCanvasRef.current.width = img.width;
-              liveCanvasRef.current.height = img.height;
-            }
             if (frame.delta) {
-              ctx.drawImage(img, frame.delta.x, frame.delta.y, frame.delta.w, frame.delta.h);
+              const { x, y, w, h, fw, fh } = frame.delta;
+              const fullW = fw || img.width;
+              const fullH = fh || img.height;
+              if (!remoteCanvasBaseReadyRef.current || canvas.width !== fullW || canvas.height !== fullH) {
+                canvas.width = fullW;
+                canvas.height = fullH;
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, fullW, fullH);
+              }
+              ctx.drawImage(img, x, y, w, h);
             } else {
+              canvas.width = img.width;
+              canvas.height = img.height;
               ctx.drawImage(img, 0, 0);
+              remoteCanvasBaseReadyRef.current = true;
             }
           }
         }
@@ -766,11 +1508,17 @@ export default function App() {
   };
 
   const applyFrame = (base64: string, delta?: import('./api').DeltaMeta) => {
-    const devId = standaloneDeviceId ?? activeSessions[0]?.id;
+    const devId = standaloneDeviceId ?? focusedSessionId ?? activeSessions[0]?.id;
     if (!devId) return;
+    if (hqStreamOnCanvasRef.current) return;
 
     // Guardar siempre para que re-renders de React tengan el frame correcto
     latestLiveFrameRef.current = base64;
+
+    // Telemetría HTTP puede marcar offline durante switch de sesión; si hay frames, está online
+    setActiveSessions(prev =>
+      prev.map(s => (s.id === devId && !s.is_online ? { ...s, is_online: true } : s))
+    );
 
     if (liveCanvasRef.current) {
       frameQueueRef.current.push({ base64, delta });
@@ -780,123 +1528,317 @@ export default function App() {
       setSessionFrames(prev => ({ ...prev, [devId]: base64 }));
     }
   };
+
+  const beginSessionSwitch = useCallback((deviceId: number, targetWindowsSessionId: number) => {
+    pendingSwitchWindowsSessionRef.current = targetWindowsSessionId;
+    setSessionSwitchError('');
+    setSessionSwitching(true);
+    setSessionSwitchingDeviceId(deviceId);
+    // No vaciar latestLiveFrameRef: el canvas sigue mostrando la última imagen hasta el primer frame nuevo
+    frameQueueRef.current = [];
+    remoteCanvasBaseReadyRef.current = false;
+    setSessionFrames(prev => ({ ...prev, [deviceId]: '' }));
+  }, []);
+
+  const cancelSessionSwitch = useCallback(() => {
+    pendingSwitchWindowsSessionRef.current = null;
+    setSessionSwitching(false);
+    setSessionSwitchingDeviceId(null);
+    setSessionSwitchError('');
+    setLoginLoading(false);
+  }, []);
   // ── FIN LIVE VIDEO REF ─────────────────────────────────────────────────────
 
 
 
   const handleViewerMessage = useCallback((msg: Record<string, unknown>) => {
+    const streamDev = standaloneDeviceId ?? focusedSessionId;
     if (msg.type === 'session_list') {
       type WS = { id: number; name: string; username: string; state: string; current: boolean; };
-      setWinSessions((msg.sessions as WS[]) ?? []);
-      setSessionSwitching(false); // Failsafe to hide spinner when new agent connects
+      const sessions = (msg.sessions as WS[]) ?? [];
+      setWinSessions(sessions);
+      if (streamDev) {
+        setWinSessionsByDevice(prev => ({ ...prev, [streamDev]: sessions }));
+      }
+      const pending = pendingSwitchWindowsSessionRef.current;
+      if (pending != null) {
+        const current = sessions.find(s => s.current);
+        if (current?.id === pending) {
+          pendingSwitchWindowsSessionRef.current = null;
+          setSessionSwitching(false);
+          setSessionSwitchingDeviceId(null);
+          setSessionSwitchError('');
+        }
+      } else {
+        setSessionSwitching(false);
+        if (streamDev) setSessionSwitchingDeviceId(null);
+      }
     } else if (msg.type === 'session_switching') {
       setSessionSwitching(true);
+      setSessionSwitchError('');
+      const target = msg.target_session_id as number | undefined;
+      if (target != null) pendingSwitchWindowsSessionRef.current = target;
+      if (streamDev) setSessionSwitchingDeviceId(streamDev);
     } else if (msg.type === 'session_switched') {
+      pendingSwitchWindowsSessionRef.current = null;
       setSessionSwitching(false);
-      setWinSessions(prev => prev.map(s => ({
-        ...s,
-        current: s.id === msg.session_id
-      })));
+      setSessionSwitchError('');
+      if (streamDev) setSessionSwitchingDeviceId(null);
+      const sid = msg.session_id as number;
+      const patch = (list: WinSession[]) => list.map(s => ({ ...s, current: s.id === sid }));
+      setWinSessions(patch);
+      if (streamDev) {
+        setWinSessionsByDevice(prev => ({
+          ...prev,
+          [streamDev]: patch(prev[streamDev] ?? []),
+        }));
+      }
+      sendViewerCommandRef.current({ type: 'refresh_frame' });
+      sendViewerCommandRef.current({ type: 'get_sessions' });
+    } else if (msg.type === 'session_switch_failed') {
+      pendingSwitchWindowsSessionRef.current = null;
+      setSessionSwitching(false);
+      setSessionSwitchingDeviceId(null);
+      setSessionSwitchError((msg.error as string) ?? 'No se pudo cambiar de sesión');
+      setLoginLoading(false);
     } else if (msg.type === 'login_result') {
       if (msg.success) {
+        const sid = (msg.session_id as number) ?? pendingSwitchWindowsSessionRef.current;
+        if (sid != null) pendingSwitchWindowsSessionRef.current = sid;
         setSessionSwitching(true);
+        setSessionSwitchError('');
+        if (streamDev) setSessionSwitchingDeviceId(streamDev);
         setShowLoginModal(false);
+        setLoginDeviceId(null);
+        setLoginLoading(false);
+        sendViewerCommandRef.current({ type: 'refresh_frame' });
       } else {
+        pendingSwitchWindowsSessionRef.current = null;
+        setSessionSwitching(false);
         setLoginError((msg.error as string) ?? 'Credenciales inválidas');
         setLoginLoading(false);
       }
     }
-  }, []);
+  }, [standaloneDeviceId, focusedSessionId]);
 
   const { sendCommand: sendViewerCommand } = useViewerWebSocket({
-    deviceId: standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0].id : null),
-    enabled: isAuthenticated && (!!standaloneDeviceId || activeSessions.length === 1),
+    deviceId: standaloneDeviceId ?? focusedSessionId ?? (activeSessions.length === 1 ? activeSessions[0].id : null),
+    enabled: isAuthenticated && (!!standaloneDeviceId || !!focusedSessionId || activeSessions.length === 1),
     onFrame: (base64, delta) => {
       applyFrame(base64, delta);
       setWsViewerConnected(true);
+      const now = performance.now();
+      frameTimestampsRef.current.push(now);
+      const twoSecsAgo = now - 2000;
+      frameTimestampsRef.current = frameTimestampsRef.current.filter(t => t > twoSecsAgo);
+      const fps = Math.round(frameTimestampsRef.current.length / 2);
+      setConnectionFps(fps);
+      setConnectionQuality(connectionQualityFromFps(fps));
+      if (sessionSwitchingRef.current && base64) {
+        pendingSwitchWindowsSessionRef.current = null;
+        setSessionSwitching(false);
+        setSessionSwitchingDeviceId(null);
+        setSessionSwitchError('');
+      }
     },
     onHqChunk: (chunk) => {
       setWsViewerConnected(true);
-      if (jmuxerRef.current) {
-          const newData = new Uint8Array(chunk);
-          if (hqBufferRef.current.length === 0) {
-              hqBufferRef.current = newData;
-          } else {
-              const combined = new Uint8Array(hqBufferRef.current.length + newData.length);
-              combined.set(hqBufferRef.current);
-              combined.set(newData, hqBufferRef.current.length);
-              hqBufferRef.current = combined;
-          }
-
-          let lastStartCodeIdx = -1;
-          for (let i = hqBufferRef.current.length - 4; i >= 0; i--) {
-              if (hqBufferRef.current[i] === 0 && hqBufferRef.current[i+1] === 0 && hqBufferRef.current[i+2] === 0 && hqBufferRef.current[i+3] === 1) {
-                  lastStartCodeIdx = i;
-                  break;
-              }
-          }
-
-          if (lastStartCodeIdx > 0) {
-              const completeNalus = hqBufferRef.current.slice(0, lastStartCodeIdx);
-              hqBufferRef.current = hqBufferRef.current.slice(lastStartCodeIdx);
-              jmuxerRef.current.feed({ video: completeNalus });
-          }
-      }
+      setHqState('open');
+      feedHqChunkImplRef.current(chunk);
     },
     onQuality: (fps, quality) => {
       setConnectionFps(fps);
       setConnectionQuality(quality);
     },
     onMessage: handleViewerMessage,
-    onClose: () => setWsViewerConnected(false),
+    onClose: () => {
+      setWsViewerConnected(false);
+      remoteCanvasBaseReadyRef.current = false;
+      frameQueueRef.current = [];
+    },
   });
+  sendViewerCommandRef.current = sendViewerCommand;
 
   const connectionFpsRef = useRef(0);
   useEffect(() => {
     connectionFpsRef.current = connectionFps;
   }, [connectionFps]);
 
-  const viewerStreamDeviceId = standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
+  const viewerStreamDeviceId = standaloneDeviceId ?? focusedSessionId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
   const streamPresetStorageKey = viewerStreamDeviceId != null ? `apollo_stream_preset_${viewerStreamDeviceId}` : null;
   const [streamPreset, setStreamPreset] = useState<StreamPreset>('auto');
 
   // ── ALTO RENDIMIENTO (HQ MODE) ──────────────────────────────────────────────
-  const hqDeviceId = standaloneDeviceId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
+  const hqDeviceId = standaloneDeviceId ?? focusedSessionId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
   const hqStorageKey = hqDeviceId ? `hq_mode_${hqDeviceId}` : null;
 
-  const [hqEnabled, setHqEnabled] = useState<boolean>(() =>
-    hqStorageKey ? localStorage.getItem(hqStorageKey) === 'true' : false
-  );
-  const [hqState, setHqState] = useState<'connecting' | 'open' | 'closed' | 'off'>(() => 
-    (hqStorageKey && localStorage.getItem(hqStorageKey) === 'true') ? 'open' : 'off'
-  );
+  const [hqEnabled, setHqEnabled] = useState<boolean>(() => {
+    if (!hqStorageKey) return false;
+    const stored = localStorage.getItem(hqStorageKey);
+    if (stored !== null) return stored === 'true';
+    return false;
+  });
+  const [hqState, setHqState] = useState<'connecting' | 'open' | 'closed' | 'off'>(() => {
+    if (!hqStorageKey) return 'off';
+    const stored = localStorage.getItem(hqStorageKey);
+    if (stored !== null) return stored === 'true' ? 'connecting' : 'off';
+    return 'off';
+  });
   const [hqReconnectAttempt, setHqReconnectAttempt] = useState(0);
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const jmuxerRef = useRef<any>(null);
-  const hqBufferRef = useRef<Uint8Array>(new Uint8Array(0));
+  const destroyHqDecoders = useCallback(() => {
+    if (webCodecsPlayerRef.current) {
+      webCodecsPlayerRef.current.destroy();
+      webCodecsPlayerRef.current = null;
+    }
+    if (jmuxerRef.current) {
+      try { jmuxerRef.current.destroy(); } catch { /* */ }
+      jmuxerRef.current = null;
+    }
+    hqBufferRef.current = new Uint8Array(0);
+    hqPendingChunksRef.current = [];
+    hqPendingWarnedRef.current = false;
+  }, []);
+
+  const feedJmuxerHqChunk = useCallback((chunk: ArrayBuffer) => {
+    if (!jmuxerRef.current) return;
+    const newData = new Uint8Array(chunk);
+    if (hqBufferRef.current.length === 0) {
+      hqBufferRef.current = newData;
+    } else {
+      const combined = new Uint8Array(hqBufferRef.current.length + newData.length);
+      combined.set(hqBufferRef.current);
+      combined.set(newData, hqBufferRef.current.length);
+      hqBufferRef.current = combined;
+    }
+
+    let lastStartCodeIdx = -1;
+    for (let i = hqBufferRef.current.length - 4; i >= 0; i--) {
+      if (hqBufferRef.current[i] === 0 && hqBufferRef.current[i + 1] === 0 && hqBufferRef.current[i + 2] === 0 && hqBufferRef.current[i + 3] === 1) {
+        lastStartCodeIdx = i;
+        break;
+      }
+    }
+
+    if (lastStartCodeIdx > 0) {
+      const completeNalus = hqBufferRef.current.slice(0, lastStartCodeIdx);
+      hqBufferRef.current = hqBufferRef.current.slice(lastStartCodeIdx);
+      jmuxerRef.current.feed({ video: completeNalus });
+    }
+  }, []);
+
+  const flushHqPendingChunks = useCallback(() => {
+    const pending = hqPendingChunksRef.current;
+    if (pending.length === 0) return;
+    hqPendingChunksRef.current = [];
+    hqPendingWarnedRef.current = false;
+    for (const chunk of pending) {
+      if (webCodecsPlayerRef.current) webCodecsPlayerRef.current.feed(chunk);
+      else feedJmuxerHqChunk(chunk);
+    }
+  }, [feedJmuxerHqChunk]);
+
+  feedHqChunkImplRef.current = (chunk: ArrayBuffer) => {
+    if (webCodecsPlayerRef.current) {
+      webCodecsPlayerRef.current.feed(chunk);
+      return;
+    }
+    if (jmuxerRef.current) {
+      feedJmuxerHqChunk(chunk);
+      return;
+    }
+    hqPendingChunksRef.current.push(chunk);
+    if (hqPendingChunksRef.current.length > 300) hqPendingChunksRef.current.shift();
+    if (!hqPendingWarnedRef.current) {
+      hqPendingWarnedRef.current = true;
+      logFrontendRef.current('[FRONTEND-HQ] Chunks H.264 en cola (decodificador no listo aún)', 'WARNING');
+    }
+  };
 
   useEffect(() => {
-    if (hqEnabled && hqState === 'open' && videoRef.current && !jmuxerRef.current) {
-      console.log('[JMUXER NALU START] Inicializando decodificador robusto H.264...');
-      hqBufferRef.current = new Uint8Array(0);
-      jmuxerRef.current = new JMuxer({
-          node: videoRef.current,
-          mode: 'video',
-          flushingTime: 10,
-          fps: 24,
-          debug: false,
-          onError: (data: any) => console.error('[JMUXER] Error:', data)
-      });
-      videoRef.current.play().catch(() => {});
-      
-    } else if (!hqEnabled && jmuxerRef.current) {
-      console.log('[JMUXER NALU STOP] Destruyendo decodificador.');
-      jmuxerRef.current.destroy();
-      jmuxerRef.current = null;
-      hqBufferRef.current = new Uint8Array(0);
+    const useHqCanvas = WEBCODECS_H264 && hqEnabled && hqState === 'open';
+    hqStreamOnCanvasRef.current = useHqCanvas;
+    if (useHqCanvas) {
+      frameQueueRef.current = [];
+      isProcessingQueueRef.current = false;
     }
   }, [hqEnabled, hqState]);
+
+  // HD activo pero sin chunks: volver a WebP para no dejar pantalla negra
+  useEffect(() => {
+    if (!hqEnabled || !wsViewerConnected || hqState === 'open') return;
+    const timer = window.setTimeout(() => {
+      if (!hqEnabled) return;
+      if (connectionFpsRef.current > 0) return;
+      logFrontendRef.current(
+        '[FRONTEND-HQ] Sin video HD en 12s — fallback a calidad estándar',
+        'WARNING',
+      );
+      setHqEnabled(false);
+      setHqState('off');
+      hqStreamOnCanvasRef.current = false;
+      if (hqStorageKey) localStorage.setItem(hqStorageKey, 'false');
+      destroyHqDecoders();
+      sendViewerCommandRef.current({ type: 'stop_hq' });
+      sendViewerCommandRef.current({ type: 'refresh_frame' });
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [hqEnabled, hqState, wsViewerConnected, hqStorageKey, destroyHqDecoders]);
+
+  useEffect(() => {
+    if (!hqEnabled) {
+      destroyHqDecoders();
+      return;
+    }
+    if (WEBCODECS_H264 && liveCanvasRef.current && !webCodecsPlayerRef.current) {
+      webCodecsPlayerRef.current = new H264WebCodecsPlayer(
+        liveCanvasRef.current,
+        24,
+        (msg) => {
+          console.warn('[WebCodecs H264]', msg);
+          logFrontendRef.current(`[FRONTEND-WEBCODECS] ${msg}`, 'WARNING');
+          if (hqEnabled && hqState === 'open') {
+            setHqState('connecting');
+            hqStreamOnCanvasRef.current = false;
+            sendViewerCommandRef.current({ type: 'refresh_frame' });
+          }
+        },
+      );
+      logFrontendRef.current('[FRONTEND-WEBCODECS] Decodificador H.264 WebCodecs activo', 'INFO');
+      logFrontendRef.current(`[VERSION] Portal ${APP_VERSION_LABEL} build ${APP_BUILD}`, 'INFO');
+      flushHqPendingChunks();
+      return;
+    }
+    if (!WEBCODECS_H264 && hqState === 'open' && videoRef.current && !jmuxerRef.current) {
+      hqBufferRef.current = new Uint8Array(0);
+      jmuxerRef.current = new JMuxer({
+        node: videoRef.current,
+        mode: 'video',
+        flushingTime: 10,
+        fps: 24,
+        debug: false,
+        onError: (data: any) => {
+          console.error('[JMUXER] Error:', data);
+          logFrontendRef.current(`[FRONTEND-JMUXER] Error: ${JSON.stringify(data)}`, 'ERROR');
+        },
+      });
+      videoRef.current.play().catch(() => {});
+      logFrontendRef.current('[FRONTEND-JMUXER] Decodificador H.264 JMuxer activo (fallback sin WebCodecs)', 'INFO');
+      flushHqPendingChunks();
+    }
+  }, [hqEnabled, hqState, destroyHqDecoders, flushHqPendingChunks]);
+
+  // Al cambiar de sesión Windows: apagar HQ para evitar crashes MSE/JMuxer (bitácora)
+  useEffect(() => {
+    if (!sessionSwitching) return;
+    destroyHqDecoders();
+    if (hqEnabled) {
+      sendViewerCommand({ type: 'stop_hq' });
+      setHqEnabled(false);
+      setHqState('off');
+      if (hqStorageKey) localStorage.setItem(hqStorageKey, 'false');
+    }
+  }, [sessionSwitching, hqEnabled, hqStorageKey, sendViewerCommand]);
   // ────────────────────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -968,16 +1910,82 @@ export default function App() {
     sendViewerCommand({ type: 'get_sessions' });
   }, [wsViewerConnected, sendViewerCommand]);
 
-  // ─── SESIONES WINDOWS ─────────────────────────────────────────────────
-  type WinSession = { id: number; name: string; username: string; state: string; current: boolean; };
-  const [winSessions, setWinSessions] = useState<WinSession[]>([]);
-  const [showSessionPicker, setShowSessionPicker] = useState(false);
-  const [showLoginModal, setShowLoginModal] = useState(false);
-  const [showLoginPassword, setShowLoginPassword] = useState(false);
-  const [loginCreds, setLoginCreds] = useState({ username: localStorage.getItem('last_remote_username') || '', password: '', domain: localStorage.getItem('last_remote_domain') || '.' });
-  const [loginError, setLoginError] = useState('');
-  const [loginLoading, setLoginLoading] = useState(false);
-  const [sessionSwitching, setSessionSwitching] = useState(false);
+  const refreshWindowsSessionsForDevice = useCallback(async (deviceId: number) => {
+    try {
+      await sendCentinelaControl(deviceId, { type: 'get_sessions' });
+    } catch { /* agente puede estar offline */ }
+    for (let i = 0; i < 8; i++) {
+      await new Promise(r => setTimeout(r, 300));
+      try {
+        const sessions = await fetchWindowsSessions(deviceId);
+        if (sessions.length) {
+          setWinSessionsByDevice(prev => ({ ...prev, [deviceId]: sessions }));
+          if ((standaloneDeviceId ?? focusedSessionId) === deviceId) {
+            setWinSessions(sessions);
+          }
+          return;
+        }
+      } catch { break; }
+    }
+  }, [standaloneDeviceId, focusedSessionId]);
+
+  useEffect(() => {
+    if (!viewerStreamDeviceId) return;
+    const cached = winSessionsByDevice[viewerStreamDeviceId];
+    if (cached?.length) setWinSessions(cached);
+  }, [viewerStreamDeviceId, winSessionsByDevice]);
+
+  useEffect(() => {
+    if (!sessionSwitching) return;
+    const warnTimer = setTimeout(() => {
+      if (pendingSwitchWindowsSessionRef.current != null) {
+        setSessionSwitchError(prev => prev || 'El cambio está tardando. Puede cancelar e intentar de nuevo.');
+      }
+    }, 45000);
+    const failTimer = setTimeout(() => {
+      if (pendingSwitchWindowsSessionRef.current != null) {
+        cancelSessionSwitch();
+        setSessionSwitchError('Tiempo agotado al cambiar de sesión. Actualice el agente en el servidor e intente otra vez.');
+      }
+    }, 50000);
+    return () => {
+      clearTimeout(warnTimer);
+      clearTimeout(failTimer);
+    };
+  }, [sessionSwitching, cancelSessionSwitch]);
+
+  const submitWindowsLogin = useCallback(async () => {
+    if (!loginCreds.username || !loginCreds.password) return;
+    const targetId = loginDeviceId ?? standaloneDeviceId ?? focusedSessionId ?? activeSessions[0]?.id;
+    if (!targetId) return;
+    setLoginLoading(true);
+    setLoginError('');
+    localStorage.setItem('last_remote_username', loginCreds.username);
+    localStorage.setItem('last_remote_domain', loginCreds.domain);
+    const sessions = winSessionsByDevice[targetId] ?? winSessions;
+    const consoleSess = sessions.find(w => w.name?.toLowerCase() === 'console');
+    const winSessId = consoleSess?.id ?? 1;
+    beginSessionSwitch(targetId, winSessId);
+    const payload = {
+      type: 'login_session' as const,
+      ...loginCreds,
+      session_id: winSessId,
+    };
+    const useWs = wsViewerConnected && (standaloneDeviceId === targetId || focusedSessionId === targetId);
+    try {
+      if (useWs) {
+        sendViewerCommand(payload);
+      } else {
+        await sendCentinelaControl(targetId, payload);
+      }
+    } catch (e: any) {
+      setLoginError(e?.message ?? 'Error al iniciar sesión');
+      setLoginLoading(false);
+    }
+  }, [
+    loginCreds, loginDeviceId, standaloneDeviceId, focusedSessionId, activeSessions,
+    winSessionsByDevice, winSessions, wsViewerConnected, sendViewerCommand, beginSessionSwitch,
+  ]);
   // ─────────────────────────────────────────────────────────────────────
 
   // Refs eliminados para MSE (usando MJPEG nativo)
@@ -999,6 +2007,10 @@ export default function App() {
     }
   }, [hqDeviceId]);
 
+  useEffect(() => {
+    logFrontendRef.current = logFrontendToBackend;
+  }, [logFrontendToBackend]);
+
   // Capturador global de excepciones, errores y rechazos de promesas en la consola para telemetría
   useEffect(() => {
     if (!hqDeviceId) return;
@@ -1018,7 +2030,10 @@ export default function App() {
     window.addEventListener('unhandledrejection', handleUnhandledRejection);
     
     // Log de confirmación de versión
-    logFrontendToBackend('[FRONTEND-TELEMETRÍA] Telemetría global de consola activada en el visor (v3.1.2-HQ)', 'INFO');
+    logFrontendToBackend(
+      `[VERSION] Portal ${APP_VERSION_LABEL} build ${APP_BUILD} (${APP_VERSION_TAG}) webcodecs=${WEBCODECS_H264}`,
+      'INFO',
+    );
 
     return () => {
       window.removeEventListener('error', handleGlobalError);
@@ -1027,21 +2042,28 @@ export default function App() {
   }, [hqDeviceId, logFrontendToBackend]);
 
   useEffect(() => {
-    // Si la página se recargó y hqEnabled quedó en true por localStorage,
-    // debemos avisarle al servidor apenas conectemos el WS para que empiece a mandar H.264
-    if (wsViewerConnected && hqEnabled) {
-      sendViewerCommand({ type: 'start_hq' });
-    }
+    if (!wsViewerConnected || !hqEnabled) return;
+    // WebP primero; HD un poco después para no dejar pantalla negra al conectar
+    sendViewerCommand({ type: 'refresh_frame' });
+    const t = window.setTimeout(() => {
+      if (hqEnabled) sendViewerCommand({ type: 'start_hq' });
+    }, 2000);
+    return () => window.clearTimeout(t);
   }, [wsViewerConnected, hqEnabled, sendViewerCommand]);
 
   const toggleHqMode = () => {
     const next = !hqEnabled;
     setHqEnabled(next);
-    setHqState(next ? 'open' : 'off');
+    setHqState(next ? 'connecting' : 'off');
     if (hqStorageKey) localStorage.setItem(hqStorageKey, String(next));
-    
-    // Notificar al backend/agente que active/desactive la transmision MJPEG HQ
+    if (!next) {
+      hqStreamOnCanvasRef.current = false;
+      destroyHqDecoders();
+    }
     sendViewerCommand({ type: next ? 'start_hq' : 'stop_hq' });
+    if (!next) {
+      sendViewerCommand({ type: 'refresh_frame' });
+    }
   };
   
   const handleAltViewer = (e: React.MouseEvent) => {
@@ -1214,13 +2236,20 @@ export default function App() {
     }
   }, [standaloneIdInit, activeSessions]);
 
-  // Sincronizar foco activo automático de teclado
+  // Sincronizar foco: una PC → siempre; varias → primera válida o la que el técnico eligió
   useEffect(() => {
+    if (activeSessions.length === 0) {
+      setFocusedSessionId(null);
+      return;
+    }
     if (activeSessions.length === 1) {
       setFocusedSessionId(activeSessions[0].id);
-    } else if (activeSessions.length === 0) {
-      setFocusedSessionId(null);
+      return;
     }
+    setFocusedSessionId(prev => {
+      if (prev != null && activeSessions.some(s => s.id === prev)) return prev;
+      return activeSessions[0].id;
+    });
   }, [activeSessions]);
 
   // Nuevos estados para Intervenciones
@@ -1364,6 +2393,9 @@ export default function App() {
         task = activeSessions.length > 0 
           ? `Asistiendo a PC: ${activeSessions.map(s => s.device_name).join(', ')}` 
           : "Explorando Flota de Terminales";
+      } else if (activeTab === 'agenda') {
+        page = "Agenda";
+        task = "Reuniones y grabaciones";
       } else if (activeTab === 'clients') {
         page = "Base Clientes";
         task = "Buscando/Editando Clientes";
@@ -1441,7 +2473,7 @@ export default function App() {
               setActiveSessions([{ id: devId, device_name: matchedDev.device_name, ...matchedDev }]);
               const client = clientsData.find((c: any) => c.id === matchedDev.client_id);
               const clientName = client ? client.razon_social : "Cliente Pendiente";
-              document.title = `🔴 ${matchedDev.device_name} - ${clientName} | ApolloSupport`;
+              document.title = `${APP_VERSION_LABEL} · ${matchedDev.device_name} - ${clientName} | ApolloSupport`;
 
               // Leer cantidad de monitores desde la telemetría en vivo del agente
               const liveTelem = telemetryData[String(devId)];
@@ -1510,6 +2542,9 @@ export default function App() {
 
     // Si el WS viewer está activo y solo hay 1 sesión, el WS ya está entregando frames.
     // El polling solo corre para multi-sesión o como fallback si el WS no conectó.
+    const wsStreamDeviceId = wsViewerConnected
+      ? (standaloneDeviceId ?? focusedSessionId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null))
+      : null;
     const usePolling = isAuthenticated && activeSessions.length > 0 &&
       (activeSessions.length > 1 || !wsViewerConnected);
 
@@ -1518,23 +2553,22 @@ export default function App() {
         if (!active) return;
         let changed = false;
         const updatedFrames: Record<string, string> = {};
+        const pollTargets = wsStreamDeviceId
+          ? activeSessions.filter(s => s.id !== wsStreamDeviceId)
+          : activeSessions;
 
         try {
-          const fetchStart = performance.now();
-          await Promise.all(activeSessions.map(async (s) => {
+          await Promise.all(pollTargets.map(async (s) => {
             const frame = await getCentinelaFrame(s.id);
             if (frame && frame !== sessionFramesRef.current[s.id]) {
               updatedFrames[s.id] = frame;
               changed = true;
 
-              // Registrar timestamp de frame recibido para cálculo de FPS
               const now = performance.now();
               frameTimestampsRef.current.push(now);
-              // Mantener solo los últimos 2 segundos de frames
               const twoSecsAgo = now - 2000;
               frameTimestampsRef.current = frameTimestampsRef.current.filter(t => t > twoSecsAgo);
 
-              // Calcular FPS y calidad
               const fps = Math.round(frameTimestampsRef.current.length / 2);
               setConnectionFps(fps);
               setConnectionQuality(connectionQualityFromFps(fps));
@@ -1549,13 +2583,14 @@ export default function App() {
         }
 
         if (active) {
-          timeoutId = setTimeout(fetchFrames, 100);
+          const delay = pollTargets.length === 0 ? 250
+            : (activeSessions.length > 1 ? 110 : 75);
+          timeoutId = setTimeout(fetchFrames, delay);
         }
       };
 
       fetchFrames();
-    } else {
-      // Sin sesiones activas → resetear calidad
+    } else if (!wsViewerConnected && isAuthenticated) {
       setConnectionFps(0);
       setConnectionQuality('disconnected');
     }
@@ -1564,25 +2599,59 @@ export default function App() {
       active = false;
       if (timeoutId) clearTimeout(timeoutId);
     };
-  }, [isAuthenticated, activeSessions, wsViewerConnected]);
+  }, [isAuthenticated, activeSessions, wsViewerConnected, focusedSessionId, standaloneDeviceId]);
 
   useEffect(() => {
     const targetSessionId = standaloneId ? parseInt(standaloneId) : focusedSessionId;
     if (!targetSessionId) return;
 
+    const specialKeys: Record<string, string> = {
+      'ArrowUp': 'up',
+      'ArrowDown': 'down',
+      'ArrowLeft': 'left',
+      'ArrowRight': 'right',
+      'Escape': 'escape',
+      'Tab': 'tab',
+      'Backspace': 'backspace',
+      ' ': 'space',
+      'Enter': 'enter',
+      'Delete': 'delete',
+      'PageUp': 'pgup',
+      'PageDown': 'pgdn',
+      'Home': 'home',
+      'End': 'end',
+      'F1': 'f1', 'F2': 'f2', 'F3': 'f3', 'F4': 'f4', 'F5': 'f5', 'F6': 'f6',
+      'F7': 'f7', 'F8': 'f8', 'F9': 'f9', 'F10': 'f10', 'F11': 'f11', 'F12': 'f12',
+      'Shift': 'shift',
+      'Control': 'ctrl',
+      'Alt': 'alt',
+      'Meta': 'win',
+      'CapsLock': 'capslock',
+    };
+
+    const mapRemoteKey = (e: KeyboardEvent): string | null => {
+      if (e.key in specialKeys) return specialKeys[e.key];
+      if (e.key.length === 1) {
+        const ch = e.key.toLowerCase();
+        if (/[a-z0-9]/.test(ch)) return ch;
+      }
+      return null;
+    };
+
+    const releaseModifiers = () => {
+      ['shift', 'ctrl', 'alt', 'win'].forEach((k) => {
+        sendCentinelaControl(targetSessionId, { type: 'key_up', key: k });
+      });
+    };
+
     const handleKeyDown = async (e: KeyboardEvent) => {
       if (!isControlEnabled) return;
       const activeEl = document.activeElement;
       if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
-        return; // Ignorar si el usuario está escribiendo en el chat o en la consola del frontend
-      }
-
-      // 1. Ignorar si es una tecla modificadora sola
-      if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].includes(e.key)) {
         return;
       }
+      if (e.repeat) return;
 
-      // Actualizar estado de CapsLock
       const isCaps = e.getModifierState && e.getModifierState('CapsLock');
       if (isCaps !== undefined) {
         setIsCapsLockActive(isCaps);
@@ -1601,20 +2670,13 @@ export default function App() {
         } catch (err) {
           console.error("No se pudo leer el portapapeles local", err);
         }
-        await sendCentinelaControl(targetSessionId, {
-          type: 'key_press',
-          key: 'ctrl+v'
-        });
+        await sendCentinelaControl(targetSessionId, { type: 'key_press', key: 'ctrl+v' });
         return;
       }
 
       if (isCopy) {
         e.preventDefault();
-        await sendCentinelaControl(targetSessionId, {
-          type: 'key_press',
-          key: 'ctrl+c'
-        });
-        // Esperar brevemente a que el agente actualice el portapapeles en el servidor y traerlo
+        await sendCentinelaControl(targetSessionId, { type: 'key_press', key: 'ctrl+c' });
         setTimeout(async () => {
           try {
             const text = await getCentinelaClipboard(targetSessionId);
@@ -1628,65 +2690,42 @@ export default function App() {
         return;
       }
 
-      const specialKeys: Record<string, string> = {
-        'ArrowUp': 'up',
-        'ArrowDown': 'down',
-        'ArrowLeft': 'left',
-        'ArrowRight': 'right',
-        'Escape': 'escape',
-        'Tab': 'tab',
-        'Backspace': 'backspace',
-        ' ': 'space',
-        'Enter': 'enter',
-        'Delete': 'delete',
-        'PageUp': 'pgup',
-        'PageDown': 'pgdn',
-        'Home': 'home',
-        'End': 'end',
-        'F1': 'f1', 'F2': 'f2', 'F3': 'f3', 'F4': 'f4', 'F5': 'f5', 'F6': 'f6',
-        'F7': 'f7', 'F8': 'f8', 'F9': 'f9', 'F10': 'f10', 'F11': 'f11', 'F12': 'f12'
-      };
-
-      // Construir combinación de teclas con modificadores
-      let hasModifier = e.ctrlKey || e.altKey || e.metaKey;
-      let isSpecialKey = e.key in specialKeys;
-
-      // Si tiene modificadores O es una tecla especial combinada con Shift (ej. Shift+ArrowRight)
-      if (hasModifier || (e.shiftKey && isSpecialKey)) {
+      const mapped = mapRemoteKey(e);
+      if (mapped) {
         e.preventDefault();
-        let keyParts: string[] = [];
-        if (e.ctrlKey || e.metaKey) keyParts.push('ctrl');
-        if (e.altKey) keyParts.push('alt');
-        if (e.shiftKey) keyParts.push('shift');
+        await sendCentinelaControl(targetSessionId, { type: 'key_down', key: mapped });
+        return;
+      }
 
-        const mainKey = isSpecialKey ? specialKeys[e.key] : e.key.toLowerCase();
-        keyParts.push(mainKey);
-
-        const combo = keyParts.join('+');
-        await sendCentinelaControl(targetSessionId, {
-          type: 'key_press',
-          key: combo
-        });
-      } else if (isSpecialKey) {
-        // Tecla especial sola (ej. ArrowUp, Escape, Tab, etc.)
+      // Caracteres fuera del mapa VK (ñ, símbolos de layout): enviar texto
+      if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
         e.preventDefault();
-        await sendCentinelaControl(targetSessionId, {
-          type: 'key_press',
-          key: specialKeys[e.key]
-        });
-      } else if (e.key.length === 1) {
-        // Caracter estándar solo (o con Shift de texto estándar, ej. "A" o "!")
-        e.preventDefault();
-        await sendCentinelaControl(targetSessionId, {
-          type: 'write_text',
-          text: e.key
-        });
+        await sendCentinelaControl(targetSessionId, { type: 'write_text', text: e.key });
       }
     };
 
+    const handleKeyUp = async (e: KeyboardEvent) => {
+      if (!isControlEnabled) return;
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
+        return;
+      }
+      const mapped = mapRemoteKey(e);
+      if (!mapped) return;
+      e.preventDefault();
+      await sendCentinelaControl(targetSessionId, { type: 'key_up', key: mapped });
+    };
+
+    const handleBlur = () => releaseModifiers();
+
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+      releaseModifiers();
     };
   }, [standaloneId, focusedSessionId, remoteClipboard, isControlEnabled]);
 
@@ -2006,18 +3045,39 @@ export default function App() {
     return null;
   };
 
+  /** Al clic en la pantalla remota, sacar el foco de TECLADO/CONSOLA
+   *  para que keydown del window llegue al agente (si no, el teclado "no anda"). */
+  const stealRemoteKeyboardFocus = (el?: EventTarget | null) => {
+    const active = document.activeElement as HTMLElement | null;
+    if (
+      active &&
+      (active.tagName === 'INPUT' ||
+        active.tagName === 'TEXTAREA' ||
+        active.tagName === 'SELECT' ||
+        active.isContentEditable)
+    ) {
+      active.blur();
+    }
+    const target = el as HTMLElement | null;
+    if (target && typeof target.focus === 'function') {
+      try {
+        target.focus({ preventScroll: true });
+      } catch {
+        try { target.focus(); } catch { /* ignore */ }
+      }
+    }
+  };
+
   const handleMouseDown = async (e: React.MouseEvent<HTMLElement>, deviceId: number) => {
     if (!isControlEnabled) return;
+    e.preventDefault();
+    e.stopPropagation();
     setFocusedSessionId(deviceId);
-    // e.button: 0 = Izquierdo, 2 = Derecho
-    const buttonMap: { [key: number]: string } = { 0: 'left', 2: 'right' };
+    stealRemoteKeyboardFocus(e.currentTarget);
+    // e.button: 0 = Izquierdo, 1 = Central, 2 = Derecho
+    const buttonMap: { [key: number]: string } = { 0: 'left', 1: 'middle', 2: 'right' };
     const button = buttonMap[e.button];
     if (!button) return;
-
-    if (e.button === 2) {
-      e.preventDefault();
-      e.stopPropagation();
-    }
 
     const coords = getCoordinates(e);
     if (coords) {
@@ -2032,14 +3092,11 @@ export default function App() {
 
   const handleMouseUp = async (e: React.MouseEvent<HTMLElement>, deviceId: number) => {
     if (!isControlEnabled) return;
-    const buttonMap: { [key: number]: string } = { 0: 'left', 2: 'right' };
+    e.preventDefault();
+    e.stopPropagation();
+    const buttonMap: { [key: number]: string } = { 0: 'left', 1: 'middle', 2: 'right' };
     const button = buttonMap[e.button];
     if (!button) return;
-
-    if (e.button === 2) {
-      e.preventDefault();
-      e.stopPropagation();
-    }
 
     const coords = getCoordinates(e);
     if (coords) {
@@ -2054,12 +3111,15 @@ export default function App() {
 
   const handleImageWheel = async (e: React.WheelEvent<HTMLElement>, deviceId: number) => {
     if (!isControlEnabled) return;
+    e.preventDefault();
+    e.stopPropagation();
     const direction = e.deltaY > 0 ? 'down' : 'up';
+    const steps = Math.max(1, Math.min(10, Math.round(Math.abs(e.deltaY) / 40)));
     const coords = getCoordinates(e as unknown as React.MouseEvent<HTMLElement>);
     await sendCentinelaControl(deviceId, {
       type: 'mouse_scroll',
       direction,
-      amount: 3,
+      amount: steps,
       ...(coords ? { x: coords.x, y: coords.y } : {})
     });
   };
@@ -2124,11 +3184,43 @@ export default function App() {
     e.preventDefault();
     setIsSubmitting(true);
     let result;
-    if (editingClient) result = await updateClient(editingClient, clientForm);
-    else result = await createClient(clientForm);
+    const versi = (clientForm.version_apollo || 'E').toUpperCase().slice(0, 1);
+    let codigo = (clientForm.codigo || '').trim().toUpperCase();
+    if (/^\d+$/.test(codigo)) codigo = codigo.padStart(4, '0');
+    const payload = {
+      ...clientForm,
+      codigo,
+      version_apollo: versi,
+      activo: clientForm.activo !== false,
+      fecha_vencimiento: clientForm.fecha_vencimiento || null,
+      fecha_ultimo_pago: clientForm.fecha_ultimo_pago || null,
+    };
+    const first = codigo.slice(0, 1);
+    const okVersi = (versi === 'E' && first < 'M') || (versi === 'S' && first === 'M') || (versi === 'R' && first === 'R') || (versi === 'P' && first === 'V');
+    if (codigo && !okVersi) {
+      setIsSubmitting(false);
+      alert('El número de Cliente (Serie) no coincide con la Versión de AGC. ERP: dígito < M · Single: M · Clock: R · Pharmakos: V');
+      return;
+    }
+    try {
+      if (editingClient) result = await updateClient(editingClient, payload);
+      else result = await createClient(payload);
+    } catch (err: any) {
+      setIsSubmitting(false);
+      showToast(err?.message || 'Error al procesar el cliente.', 'error', 7000);
+      return;
+    }
     setIsSubmitting(false);
 
-    if (result) {
+    if (result && result.id) {
+      if (!editingClient) {
+        setEditingClient(result.id);
+        setClientActiveTab('erp_licensing');
+        setShowNotification("Cliente dado de alta. Generá el serial GesActi en Activaciones ERP.");
+        setTimeout(() => setShowNotification(null), 5000);
+        loadData();
+        return;
+      }
       setIsClientModalOpen(false);
       setEditingClient(null);
       setClientForm({
@@ -2137,7 +3229,7 @@ export default function App() {
         nombre_fantasia: '',
         identificador_fiscal: '',
         cparte: '',
-        version_apollo: '',
+        version_apollo: 'E',
         telefono: '',
         email: '',
         localidad: '',
@@ -2151,7 +3243,9 @@ export default function App() {
         clasificacion_codigo: '',
         clasificacion_nombre: '',
         extracto: '',
-        cclifac: ''
+        cclifac: '',
+        fecha_ultimo_pago: '',
+        activo: true,
       });
       loadData();
     } else alert("Error al procesar el cliente.");
@@ -2187,6 +3281,32 @@ export default function App() {
       }
     } catch (error) {
       alert("Error de red: No se pudo conectar con el servidor. Revisa si el backend de producción se encuentra activo.");
+    }
+  };
+
+  const handleReleaseDeviceSession = async (deviceId: number, deviceName: string) => {
+    if (!window.confirm(`¿Liberar sesión colgada en ${deviceName}?`)) return;
+    try {
+      const res = await releaseCentinelaSession(deviceId);
+      setShowNotification(res.message || `Sesión liberada en ${deviceName}`);
+      setTimeout(() => setShowNotification(null), 3500);
+      loadData();
+    } catch (e: any) {
+      alert(e?.message || 'Error al liberar sesión');
+    }
+  };
+
+  const handleForceRefreshDevice = async (deviceId: number, deviceName: string) => {
+    try {
+      const res = await forceCentinelaRefresh(deviceId);
+      if (res.commands_sent) {
+        setShowNotification(`Refresh enviado a ${deviceName}`);
+      } else {
+        alert(res.message || 'El agente no tiene WebSocket activo. Reiniciá Centinela en la PC cliente.');
+      }
+      setTimeout(() => setShowNotification(null), 3500);
+    } catch (e: any) {
+      alert(e?.message || 'Error al forzar refresh del agente');
     }
   };
 
@@ -2230,18 +3350,13 @@ export default function App() {
   const handleAssignLicense = async () => {
     if (!assignModal || !assignClientId) return;
     try {
-      const ok = await assignCentinelaLicense(assignModal.id, parseInt(assignClientId));
-      if (ok) {
-        setShowNotification(`Dispositivo asignado exitosamente.`);
-        setTimeout(() => setShowNotification(null), 3000);
-        setAssignModal(null);
-        setAssignClientId("");
-        loadData();
-      } else {
-        alert("Error al asignar la licencia.");
-      }
+      const res = await assignCentinelaLicense(assignModal.id, parseInt(assignClientId));
+      showToast(res.message || 'Dispositivo asignado exitosamente.', 'success');
+      setAssignModal(null);
+      setAssignClientId("");
+      loadData();
     } catch (e: any) {
-      alert("Error de comunicación: " + e.message);
+      showToast(e.message || 'No se pudo asignar la licencia al dispositivo.', 'error', 7000);
     }
   };
 
@@ -2466,7 +3581,7 @@ export default function App() {
         nombre_fantasia: c.nombre_fantasia || '',
         identificador_fiscal: c.identificador_fiscal || '',
         cparte: c.cparte || '',
-        version_apollo: c.version_apollo || '',
+        version_apollo: c.version_apollo || 'E',
         telefono: c.telefono || '',
         email: c.email || '',
         localidad: c.localidad || '',
@@ -2480,7 +3595,9 @@ export default function App() {
         clasificacion_codigo: c.clasificacion_codigo || '',
         clasificacion_nombre: c.clasificacion_nombre || '',
         extracto: c.extracto || '',
-        cclifac: c.cclifac || ''
+        cclifac: c.cclifac || '',
+        fecha_ultimo_pago: c.fecha_ultimo_pago || '',
+        activo: c.activo !== false,
       });
     } else {
       setEditingClient(null);
@@ -2490,7 +3607,7 @@ export default function App() {
         nombre_fantasia: '',
         identificador_fiscal: '',
         cparte: '',
-        version_apollo: '',
+        version_apollo: 'E',
         telefono: '',
         email: '',
         localidad: '',
@@ -2504,8 +3621,11 @@ export default function App() {
         clasificacion_codigo: '',
         clasificacion_nombre: '',
         extracto: '',
-        cclifac: ''
+        cclifac: '',
+        fecha_ultimo_pago: '',
+        activo: true,
       });
+      suggestNextGesactiCode('E');
     }
     setIsClientModalOpen(true);
   }
@@ -2528,6 +3648,17 @@ export default function App() {
     const isChatOpen = !!chatVisibility[String(session.id)];
     const isFilesOpen = !!sessionFiles[session.id]?.visible;
 
+    // Video en canvas (latestLiveFrameRef) puede seguir visible aunque frame en state esté vacío tras switch
+    const hasLiveRemoteVideo = !!(
+      frame ||
+      latestLiveFrameRef.current ||
+      sessionSwitching ||
+      wsViewerConnected ||
+      hqState === 'open' ||
+      connectionFps > 0
+    );
+    const showDisconnectedOverlay = !sessionSwitching && !hasLiveRemoteVideo && !session.is_online;
+
     // ─── OVERLAY DE FULLSCREEN REAL DEL VISOR DECORADO (MANEJADO EN EL CONTENEDOR PRINCIPAL) ───
 
     return (
@@ -2535,11 +3666,23 @@ export default function App() {
         {/* Cabecera Standalone */}
         <div className="flex flex-col sm:flex-row gap-3 justify-between items-start sm:items-center mb-3" style={{ display: isViewerFullscreen ? 'none' : 'flex' }}>
           <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-            <span className={`w-3.5 h-3.5 rounded-full ${(session.is_online || frame) ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+            <span className={`w-3.5 h-3.5 rounded-full ${hasLiveRemoteVideo ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
             <h1 className="text-sm sm:text-lg font-black tracking-tight truncate max-w-[200px] sm:max-w-none">{session.device_name || "Soporte Remoto"}</h1>
-            <span className="text-[10px] sm:text-xs bg-slate-800 text-slate-400 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md font-mono">ID: {session.id}</span>
-            <span className={`text-[9px] sm:text-[10px] font-bold px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md uppercase tracking-wider ${(session.is_online || frame) ? (isControlEnabled ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 animate-pulse' : 'bg-amber-500/15 text-amber-400 border border-amber-500/20') : 'bg-red-500/15 text-red-400 border border-red-500/20'}`}>
-              {!(session.is_online || frame) ? 'DESCONECTADO' : (isControlEnabled ? 'Control Remoto' : 'Solo Observando')}
+            {deviceAssistLabel(session) ? (
+              <span className="text-[10px] sm:text-xs bg-sky-500/10 text-sky-400 border border-sky-500/20 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md font-mono font-black" title="ID de asistencia">
+                ID: {deviceAssistLabel(session)}
+              </span>
+            ) : (
+              <span className="text-[10px] sm:text-xs bg-slate-800 text-slate-400 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md font-mono" title="ID interno DB">#{session.id}</span>
+            )}
+            {session.alt_remote_id && (
+              <span className="text-[9px] sm:text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-md font-mono" title="RustDesk / AnyDesk">RD: {session.alt_remote_id}</span>
+            )}
+            <span className="text-[9px] sm:text-[10px] bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 px-2 py-0.5 rounded-md font-mono" title={`Build ${APP_BUILD} · ${APP_VERSION_TAG}`}>
+              {APP_VERSION_LABEL}
+            </span>
+            <span className={`text-[9px] sm:text-[10px] font-bold px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md uppercase tracking-wider ${hasLiveRemoteVideo ? (isControlEnabled ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 animate-pulse' : 'bg-amber-500/15 text-amber-400 border border-amber-500/20') : 'bg-red-500/15 text-red-400 border border-red-500/20'}`}>
+              {!hasLiveRemoteVideo ? 'DESCONECTADO' : (sessionSwitching ? 'Cambiando sesión' : (isControlEnabled ? 'Control Remoto' : 'Solo Observando'))}
             </span>
             {isCapsLockActive && (
               <span className="text-[9px] sm:text-[10px] bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2.5 py-1 rounded-md font-bold flex items-center gap-1 animate-pulse shadow-sm shadow-amber-500/10">
@@ -2548,7 +3691,7 @@ export default function App() {
               </span>
             )}
             {/* Indicador de calidad de conexión en tiempo real */}
-            {(session.is_online || frame) && (
+            {hasLiveRemoteVideo && (
               <span className={`text-[9px] sm:text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1.5 border font-mono ${
                 wsViewerConnected && connectionFps === 0 ? 'bg-slate-500/10 text-slate-400 border-slate-500/20' :
                 connectionQuality === 'excellent' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
@@ -2588,18 +3731,19 @@ export default function App() {
                 ))}
               </div>
             )}
-            {/* 👤 SELECTOR DE SESIONES WINDOWS */}
-            {activeSessions.length === 1 && (
+            {/* Selector de sesiones Windows (RDP / Consola) */}
+            {viewerStreamDeviceId && (
               <div className="relative flex-shrink-0">
                 <button
-                  onClick={() => {
+                  onClick={async () => {
                     sendViewerCommand({ type: 'get_sessions' });
+                    if (!showSessionPicker) await refreshWindowsSessionsForDevice(viewerStreamDeviceId);
                     setShowSessionPicker(v => !v);
                   }}
                   className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border transition-all ${
                     sessionSwitching
                       ? 'bg-amber-600/70 border-amber-500/30 text-amber-100 animate-pulse'
-                      : winSessions.length === 0
+                      : (winSessionsByDevice[viewerStreamDeviceId] ?? winSessions).length === 0
                         ? 'bg-slate-700 border-white/10 text-slate-500 hover:bg-slate-600'
                         : 'bg-slate-700 border-white/10 text-slate-300 hover:bg-slate-600 hover:text-white'
                   }`}
@@ -2608,7 +3752,7 @@ export default function App() {
                   <span>👤</span>
                   <span className="hidden sm:inline">
                     {sessionSwitching ? 'Cambiando...' :
-                     winSessions.find(s => s.current)?.username || 'Sesión'}
+                     (winSessionsByDevice[viewerStreamDeviceId] ?? winSessions).find(s => s.current)?.username || 'Sesión'}
                   </span>
                 </button>
 
@@ -2618,17 +3762,24 @@ export default function App() {
                     <div className="px-3 py-1.5 text-[10px] text-slate-500 font-bold uppercase tracking-widest border-b border-white/5 mb-1">
                       Sesiones Windows
                     </div>
-                    {winSessions.length === 0 ? (
+                    {(winSessionsByDevice[viewerStreamDeviceId] ?? winSessions).length === 0 ? (
                       <div className="px-3 py-2 text-xs text-slate-500 italic">Cargando sesiones...</div>
                     ) : (
-                      winSessions.map(s => (
+                      (winSessionsByDevice[viewerStreamDeviceId] ?? winSessions).map(s => (
                         <button
                           key={s.id}
                           onClick={() => {
                             setShowSessionPicker(false);
-                            if (!s.current) {
+                            if (!s.current && viewerStreamDeviceId) {
+                              const disc = (s.state || '').toLowerCase().includes('disc');
+                              if (disc) {
+                                setSessionSwitchError('Sesión RDP desconectada: elegí Consola o una sesión Activa.');
+                                return;
+                              }
+                              if (s.id < 1 || s.id > 65535) return;
+                              beginSessionSwitch(viewerStreamDeviceId, s.id);
                               sendViewerCommand({ type: 'switch_session', session_id: s.id });
-                              setSessionSwitching(true);
+                              setShowSessionPicker(false);
                             }
                           }}
                           className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs transition-all text-left ${
@@ -2642,7 +3793,9 @@ export default function App() {
                             s.state?.toLowerCase().includes('disc') ? 'bg-yellow-400' : 'bg-slate-500'
                           }`} />
                           <span className="flex-1 truncate">
-                            {s.username || s.name || `Sesión ${s.id}`}
+                            {s.name?.toLowerCase() === 'console' && !s.username
+                              ? `Consola (#${s.id})`
+                              : (s.username || s.name || `Sesión ${s.id}`)}
                           </span>
                           <span className="text-slate-500 text-[10px]">{s.state}</span>
                           {s.current && <span className="text-brand-400 text-[10px]">● actual</span>}
@@ -2651,7 +3804,7 @@ export default function App() {
                     )}
                     <div className="border-t border-white/5 mt-1 pt-1">
                       <button
-                        onClick={() => { setShowSessionPicker(false); setShowLoginModal(true); setLoginError(''); }}
+                        onClick={() => { setShowSessionPicker(false); setLoginDeviceId(viewerStreamDeviceId); setShowLoginModal(true); setLoginError(''); }}
                         className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-slate-400 hover:bg-slate-700 hover:text-white transition-all text-left"
                       >
                         <span>🔑</span> Iniciar sesión con credenciales
@@ -2673,12 +3826,27 @@ export default function App() {
                   ? 'bg-violet-600 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
                   : 'bg-slate-700 border-white/10 text-slate-400 hover:bg-violet-700/50 hover:text-white'
               }`}
-              title="Modo Alto Rendimiento: Turbo WebP Canvas a 30 FPS"
+              title={WEBCODECS_H264 ? 'Stream HD H.264 (WebCodecs, ~24 FPS)' : 'Modo Alto Rendimiento H.264 (JMuxer)'}
             >
               <span>⚡</span>
               <span className="hidden sm:inline">
-                {hqEnabled ? 'HQ ON' : 'HQ'}
+                {hqEnabled ? (WEBCODECS_H264 ? 'HD ON' : 'HQ ON') : (WEBCODECS_H264 ? 'HD' : 'HQ')}
               </span>
+            </button>
+
+            {/* 🗔 Restaurar / Despertar Pantalla Minimizada */}
+            <button
+              onClick={() => {
+                sendViewerCommand({ type: 'wake_screen' });
+                sendViewerCommand({ type: 'refresh_frame' });
+                setShowNotification('Enviando señal para des-minimizar ventanas y despertar pantalla...');
+                setTimeout(() => setShowNotification(null), 3500);
+              }}
+              className="flex-shrink-0 bg-slate-700 hover:bg-amber-600/40 hover:border-amber-400/50 text-slate-300 hover:text-amber-200 px-3 py-2 rounded-xl text-xs font-bold transition-all shadow-lg border border-white/10 flex items-center gap-1.5"
+              title="Restaurar ventanas minimizadas y despertar renderizado si la pantalla se ve negra"
+            >
+              <span>🗔</span>
+              <span className="hidden md:inline">Restaurar Pantalla</span>
             </button>
 
             {/* Botón de Pantalla Completa del Visor */}
@@ -2769,29 +3937,43 @@ export default function App() {
               <div className="relative w-full h-full flex items-center justify-center">
                 <canvas
                   ref={setLiveCanvasRef}
+                  tabIndex={0}
                   onMouseDown={(e) => handleMouseDown(e, session.id)}
                   onMouseUp={(e) => handleMouseUp(e, session.id)}
-                  onDoubleClick={(e) => handleImageInteraction(e, session.id, 'double')}
+                  onMouseLeave={(e) => handleMouseUp(e, session.id)}
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
                   onWheel={(e) => handleImageWheel(e, session.id)}
-                  style={{ display: hqState === 'open' ? 'none' : 'block' }}
-                  className={`w-full h-full object-contain cursor-default select-none transition-all duration-500 ${(!session.is_online && !frame) ? 'filter blur-[4px] brightness-[0.35] grayscale contrast-75' : ''}`}
+                  style={{ display: (hqState === 'open' && !WEBCODECS_H264) ? 'none' : 'block' }}
+                  className={`w-full h-full object-contain cursor-default select-none outline-none transition-all duration-500 ${showDisconnectedOverlay ? 'filter blur-[4px] brightness-[0.35] grayscale contrast-75' : ''}`}
                 />
                 
                 <video
                   ref={videoRef}
+                  tabIndex={0}
                   autoPlay muted playsInline
                   onMouseDown={(e) => handleMouseDown(e, session.id)}
                   onMouseUp={(e) => handleMouseUp(e, session.id)}
-                  onDoubleClick={(e) => handleImageInteraction(e, session.id, 'double')}
+                  onMouseLeave={(e) => handleMouseUp(e, session.id)}
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
                   onWheel={(e) => handleImageWheel(e, session.id)}
-                  style={{ display: hqState === 'open' ? 'block' : 'none' }}
-                  className="w-full h-full object-contain"
+                  style={{ display: (hqState === 'open' && !WEBCODECS_H264) ? 'block' : 'none' }}
+                  className="w-full h-full object-contain outline-none"
                 />
 
-                {/* Overlay Estético de Conexión Perdida (NUEVO) */}
-                {(!session.is_online && !frame) && (
+                {hqEnabled && hqState !== 'open' && wsViewerConnected && connectionFps === 0 && (
+                  <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 max-w-md px-4 py-2 rounded-xl bg-violet-500/15 border border-violet-500/30 text-violet-100 text-xs text-center pointer-events-none">
+                    Modo HD: conectando… Si la pantalla sigue negra, se activará calidad estándar en unos segundos (o desactiva HD).
+                  </div>
+                )}
+
+                {sessionSwitching && (
+                  <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/20 border border-amber-500/30 text-amber-200 text-xs font-bold shadow-lg pointer-events-none">
+                    <div className="animate-spin rounded-full h-4 w-4 border-2 border-amber-400 border-t-transparent" />
+                    Cambiando sesión Windows…
+                  </div>
+                )}
+
+                {showDisconnectedOverlay && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/40 backdrop-blur-[1px] p-6 text-center z-20 animate-in fade-in duration-300">
                     <div className="p-4 rounded-[2rem] border border-red-500/20 bg-red-500/10 text-red-400 animate-bounce mb-3 shadow-2xl shadow-red-500/10">
                       <AlertCircle className="w-8 h-8 animate-pulse text-red-500" />
@@ -2820,9 +4002,18 @@ export default function App() {
                     >
                       {/* Info izquierda */}
                       <div className="flex items-center gap-3">
-                        <span className={`w-2.5 h-2.5 rounded-full ${(session.is_online || frame) ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
+                        <span className={`w-2.5 h-2.5 rounded-full ${hasLiveRemoteVideo ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
                         <span className="text-white font-bold text-sm tracking-tight">{session.device_name || 'Soporte Remoto'}</span>
-                        <span className="text-slate-400 text-xs font-mono bg-slate-800/70 px-2 py-0.5 rounded-md">ID: {session.id}</span>
+                        {deviceAssistLabel(session) ? (
+                          <span className="text-sky-400 text-xs font-mono font-black bg-sky-500/10 border border-sky-500/20 px-2 py-0.5 rounded-md" title="ID de asistencia">
+                            ID: {deviceAssistLabel(session)}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 text-xs font-mono bg-slate-800/70 px-2 py-0.5 rounded-md">#{session.id}</span>
+                        )}
+                        {session.alt_remote_id && (
+                          <span className="text-slate-500 text-[10px] font-mono bg-slate-800/50 px-2 py-0.5 rounded-md">RD: {session.alt_remote_id}</span>
+                        )}
                         <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wider border ${isControlEnabled ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20' : 'bg-amber-500/15 text-amber-400 border-amber-500/20'}`}>
                           {isControlEnabled ? '⚡ Control Activo' : '👁 Solo Observando'}
                         </span>
@@ -2845,9 +4036,9 @@ export default function App() {
                               ? 'bg-violet-600/80 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
                               : 'bg-slate-700/60 border-white/10 text-slate-400 hover:bg-violet-700/50 hover:text-white'
                           }`}
-                          title="Modo Alto Rendimiento: Turbo WebP Canvas a 30 FPS"
+                          title={WEBCODECS_H264 ? 'Stream HD H.264 (WebCodecs, ~24 FPS)' : 'Modo Alto Rendimiento H.264 (JMuxer)'}
                         >
-                          {hqEnabled ? '⚡ HQ ON' : '⚡ Alto Rendimiento'}
+                          {hqEnabled ? (WEBCODECS_H264 ? '⚡ HD ON' : '⚡ HQ ON') : (WEBCODECS_H264 ? '⚡ Stream HD' : '⚡ Alto Rendimiento')}
                         </button>
                         <button
                           onClick={() => setIsControlEnabled(v => !v)}
@@ -3202,7 +4393,7 @@ export default function App() {
         {/* 🔑 MODAL LOGIN SESIÓN WINDOWS */}
         {showLoginModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-md p-4 animate-in fade-in">
-            <div className="w-full max-w-sm p-6 rounded-2xl border border-white/10 glass-dark shadow-2xl flex flex-col gap-5 animate-in slide-in-from-bottom-8">
+            <div className="w-full max-w-[340px] px-5 pt-6 pb-5 rounded-2xl border border-white/10 glass-dark shadow-2xl flex flex-col gap-4 animate-in slide-in-from-bottom-8">
               <div className="flex justify-between items-center">
                 <div>
                   <span className="text-violet-400 font-bold text-[10px] uppercase tracking-widest bg-violet-500/10 px-2 py-0.5 rounded-full">
@@ -3213,20 +4404,20 @@ export default function App() {
                 <button onClick={() => setShowLoginModal(false)} className="text-slate-500 hover:text-white p-1">✕</button>
               </div>
 
-              <div className="flex flex-col gap-3">
+              <div className="flex flex-col gap-4 pt-2">
                 <div>
-                  <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 block">Usuario</label>
+                  <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2 block">Usuario</label>
                   <input
                     type="text"
                     value={loginCreds.username}
                     onChange={e => setLoginCreds(c => ({...c, username: e.target.value}))}
                     placeholder="nombre.usuario"
-                    className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50"
+                    className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-3 text-sm leading-5 text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50"
                     autoFocus
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 block">
+                  <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2 block">
                     Dominio <span className="text-slate-600 font-normal normal-case">(opcional, dejar '.' para local)</span>
                   </label>
                   <input
@@ -3234,7 +4425,7 @@ export default function App() {
                     value={loginCreds.domain}
                     onChange={e => setLoginCreds(c => ({...c, domain: e.target.value}))}
                     placeholder="."
-                    className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50 pr-10"
+                    className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-3 text-sm leading-5 text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50 pr-10"
                   />
                   <button
                     type="button"
@@ -3246,7 +4437,7 @@ export default function App() {
                   </button>
                 </div>
                 <div>
-                  <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1 block">Contraseña</label>
+                  <label className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2 block">Contraseña</label>
                   <div className="relative">
                     <input
                       type={showLoginPassword ? "text" : "password"}
@@ -3255,13 +4446,10 @@ export default function App() {
                       placeholder="••••••••"
                       onKeyDown={e => {
                         if (e.key === 'Enter' && loginCreds.username && loginCreds.password) {
-                          setLoginLoading(true); setLoginError('');
-                          localStorage.setItem('last_remote_username', loginCreds.username);
-                          localStorage.setItem('last_remote_domain', loginCreds.domain);
-                          sendViewerCommand({ type: 'login_session', ...loginCreds });
+                          submitWindowsLogin();
                         }
                       }}
-                      className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50 pr-10"
+                      className="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-3 text-sm leading-5 text-white placeholder:text-slate-600 focus:outline-none focus:border-violet-500/50 pr-10"
                     />
                     <button
                       type="button"
@@ -3290,11 +4478,7 @@ export default function App() {
                   className="flex-1 py-2 rounded-xl text-xs font-bold bg-slate-700 hover:bg-slate-600 text-slate-300 transition-all"
                 >Cancelar</button>
                 <button
-                  onClick={() => {
-                    if (!loginCreds.username || !loginCreds.password) return;
-                    setLoginLoading(true); setLoginError('');
-                    sendViewerCommand({ type: 'login_session', ...loginCreds });
-                  }}
+                  onClick={() => submitWindowsLogin()}
                   disabled={loginLoading || !loginCreds.username || !loginCreds.password}
                   className="flex-1 py-2 rounded-xl text-xs font-bold bg-violet-600 hover:bg-violet-500 text-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
@@ -3307,11 +4491,23 @@ export default function App() {
 
         {/* 🔄 OVERLAY CAMBIO DE SESION */}
         {sessionSwitching && (
-          <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-md animate-in fade-in">
-            <div className="text-center flex flex-col items-center gap-4">
+          <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-950/80 backdrop-blur-md animate-in fade-in p-4">
+            <div className="text-center flex flex-col items-center gap-4 max-w-sm">
               <div className="w-12 h-12 border-4 border-violet-500 border-t-transparent rounded-full animate-spin" />
               <p className="text-white font-bold">Cambiando sesión...</p>
-              <p className="text-slate-400 text-xs">El agente se reconectará en la nueva sesión</p>
+              <p className="text-slate-400 text-xs">El agente se reconectará en la nueva sesión (Consola o RDP)</p>
+              {sessionSwitchError && (
+                <p className="text-amber-300 text-xs bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2">
+                  {sessionSwitchError}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={cancelSessionSwitch}
+                className="mt-2 px-4 py-2 rounded-xl text-xs font-bold bg-slate-700 hover:bg-slate-600 text-slate-200"
+              >
+                Cancelar y volver
+              </button>
             </div>
           </div>
         )}
@@ -3462,6 +4658,7 @@ export default function App() {
             <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Vistas Principales</p>
             <NavItem icon={<Ticket size={20} />} text="Bandeja Unificada" badge={tickets.length > 0 ? tickets.length.toString() : ""} active={activeTab === 'tickets' && selectedArea === null} onClick={() => { setActiveTab('tickets'); setSelectedArea(null); setIsSidebarOpen(false); }} />
             <NavItem icon={<Monitor size={20} />} text="Terminal Remota" badge="En Vivo" active={activeTab === 'monitor'} onClick={() => { setActiveTab('monitor'); setIsSidebarOpen(false); }} />
+            <NavItem icon={<Video size={20} />} text="Agenda" active={activeTab === 'agenda'} onClick={() => { setActiveTab('agenda'); setIsSidebarOpen(false); }} />
             <NavItem icon={<Users size={20} />} text="Base Clientes" active={activeTab === 'clients'} onClick={() => { setActiveTab('clients'); setIsSidebarOpen(false); }} />
           </div>
 
@@ -3481,6 +4678,9 @@ export default function App() {
           <div className="mb-4">
             <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Control Interno</p>
             <NavItem icon={<Activity size={20} />} text="Plantel de Personal" active={activeTab === 'personnel'} onClick={() => { setActiveTab('personnel'); setIsSidebarOpen(false); }} />
+            <NavItem icon={<Smartphone size={20} />} text="Dispositivos Móviles" active={activeTab === 'android_devices'} onClick={() => { setActiveTab('android_devices'); setIsSidebarOpen(false); }} />
+            <NavItem icon={<Clock size={20} />} text="Activaciones OL" active={activeTab === 'acti_pending'} onClick={() => { setActiveTab('acti_pending'); setIsSidebarOpen(false); }} />
+            <NavItem icon={<CalendarDays size={20} />} text="Extensiones OL" active={activeTab === 'extensiones'} onClick={() => { setActiveTab('extensiones'); setIsSidebarOpen(false); }} />
           </div>
 
           <div className="mb-4">
@@ -3565,15 +4765,21 @@ export default function App() {
           </div>
         </header>
 
-        {showNotification && (
-          <div className="fixed top-20 right-8 z-[100] animate-in slide-in-from-right-full">
-            <div className="bg-red-600 text-white px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-4 border border-red-500 ring-4 ring-red-500/10">
-              <Bell className="animate-bounce" />
-              <div>
-                <p className="font-black text-sm uppercase tracking-tighter">Atención Inmediata</p>
-                <p className="text-xs font-bold opacity-90">{showNotification}</p>
+        {toast && (
+          <div className="fixed top-20 right-4 sm:right-8 z-[100] animate-in slide-in-from-right-full max-w-md">
+            <div className={`${TOAST_META[toast.kind].bar} text-white px-5 py-4 rounded-2xl shadow-2xl flex items-start gap-3 border ${TOAST_META[toast.kind].border} ring-4 ${TOAST_META[toast.kind].ring}`}>
+              {toast.kind === 'success' ? (
+                <CheckCircle2 size={22} className="shrink-0 mt-0.5" />
+              ) : toast.kind === 'error' ? (
+                <AlertCircle size={22} className="shrink-0 mt-0.5" />
+              ) : (
+                <Bell size={22} className="shrink-0 mt-0.5" />
+              )}
+              <div className="min-w-0 flex-1">
+                <p className="font-black text-sm uppercase tracking-tighter">{TOAST_META[toast.kind].title}</p>
+                <p className="text-xs font-semibold opacity-95 leading-relaxed break-words">{toast.message}</p>
               </div>
-              <button onClick={() => setShowNotification(null)} className="ml-4 hover:bg-white/20 p-1 rounded-full transition-colors"><X size={16} /></button>
+              <button onClick={() => setToast(null)} className="shrink-0 hover:bg-white/20 p-1 rounded-full transition-colors"><X size={16} /></button>
             </div>
           </div>
         )}
@@ -3612,6 +4818,19 @@ export default function App() {
               </>
             )}
 
+            {activeTab === 'agenda' && (
+              <AgendaPanel
+                darkMode={darkMode}
+                clients={clients}
+                users={users}
+                currentUserId={userProfile?.id}
+                onNotify={(msg) => {
+                  setShowNotification(msg);
+                  setTimeout(() => setShowNotification(null), 3500);
+                }}
+              />
+            )}
+
             {activeTab === 'monitor' && (
               <div className="space-y-8 animate-in slide-in-from-bottom-8">
                 <div className="flex items-end justify-between">
@@ -3646,7 +4865,29 @@ export default function App() {
                           <div className="flex items-start justify-between gap-2">
                             <div>
                               <span className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-widest block">Nombre del Equipo</span>
-                              <span className="text-sm font-black text-white">{dev.device_name}</span>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-sm font-black text-white">{dev.device_name}</span>
+                                {(dev.assist_id) && (
+                                  <span className="text-[11px] font-mono font-black text-sky-400 bg-sky-500/10 px-2 py-0.5 rounded-lg border border-sky-500/20 shadow-sm" title="ID de asistencia (el que dicta el cliente)">
+                                    ID: {formatAssistId(dev.assist_id)}
+                                  </span>
+                                )}
+                                {!dev.assist_id && (
+                                  <span className="text-[10px] font-mono text-slate-500 bg-slate-500/10 px-2 py-0.5 rounded-lg border border-slate-500/20" title="Sin ID de asistencia aún (reconectar agente)">
+                                    #{dev.id}
+                                  </span>
+                                )}
+                                {dev.remote_password && (
+                                  <span className="text-[11px] font-mono font-black text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-lg border border-emerald-500/20 shadow-sm" title="PIN de Conexión">
+                                    PIN: {dev.remote_password}
+                                  </span>
+                                )}
+                                {dev.alt_remote_id && (
+                                  <span className="text-[10px] font-mono text-slate-400 bg-slate-500/10 px-2 py-0.5 rounded-lg border border-slate-500/20" title="ID RustDesk / AnyDesk">
+                                    RD: {dev.alt_remote_id}
+                                  </span>
+                                )}
+                              </div>
                             </div>
                             <div className="flex items-center gap-1.5 shrink-0">
                               <button
@@ -3843,11 +5084,26 @@ export default function App() {
                               const isBusy = dev.current_technician_id !== null;
 
                               return (
-                                <div key={dev.id} className={`p-4 rounded-2xl border transition-all flex items-center justify-between group ${isOnline ? (isBusy ? 'bg-amber-500/5 border-amber-500/20' : 'bg-emerald-500/5 border-emerald-500/20') : 'bg-slate-500/5 border-slate-500/10 grayscale opacity-70'}`}>
-                                  <div className="flex items-center gap-3">
-                                    <div className={`w-3 h-3 rounded-full ${isOnline ? (isBusy ? 'bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.4)]' : 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]') : 'bg-slate-400'}`} />
-                                    <div>
-                                      <div className="text-sm font-extrabold flex items-center gap-2">{dev.device_name}{(telemetry?.remote_password || dev.remote_password) && (<span className="text-[10px] font-mono bg-brand-500/10 text-brand-500 px-2.5 py-0.5 rounded-full flex items-center gap-1 shadow-sm">🔑 {telemetry?.remote_password || dev.remote_password}</span>)}</div>
+                                <div key={dev.id} className={`p-4 rounded-2xl border transition-all flex flex-col gap-3 ${isOnline ? (isBusy ? 'bg-amber-500/5 border-amber-500/20' : 'bg-emerald-500/5 border-emerald-500/20') : 'bg-slate-500/5 border-slate-500/10 grayscale opacity-70'}`}>
+                                  <div className="flex items-start gap-3 min-w-0">
+                                    <div className={`w-3 h-3 rounded-full flex-shrink-0 mt-1 ${isOnline ? (isBusy ? 'bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.4)]' : 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]') : 'bg-slate-400'}`} />
+                                    <div className="min-w-0 flex-1">
+                                      <div className="text-sm font-extrabold flex items-center gap-2 flex-wrap">
+                                        {dev.device_name}
+                                        {(dev.assist_id || telemetry?.assist_id) ? (
+                                          <span className="text-[10px] font-mono bg-sky-500/10 text-sky-400 px-2 py-0.5 rounded-full border border-sky-500/20" title="ID de asistencia">
+                                            ID {formatAssistId(dev.assist_id || telemetry?.assist_id)}
+                                          </span>
+                                        ) : null}
+                                        {dev.alt_remote_id && (
+                                          <span className="text-[9px] font-mono text-slate-500 bg-slate-500/10 px-1.5 py-0.5 rounded-full border border-slate-500/20" title="RustDesk / AnyDesk">
+                                            RD {dev.alt_remote_id}
+                                          </span>
+                                        )}
+                                        {(telemetry?.remote_password || dev.remote_password) && (
+                                          <span className="text-[10px] font-mono bg-brand-500/10 text-brand-500 px-2.5 py-0.5 rounded-full flex items-center gap-1 shadow-sm">🔑 {telemetry?.remote_password || dev.remote_password}</span>
+                                        )}
+                                      </div>
                                       <div className="flex items-center gap-2 text-[9px] uppercase font-bold text-slate-500">
                                         {isOnline ? (
                                           <>CPU: {telemetry?.cpu || 0}% | RAM: {telemetry?.ram || 0}% {telemetry?.agent_version && <span className="text-amber-500 font-extrabold ml-1">V{telemetry.agent_version}</span>}</>
@@ -3914,42 +5170,75 @@ export default function App() {
                                     </div>
                                   </div>
 
-                                  <div className="flex items-center gap-2">
-                                    {isBusy && (
-                                      <div className="flex flex-col items-end mr-2">
-                                        <span className="text-[8px] font-black text-amber-500 uppercase tracking-widest">Ocupado por</span>
-                                        <span className="text-[10px] font-extrabold text-amber-400">{dev.technician_name || 'Técnico'}</span>
-                                        <span className="text-[9px] font-bold text-slate-400">Hace {Math.floor((new Date().getTime() - new Date(dev.session_start).getTime()) / 60000)}m</span>
-                                      </div>
-                                    )}
+                                  {isBusy && (
+                                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] px-1">
+                                      <span className="font-black text-amber-500 uppercase tracking-widest">Ocupado por</span>
+                                      <span className="font-extrabold text-amber-400">{dev.technician_name || 'Técnico'}</span>
+                                      <span className="font-bold text-slate-400">
+                                        hace {Math.floor((new Date().getTime() - new Date(dev.session_start).getTime()) / 60000)}m
+                                      </span>
+                                    </div>
+                                  )}
+
+                                  <div className="flex flex-wrap items-center gap-1.5 justify-end border-t border-white/5 pt-2">
                                   <button
                                     onClick={() => setDeviceNotesModal({ deviceId: dev.id, name: dev.device_name, notes: dev.notes || "" })}
-                                    className={`p-2.5 rounded-xl transition-all shadow-sm ${
+                                    className={`p-2 rounded-lg transition-all shadow-sm ${
                                       dev.notes
                                         ? 'bg-purple-500/20 text-purple-400 hover:bg-purple-500 hover:text-white border border-purple-500/30'
                                         : 'bg-slate-500/10 hover:bg-slate-500 text-slate-400 hover:text-white border border-transparent'
                                     }`}
                                     title="Notas y Recordatorios (Claves Windows, etc.)"
                                   >
-                                    <FileText size={16} />
+                                    <FileText size={14} />
+                                  </button>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleReleaseDeviceSession(dev.id, dev.device_name);
+                                    }}
+                                    className={`p-2 rounded-lg transition-all shadow-sm ${
+                                      isBusy
+                                        ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500 hover:text-white border border-amber-500/30'
+                                        : 'bg-slate-500/10 text-slate-400 hover:bg-amber-500/20 hover:text-amber-300 border border-transparent'
+                                    }`}
+                                    title="Liberar sesión colgada (quita Ocupado por...)"
+                                  >
+                                    <Unlock size={14} />
+                                  </button>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleForceRefreshDevice(dev.id, dev.device_name);
+                                    }}
+                                    disabled={!isOnline}
+                                    className={`p-2 rounded-lg transition-all shadow-sm ${
+                                      isOnline
+                                        ? 'bg-sky-500/10 text-sky-400 hover:bg-sky-500 hover:text-white border border-sky-500/20'
+                                        : 'bg-slate-200 text-slate-400'
+                                    }`}
+                                    title="Forzar refresh del agente (pantalla negra / sin video)"
+                                  >
+                                    <RefreshCw size={14} />
                                   </button>
                                   <button
                                     onClick={() => {
                                       if (isOnline) {
-                                        handleVerifyRemotePassword(dev.id, dev.remote_password);
+                                        handleVerifyRemotePassword(dev.id, telemetry?.remote_password || dev.remote_password || "");
                                       }
                                     }}
                                     disabled={!isOnline}
-                                    className={`p-2.5 rounded-xl transition-all ${isOnline ? 'bg-brand-500 text-white hover:bg-brand-600 shadow-lg shadow-brand-500/20' : 'bg-slate-200 text-slate-400'}`}
+                                    className={`p-2 rounded-lg transition-all ${isOnline ? 'bg-brand-500 text-white hover:bg-brand-600 shadow-lg shadow-brand-500/20' : 'bg-slate-200 text-slate-400'}`}
+                                    title="Conectar control remoto"
                                   >
-                                    <Monitor size={16} />
+                                    <Monitor size={14} />
                                   </button>
                                   <button
                                     onClick={() => handleDeleteDevice(dev.id)}
-                                    className="p-2.5 rounded-xl bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white transition-all shadow-sm"
+                                    className="p-2 rounded-lg bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white transition-all shadow-sm"
                                     title="Eliminar dispositivo (libera cupo)"
                                   >
-                                    <Trash2 size={16} />
+                                    <Trash2 size={14} />
                                   </button>
                                 </div>
                               </div>
@@ -3976,9 +5265,14 @@ export default function App() {
                       onClick={async () => {
                         setIsSyncing(true);
                         try {
-                          await syncClientsFromDbf();
-                          setShowNotification("¡Clientes sincronizados con CLIGESCO.DBF!");
-                          setTimeout(() => setShowNotification(null), 3000);
+                          const res = await syncClientsFromDbf();
+                          const n = res?.saldos?.updated;
+                          setShowNotification(
+                            n != null
+                              ? `Sync OK: CLIGESCO + ${n} saldos desde Clientes:CSaldo`
+                              : "¡Clientes sincronizados (DBF + saldos ERP)!"
+                          );
+                          setTimeout(() => setShowNotification(null), 4000);
                           loadData();
                         } catch (err: any) {
                           alert(err.message || "Error al sincronizar");
@@ -3993,7 +5287,7 @@ export default function App() {
                       {isSyncing ? 'Sincronizando...' : 'Sincronizar ERP'}
                     </button>
                     <button onClick={() => openClientModal()} className="w-full sm:w-auto bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2.5 rounded-xl font-bold shadow-lg transition-all hover:-translate-y-1 text-center text-xs sm:text-sm">
-                      + Nueva Empresa
+                      + Alta cliente
                     </button>
                   </div>
                 </div>
@@ -4023,52 +5317,238 @@ export default function App() {
                 <div className={`rounded-2xl border p-1 shadow-sm mt-6 ${darkMode ? 'glass-dark border-dark-border' : 'bg-white border-slate-200'}`}>
                   <div className="p-5 flex flex-col sm:flex-row gap-4 sm:items-center justify-between border-b dark:border-dark-border/50">
                     <h2 className="text-lg font-bold">Empresas Registradas</h2>
-                    <div className="relative w-full sm:w-80">
-                      <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                      <input
-                        type="text"
-                        placeholder="Buscar por nombre, código, CUIT o localidad..."
-                        value={clientSearchTerm}
-                        onChange={e => setClientSearchTerm(e.target.value)}
-                        className={`w-full pl-9 pr-4 py-2 rounded-xl text-sm border outline-none focus:ring-2 focus:ring-brand-500 ${darkMode ? 'bg-dark-bg border-dark-border text-white' : 'bg-slate-50 border-slate-200'}`}
-                      />
+                    <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                      <div className="relative w-full sm:w-72">
+                        <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                        <input
+                          type="text"
+                          placeholder="Buscar por nombre, código, CUIT o localidad..."
+                          value={clientSearchTerm}
+                          onChange={e => setClientSearchTerm(e.target.value)}
+                          className={`w-full pl-9 pr-4 py-2 rounded-xl text-sm border outline-none focus:ring-2 focus:ring-brand-500 ${darkMode ? 'bg-dark-bg border-dark-border text-white' : 'bg-slate-50 border-slate-200'}`}
+                        />
+                      </div>
                     </div>
                   </div>
-                  <div className="p-4">
-                    <div className="hidden md:grid grid-cols-12 gap-4 pb-3 border-b border-slate-100 dark:border-dark-border/50 text-xs font-bold text-slate-400 tracking-wider uppercase">
-                      <div className="col-span-1 pl-2">CÓD.</div>
-                      <div className="col-span-3">Razón Social / Fantasía</div>
-                      <div className="col-span-2">CUIT / Email</div>
-                      <div className="col-span-2">Módulos / Apollo</div>
-                      <div className="col-span-2 text-right pr-4">Saldo ERP</div>
-                      <div className="col-span-2 text-right pr-4">Estado / Acciones</div>
-                    </div>
-                    <div className="space-y-2 mt-2">
-                      {clients
+                  <div className="px-5 py-3 flex flex-wrap gap-2 border-b dark:border-dark-border/50">
+                    {(() => {
+                      const visibleCodes = clients
                         .filter(c => {
                           const term = clientSearchTerm.toLowerCase();
-                          return (
+                          const code4 = c.codigo ? String(c.codigo).trim().padStart(4, '0') : '';
+                          const textOk = (
                             (c.razon_social || '').toLowerCase().includes(term) ||
                             (c.nombre_fantasia || '').toLowerCase().includes(term) ||
                             (c.codigo || '').toLowerCase().includes(term) ||
                             (c.cclifac || '').toLowerCase().includes(term) ||
                             (c.identificador_fiscal || '').toLowerCase().includes(term) ||
-                            (c.localidad || '').toLowerCase().includes(term)
+                            (c.localidad || '').toLowerCase().includes(term) ||
+                            (c.clasificacion_codigo || '').toLowerCase().includes(term) ||
+                            (c.clasificacion_nombre || '').toLowerCase().includes(term)
                           );
+                          return textOk && clientMatchesCartelFilter(code4) && clientMatchesEstadoFilter(c);
+                        })
+                        .map((c: any) => c.codigo ? String(c.codigo).trim().padStart(4, '0') : '')
+                        .filter(Boolean);
+                      const btn = `px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wide border transition-all ${darkMode ? 'border-white/10 bg-white/5 hover:bg-white/10 text-slate-200' : 'border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700'}`;
+                      return (
+                        <>
+                          <button type="button" className={btn} onClick={() => setSelectedClientCodes(visibleCodes)} title="Marcar todos los filtrados">Todo</button>
+                          <button type="button" className={btn} onClick={() => setSelectedClientCodes([])}>Nada</button>
+                          <button type="button" className={btn} onClick={() => {
+                            setSelectedClientCodes(prev => {
+                              const set = new Set(prev);
+                              return visibleCodes.filter(code => !set.has(code)).concat(prev.filter(code => !visibleCodes.includes(code) && set.has(code)));
+                            });
+                          }}>Invierte</button>
+                          <select
+                            value={cartelFilter}
+                            onChange={e => setCartelFilter(e.target.value)}
+                            title="Filtrar por tipo de cartel"
+                            className={`${btn} max-w-[200px] normal-case font-bold`}
+                          >
+                            <option value="all">Cartel: todos</option>
+                            <option value="con">Con cartel</option>
+                            <option value="sin">Sin cartel</option>
+                            {erpTemplates.filter((t: any) => Number(t.m_num ?? t.id) > 1).map((t: any) => (
+                              <option key={t.m_num ?? t.id} value={String(t.m_num ?? t.id)}>
+                                Tipo {t.m_num ?? t.id} — {t.m_des || t.label || 'Aviso'}
+                              </option>
+                            ))}
+                          </select>
+                          <select
+                            value={estadoCtaFilter}
+                            onChange={e => setEstadoCtaFilter(e.target.value)}
+                            title="Filtrar por estado de cuenta corriente (ClasiCli)"
+                            className={`${btn} max-w-[220px] normal-case font-bold`}
+                          >
+                            <option value="all">Estado Cta: todos</option>
+                            <option value="sin">Sin estado</option>
+                            {estadosCta.filter((e: any) => e.activo !== false).map((e: any) => (
+                              <option key={e.codigo} value={normalizeEstadoCodigo(e.codigo)}>
+                                {e.codigo} — {e.descripcion}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            className={`${btn} ${selectedClientCodes.length ? 'text-amber-400 border-amber-500/30' : 'opacity-50'}`}
+                            disabled={selectedClientCodes.length === 0}
+                            title="Cartel / corte completo (GesActi Monitoreo)"
+                            onClick={() => {
+                              if (selectedClientCodes.length === 0) return;
+                              loadErpTemplates();
+                              const tipFromFilter = /^\d+$/.test(cartelFilter) ? parseInt(cartelFilter, 10) : 1;
+                              const modes = selectedClientCodes.flatMap(code => {
+                                const s = licensePanelSummary[code] || {};
+                                return Array.isArray(s.showmodes) && s.showmodes.length
+                                  ? s.showmodes
+                                  : (s.m_showmode ? [s.m_showmode] : []);
+                              });
+                              const uniqueModes = Array.from(new Set(modes.filter(Boolean)));
+                              // Preferir demora única de los marcados; si mezclan, dejar 15s (03) como default operativo
+                              const preferredMode = uniqueModes.length === 1
+                                ? String(uniqueModes[0]).padStart(2, '0')
+                                : (uniqueModes.includes('04') ? '04' : uniqueModes.includes('03') ? '03' : uniqueModes.includes('05') ? '05' : '03');
+                              setBannerForm({
+                                serial: '',
+                                client_codes: selectedClientCodes,
+                                m_down: false,
+                                m_newdate: '',
+                                m_tipmsg: tipFromFilter > 1 ? tipFromFilter : 1,
+                                m_showmode: preferredMode,
+                                m_text: ''
+                              });
+                              setShowBannerConfigModal(true);
+                            }}
+                          >
+                            Monitoreo ({selectedClientCodes.length})
+                          </button>
+                          <button
+                            type="button"
+                            className={`${btn} ${selectedClientCodes.length ? 'text-emerald-400 border-emerald-500/30' : 'opacity-50'}`}
+                            disabled={selectedClientCodes.length === 0}
+                            title="Quitar cartel (m_tipmsg=1) a los marcados"
+                            onClick={() => applyBulkCartelToMarked(1)}
+                          >
+                            Quitar carteles
+                          </button>
+                          <select
+                            disabled={selectedClientCodes.length === 0}
+                            defaultValue=""
+                            title="Poner un tipo de cartel a los marcados"
+                            className={`${btn} ${selectedClientCodes.length ? 'text-amber-300 border-amber-500/30' : 'opacity-50'} max-w-[220px] normal-case font-bold`}
+                            onChange={e => {
+                              const v = parseInt(e.target.value, 10);
+                              e.target.value = '';
+                              if (v > 1) applyBulkCartelToMarked(v);
+                            }}
+                          >
+                            <option value="">Poner cartel a marcados…</option>
+                            {erpTemplates.filter((t: any) => Number(t.m_num ?? t.id) > 1).map((t: any) => (
+                              <option key={t.m_num ?? t.id} value={String(t.m_num ?? t.id)}>
+                                {t.m_num ?? t.id} — {t.m_des || t.label || 'Aviso'}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            className={`${btn} text-amber-300`}
+                            title="Catálogo de carteles de aviso (misi_messages)"
+                            onClick={() => {
+                              loadErpTemplates();
+                              setAvisoEdit({ m_num: 0, m_des: '', m_text: '' });
+                              setShowAvisosCatalog(true);
+                            }}
+                          >
+                            Catálogo
+                          </button>
+                          <button
+                            type="button"
+                            className={`${btn} text-teal-300`}
+                            title="ABM Estados de Cuenta Corriente (ClasiCli ERP)"
+                            onClick={() => {
+                              loadEstadosCta(false);
+                              setEstadoCtaEdit({ codigo: '', descripcion: '', activo: true });
+                              setShowEstadosCtaModal(true);
+                            }}
+                          >
+                            Estados Cta
+                          </button>
+                          <span className="text-[10px] text-slate-500 self-center ml-auto font-mono">
+                            {selectedClientCodes.length} marcados · {visibleCodes.length} visibles
+                          </span>
+                        </>
+                      );
+                    })()}
+                  </div>
+                  <div className="p-4">
+                    <div className="hidden md:grid grid-cols-12 gap-3 pb-3 border-b border-slate-100 dark:border-dark-border/50 text-xs font-bold text-slate-400 tracking-wider uppercase">
+                      <div className="col-span-1 pl-2">Sel / Cód.</div>
+                      <div className="col-span-2">Razón Social / Fantasía</div>
+                      <div className="col-span-2"># Lic / Cortado / Cartel · demora</div>
+                      <div className="col-span-1">Estado Cta</div>
+                      <div className="col-span-1 text-right">Saldo ERP</div>
+                      <div className="col-span-1 text-right">Últ. Pago</div>
+                      <div className="col-span-2">CUIT / Email</div>
+                      <div className="col-span-2 text-right pr-2">Acciones</div>
+                    </div>
+                    <div className="space-y-2 mt-2">
+                      {clients
+                        .filter(c => {
+                          const term = clientSearchTerm.toLowerCase();
+                          const code4 = c.codigo ? String(c.codigo).trim().padStart(4, '0') : '';
+                          const textOk = (
+                            (c.razon_social || '').toLowerCase().includes(term) ||
+                            (c.nombre_fantasia || '').toLowerCase().includes(term) ||
+                            (c.codigo || '').toLowerCase().includes(term) ||
+                            (c.cclifac || '').toLowerCase().includes(term) ||
+                            (c.identificador_fiscal || '').toLowerCase().includes(term) ||
+                            (c.localidad || '').toLowerCase().includes(term) ||
+                            (c.clasificacion_codigo || '').toLowerCase().includes(term) ||
+                            (c.clasificacion_nombre || '').toLowerCase().includes(term)
+                          );
+                          return textOk && clientMatchesCartelFilter(code4) && clientMatchesEstadoFilter(c);
                         })
                         .map((c: any) => {
                           const isExpired = c.fecha_vencimiento && new Date(c.fecha_vencimiento) < new Date();
                           const formattedSaldo = new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(c.saldo || 0);
                           const isSaldoPendiente = (c.saldo || 0) > 0;
                           
+                          const code4 = c.codigo ? String(c.codigo).trim().padStart(4, '0') : '';
+                          const licSum = licensePanelSummary[code4] || licensePanelSummary[c.codigo] || {};
+                          const isMarked = selectedClientCodes.includes(code4);
+                          const tipLabel = licSum.cartel
+                            ? `${licSum.m_tipmsg || '?'}${licSum.m_tipmsg_des ? ` · ${String(licSum.m_tipmsg_des).slice(0, 14)}` : ''}`
+                            : '—';
+                          const demoraModes: string[] = Array.isArray(licSum.showmodes) && licSum.showmodes.length
+                            ? licSum.showmodes
+                            : (licSum.m_showmode ? [licSum.m_showmode] : []);
+                          const demoraLabel = licSum.cartel
+                            ? (demoraModes.length
+                              ? Array.from(new Set(demoraModes.map((m: string) => formatShowmodeLabel(m)).filter(Boolean))).join('/')
+                              : '—')
+                            : '';
+                          
                           return (
                             <div key={c.id} className={`
-                              flex flex-col md:grid md:grid-cols-12 gap-3 md:gap-4 p-4 md:p-3.5 rounded-2xl items-start md:items-center
-                              ${darkMode ? 'hover:bg-slate-800/60 bg-white/[0.01] border border-white/5 md:border-transparent md:bg-transparent' : 'hover:bg-slate-50 bg-slate-50/50 border border-slate-100 md:border-transparent md:bg-transparent'}
+                              flex flex-col md:grid md:grid-cols-12 gap-3 md:gap-3 p-4 md:p-3.5 rounded-2xl items-start md:items-center
+                              ${isMarked ? (darkMode ? 'bg-amber-500/10 border border-amber-500/20' : 'bg-amber-50 border border-amber-200') : ''}
+                              ${!isMarked && (darkMode ? 'hover:bg-slate-800/60 bg-white/[0.01] border border-white/5 md:border-transparent md:bg-transparent' : 'hover:bg-slate-50 bg-slate-50/50 border border-slate-100 md:border-transparent md:bg-transparent')}
                               w-full
                             `}>
                               <div className="flex justify-between items-center w-full md:w-auto md:col-span-1">
-                                <div className="flex flex-col items-start gap-0.5">
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={isMarked}
+                                    onChange={() => {
+                                      setSelectedClientCodes(prev => isMarked ? prev.filter(x => x !== code4) : [...prev, code4]);
+                                    }}
+                                    className="w-4 h-4 accent-amber-500 cursor-pointer"
+                                    title="Marcar para Monitoreo (como ENTER en GesActi)"
+                                  />
+                                  <div className="flex flex-col items-start gap-0.5">
                                   <span className="text-[10px] font-mono font-bold bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-400 px-1.5 py-0.5 rounded" title="Código de Cliente ERP">
                                     {c.codigo || `-`}
                                   </span>
@@ -4078,9 +5558,10 @@ export default function App() {
                                     </span>
                                   )}
                                 </div>
+                                </div>
                                 <span className="md:hidden text-[9px] font-bold px-2 py-0.5 rounded bg-brand-500/10 text-brand-500">CLIENTE</span>
                               </div>
-                              <div className="md:col-span-3 truncate w-full">
+                              <div className="md:col-span-2 truncate w-full">
                                 <div className="text-sm font-bold text-slate-800 dark:text-white leading-tight truncate" title={c.razon_social}>
                                   {c.razon_social}
                                 </div>
@@ -4097,29 +5578,56 @@ export default function App() {
                                   )}
                                 </div>
                               </div>
-                              <div className="flex flex-col w-full md:block md:col-span-2">
-                                <span className="md:hidden text-[10px] font-bold text-slate-400 uppercase">CUIT / Contacto:</span>
-                                <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-300 truncate font-mono">
-                                  {c.identificador_fiscal || 'SIN CUIT'}
-                                </div>
-                                <div className="text-[10px] text-slate-400 truncate mt-0.5">
-                                  {c.email || 'sin-email@dominio.com'}
+                              <div className="flex flex-col md:block md:col-span-2 gap-1 w-full">
+                                <span className="md:hidden text-[10px] font-bold text-slate-400 uppercase">Licencias GesActi:</span>
+                                <div className="flex flex-wrap items-center gap-1.5 md:justify-start">
+                                  <span className="text-[10px] font-mono font-black text-slate-600 dark:text-slate-300" title="Cantidad de seriales">
+                                    {licSum.lic_total != null ? licSum.lic_total : '—'} lic
+                                  </span>
+                                  <span
+                                    className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase ${licSum.cortado ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' : 'bg-slate-100 dark:bg-white/5 text-slate-500'}`}
+                                    title={licSum.lic_cortadas ? `${licSum.lic_cortadas} seriales con m_down` : 'Sin corte'}
+                                  >
+                                    {licSum.cortado ? 'Cortado' : 'Ok'}
+                                  </span>
+                                  <span
+                                    className={`text-[9px] font-black px-1.5 py-0.5 rounded uppercase max-w-[140px] truncate ${licSum.cartel ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' : 'bg-slate-100 dark:bg-white/5 text-slate-500'}`}
+                                    title={
+                                      licSum.cartel
+                                        ? `Tipo ${licSum.m_tipmsg}${licSum.m_tipmsg_des ? ` — ${licSum.m_tipmsg_des}` : ''} · ${licSum.lic_cartel || 0} serial(es)`
+                                          + (Array.isArray(licSum.tipmsgs) && licSum.tipmsgs.length > 1 ? ` · tipos: ${licSum.tipmsgs.join(', ')}` : '')
+                                          + (demoraLabel ? ` · demora: ${demoraLabel}` : '')
+                                        : 'Sin cartel'
+                                    }
+                                  >
+                                    {tipLabel}
+                                  </span>
+                                  {licSum.cartel && demoraLabel && (
+                                    <span
+                                      className="text-[9px] font-black px-1.5 py-0.5 rounded font-mono bg-sky-500/15 text-sky-300 border border-sky-500/25"
+                                      title={`Modo de muestra (m_showmode): ${demoraModes.join(', ')} — uso habitual 15/30/180 s`}
+                                    >
+                                      {demoraLabel}
+                                    </span>
+                                  )}
                                 </div>
                               </div>
-                              <div className="flex flex-col md:block md:col-span-2 gap-1.5 w-full">
-                                <span className="md:hidden text-[10px] font-bold text-slate-400 uppercase">Módulos:</span>
-                                <div className="flex flex-wrap gap-1">
-                                  {c.modulos?.split(',').map((m: string) => (
-                                    <span key={m} className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5 text-slate-500 border dark:border-white/5 uppercase">{m.trim()}</span>
-                                  ))}
-                                </div>
-                                {c.version_apollo && (
-                                  <div className="text-[9px] text-brand-400 font-bold mt-1">
-                                    V. APOLLO: {c.version_apollo}
+                              <div className="flex justify-between items-center w-full md:block md:col-span-1 mt-1 md:mt-0">
+                                <span className="md:hidden text-[10px] font-bold text-slate-400 uppercase">Estado Cta:</span>
+                                {c.clasificacion_codigo || c.clasificacion_nombre ? (
+                                  <div className="min-w-0">
+                                    <div className="text-[10px] font-mono font-black text-teal-400 truncate" title={c.clasificacion_codigo}>
+                                      {normalizeEstadoCodigo(c.clasificacion_codigo) || '—'}
+                                    </div>
+                                    <div className="text-[9px] text-slate-400 truncate max-w-[110px]" title={c.clasificacion_nombre || ''}>
+                                      {c.clasificacion_nombre || '—'}
+                                    </div>
                                   </div>
+                                ) : (
+                                  <span className="text-[10px] text-slate-500">—</span>
                                 )}
                               </div>
-                              <div className="flex justify-between items-center w-full md:block md:col-span-2 md:text-right pr-4 mt-1 md:mt-0">
+                              <div className="flex justify-between items-center w-full md:block md:col-span-1 md:text-right mt-1 md:mt-0">
                                 <span className="md:hidden text-[10px] font-bold text-slate-400 uppercase font-mono">Saldo:</span>
                                 <div className="flex items-center gap-1.5 md:justify-end">
                                   <div className={`text-sm font-black font-mono leading-tight ${isSaldoPendiente ? 'text-rose-500 dark:text-rose-400' : 'text-emerald-500 dark:text-emerald-400'}`}>
@@ -4134,7 +5642,7 @@ export default function App() {
                                       }
                                       try {
                                         const res = await getClientBalance(c.id);
-                                        setClients(prev => prev.map(cl => cl.id === c.id ? { ...cl, saldo: res.saldo_real_erp } : cl));
+                                        setClients(prev => prev.map(cl => cl.id === c.id ? { ...cl, saldo: res.saldo_real_erp, fecha_ultimo_pago: res.fecha_ultimo_pago ?? cl.fecha_ultimo_pago } : cl));
                                         setShowNotification(`Saldo real ERP actualizado: ${new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(res.saldo_real_erp)}`);
                                         setTimeout(() => setShowNotification(null), 3500);
                                       } catch (err: any) {
@@ -4142,24 +5650,49 @@ export default function App() {
                                       }
                                     }}
                                     className="p-1 hover:bg-slate-100 dark:hover:bg-white/10 rounded text-indigo-400 hover:text-brand-500 transition-colors"
-                                    title="Sincronizar saldo en vivo desde el ERP"
+                                    title="Sincronizar saldo y último pago desde el ERP"
                                   >
                                     <Sparkles size={11} className="text-brand-500 animate-pulse" />
                                   </button>
                                 </div>
-                                {c.fecha_ultimo_pago && (
-                                  <div className="text-[9px] text-slate-400 mt-0.5">
-                                    Últ. Pago: {new Date(c.fecha_ultimo_pago).toLocaleDateString()}
-                                  </div>
-                                )}
+                              </div>
+                              <div className="flex justify-between items-center w-full md:block md:col-span-1 md:text-right mt-1 md:mt-0">
+                                <span className="md:hidden text-[10px] font-bold text-slate-400 uppercase">Últ. pago:</span>
+                                <div className={`text-xs font-bold font-mono ${c.fecha_ultimo_pago ? 'text-slate-700 dark:text-slate-200' : 'text-slate-400'}`} title="Fecha de último pago (CULPA)">
+                                  {formatFechaLocal(c.fecha_ultimo_pago) || '—'}
+                                </div>
+                              </div>
+                              <div className="flex flex-col w-full md:block md:col-span-2">
+                                <span className="md:hidden text-[10px] font-bold text-slate-400 uppercase">CUIT / Contacto:</span>
+                                <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-300 truncate font-mono">
+                                  {c.identificador_fiscal || 'SIN CUIT'}
+                                </div>
+                                <div className="text-[10px] text-slate-400 truncate mt-0.5">
+                                  {c.email || 'sin-email@dominio.com'}
+                                </div>
                               </div>
                               <div className="flex justify-between items-center w-full md:col-span-2 md:justify-end gap-2 border-t md:border-t-0 border-slate-100 dark:border-white/5 pt-2 md:pt-0 mt-1 md:mt-0">
                                 <button
-                                  onClick={async () => { await toggleClientStatus(c.id); loadData(); }}
-                                  className={`px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase transition-all ${c.activo ? 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20' : 'bg-red-500/10 text-red-500 hover:bg-red-500/20'}`}
+                                  onClick={() => {
+                                    openClientModal(c);
+                                    setClientActiveTab('erp_licensing');
+                                  }}
+                                  className="flex items-center gap-1 p-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 rounded-xl transition-all text-[10px] font-black uppercase"
+                                  title="Licencias (GesActi)"
                                 >
-                                  {c.activo ? 'Activo' : 'Suspendido'}
+                                  <Key size={13} />
+                                  <span className="hidden xl:inline">Licencias</span>
                                 </button>
+                                {c.cclifac && (
+                                  <button
+                                    onClick={() => handleOpenLicFacturadas(c)}
+                                    className="flex items-center gap-1 p-2 bg-teal-500/10 hover:bg-teal-500/20 text-teal-400 border border-teal-500/20 rounded-xl transition-all"
+                                    title="Licencias facturadas (LisArtC)"
+                                  >
+                                    <DollarSign size={14} />
+                                    <span className="hidden xl:inline text-[10px] font-black uppercase">Lic Fac</span>
+                                  </button>
+                                )}
                                 {c.cclifac && (
                                   <button
                                     onClick={() => handleOpenExtracto(c)}
@@ -4659,7 +6192,9 @@ export default function App() {
                       >
                         <option value="all">🖥️ Todos los Equipos</option>
                         {clients.flatMap(c => c.devices || []).map((dev: any) => (
-                          <option key={dev.id} value={dev.id}>🖥️ {dev.device_name} (ID: {dev.id})</option>
+                          <option key={dev.id} value={dev.id}>
+                            🖥️ {dev.device_name}{deviceAssistLabel(dev) ? ` (ID: ${deviceAssistLabel(dev)})` : ` (#${dev.id})`}
+                          </option>
                         ))}
                       </select>
                     </div>
@@ -4811,6 +6346,569 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            {/* ====================================================== */}
+            {/* SECCIÓN: DISPOSITIVOS MÓVILES ANDROID                  */}
+            {/* ====================================================== */}
+            {activeTab === 'android_devices' && (
+              <div className="space-y-6 animate-in slide-in-from-bottom-8">
+
+                {/* Cabecera */}
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div>
+                    <h1 className="text-4xl font-extrabold tracking-tight flex items-center gap-3">
+                      <Smartphone className="text-emerald-400" size={36} />
+                      Dispositivos Móviles
+                      {androidSummaryLoading && (
+                        <span className="relative flex h-3 w-3 ml-1">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                        </span>
+                      )}
+                    </h1>
+                    <p className="text-slate-400 mt-1.5">
+                      Control de licencias móviles y web (TCK en PC) por cliente y aplicación · {androidSummary.length} clientes con dispositivos registrados
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => { setAndroidSelectedClient(null); loadAndroidSummary(); }}
+                    className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs px-4 py-3 rounded-2xl border border-white/5 transition-all shadow-md cursor-pointer"
+                  >
+                    🔄 Actualizar
+                  </button>
+                </div>
+
+                {/* KPI Cards */}
+                {(() => {
+                  const totalHab = androidSummary.reduce((a, c) => a + (c.total_habilitados || 0), 0);
+                  const totalDev = androidSummary.reduce((a, c) => a + (c.total_dispositivos || 0), 0);
+                  const totalClientes = androidSummary.length;
+                  // Contar por app
+                  const appCounts: Record<string, number> = {};
+                  androidSummary.forEach(c => {
+                    Object.entries(c.apps || {}).forEach(([app, info]: [string, any]) => {
+                      appCounts[app] = (appCounts[app] || 0) + (info.habilitados || 0);
+                    });
+                  });
+                  const topApps = Object.entries(appCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+                  return (
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className={`p-5 rounded-2xl border ${darkMode ? 'bg-slate-900 border-white/5' : 'bg-white border-slate-200'} flex flex-col gap-1`}>
+                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Clientes</span>
+                        <span className="text-3xl font-black text-white">{totalClientes}</span>
+                        <span className="text-[10px] text-slate-500">con dispositivos registrados</span>
+                      </div>
+                      <div className={`p-5 rounded-2xl border ${darkMode ? 'bg-slate-900 border-white/5' : 'bg-white border-slate-200'} flex flex-col gap-1`}>
+                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Total Dispositivos</span>
+                        <span className="text-3xl font-black text-white">{totalDev}</span>
+                        <span className="text-[10px] text-slate-500">registros totales en BD</span>
+                      </div>
+                      <div className={`p-5 rounded-2xl border ${darkMode ? 'bg-emerald-500/5 border-emerald-500/20' : 'bg-emerald-50 border-emerald-200'} flex flex-col gap-1`}>
+                        <span className="text-[10px] font-black text-emerald-400 uppercase tracking-widest">Habilitados</span>
+                        <span className="text-3xl font-black text-emerald-400">{totalHab}</span>
+                        <span className="text-[10px] text-slate-500">activos actualmente</span>
+                      </div>
+                      <div className={`p-5 rounded-2xl border ${darkMode ? 'bg-slate-900 border-white/5' : 'bg-white border-slate-200'} flex flex-col gap-2`}>
+                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Top Apps</span>
+                        {topApps.map(([app, count]) => (
+                          <div key={app} className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-slate-300">{app}</span>
+                            <span className="text-xs font-black text-white bg-slate-800 px-2 py-0.5 rounded-lg">{count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Layout de dos columnas: tabla izquierda + detalle derecha */}
+                <div className={`flex flex-col lg:flex-row gap-5 ${androidSelectedClient ? 'lg:items-start' : ''}`}>
+
+                  {/* Tabla de clientes */}
+                  <div className={`${androidSelectedClient ? 'lg:w-2/5' : 'w-full'} transition-all duration-300`}>
+                    <div className={`rounded-[1.75rem] border shadow-xl overflow-hidden ${darkMode ? 'bg-slate-900 border-white/5' : 'bg-white border-slate-200'}`}>
+                      {/* Buscador */}
+                      <div className="p-4 border-b border-white/5">
+                        <div className="relative">
+                          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                          <input
+                            type="text"
+                            value={androidSearchTerm}
+                            onChange={e => setAndroidSearchTerm(e.target.value)}
+                            placeholder="Buscar cliente por código o razón social..."
+                            className={`w-full pl-9 pr-4 py-2.5 rounded-xl text-xs font-semibold outline-none border transition-all ${darkMode ? 'bg-black/30 border-white/10 text-white focus:border-emerald-500' : 'bg-slate-50 border-slate-200 text-slate-700'}`}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="border-b border-white/5 bg-black/20 text-[10px] uppercase font-black tracking-wider text-slate-400">
+                              <th className="py-3 px-4">Cliente</th>
+                              <th className="py-3 px-3 text-center">PRV</th>
+                              <th className="py-3 px-3 text-center">ROU</th>
+                              <th className="py-3 px-3 text-center">FIR</th>
+                              <th className="py-3 px-3 text-center">INV</th>
+                              <th className="py-3 px-3 text-center">FRA</th>
+                              <th className="py-3 px-3 text-center">Otros</th>
+                              <th className="py-3 px-3 text-center">Total</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5">
+                            {androidSummaryLoading && androidSummary.length === 0 ? (
+                              <tr><td colSpan={8} className="py-12 text-center text-slate-500">
+                                <div className="flex flex-col items-center gap-3">
+                                  <div className="animate-spin rounded-full h-7 w-7 border-4 border-emerald-500 border-t-transparent" />
+                                  <span>Cargando dispositivos...</span>
+                                </div>
+                              </td></tr>
+                            ) : (() => {
+                              const filtered = androidSummary.filter(c => {
+                                const term = androidSearchTerm.toLowerCase();
+                                if (!term) return true;
+                                const clientData = clients.find((cl: any) => cl.codigo === c.client_code);
+                                const razon = clientData?.razon_social?.toLowerCase() || '';
+                                return c.client_code?.toLowerCase().includes(term) || razon.includes(term);
+                              });
+
+                              if (filtered.length === 0) {
+                                return <tr><td colSpan={8} className="py-10 text-center text-slate-500 italic text-xs">No se encontraron clientes con los filtros aplicados.</td></tr>;
+                              }
+
+                              const MAIN_APPS = ['PRV', 'ROU', 'FIR', 'INV', 'FRA'];
+
+                              return filtered
+                                .sort((a, b) => (b.total_habilitados || 0) - (a.total_habilitados || 0))
+                                .map((row: any) => {
+                                  const clientData = clients.find((cl: any) => cl.codigo === row.client_code);
+                                  const razon = clientData?.razon_social || `Cliente ${row.client_code}`;
+                                  const isSelected = androidSelectedClient?.client_code === row.client_code;
+
+                                  const getAppCount = (app: string) => {
+                                    const info = row.apps?.[app];
+                                    return info ? info.habilitados : 0;
+                                  };
+
+                                  const otrosCount = Object.entries(row.apps || {})
+                                    .filter(([app]: [string, any]) => !MAIN_APPS.includes(app))
+                                    .reduce((sum: number, [, info]: [string, any]) => sum + ((info as any).habilitados || 0), 0);
+
+                                  return (
+                                    <tr
+                                      key={row.client_code}
+                                      onClick={() => {
+                                        setAndroidSelectedClient(row);
+                                        setAndroidFilterApp('all');
+                                        setAndroidFilterHabilitado('all');
+                                        loadAndroidClientDevices(row.client_code);
+                                      }}
+                                      className={`cursor-pointer transition-all duration-150 hover:bg-emerald-500/5 ${isSelected ? 'bg-emerald-500/10 border-l-2 border-emerald-500' : ''}`}
+                                    >
+                                      <td className="py-3 px-4">
+                                        <div className="font-bold text-white leading-tight">{razon.length > 30 ? razon.substring(0, 28) + '…' : razon}</div>
+                                        <div className="text-[10px] text-slate-500 font-mono mt-0.5">Cód: {row.client_code}</div>
+                                        {row.ultimo_acceso && (
+                                          <div className="text-[9px] text-slate-600 mt-0.5">
+                                            Últ: {new Date(row.ultimo_acceso).toLocaleDateString('es-AR')}
+                                          </div>
+                                        )}
+                                      </td>
+                                      {MAIN_APPS.map(app => (
+                                        <td key={app} className="py-3 px-3 text-center">
+                                          {getAppCount(app) > 0 ? (
+                                            <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-emerald-500/15 text-emerald-400 font-black text-xs border border-emerald-500/20">
+                                              {getAppCount(app)}
+                                            </span>
+                                          ) : (
+                                            <span className="text-slate-700 text-xs">—</span>
+                                          )}
+                                        </td>
+                                      ))}
+                                      <td className="py-3 px-3 text-center">
+                                        {otrosCount > 0 ? (
+                                          <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-amber-500/15 text-amber-400 font-black text-xs border border-amber-500/20">{otrosCount}</span>
+                                        ) : <span className="text-slate-700">—</span>}
+                                      </td>
+                                      <td className="py-3 px-3 text-center">
+                                        <span className={`inline-flex items-center justify-center h-7 px-2.5 rounded-full font-black text-xs ${row.total_habilitados > 0 ? 'bg-white/10 text-white' : 'bg-slate-800 text-slate-500'}`}>
+                                          {row.total_habilitados}
+                                        </span>
+                                      </td>
+                                    </tr>
+                                  );
+                                });
+                            })()}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Panel de detalle del cliente seleccionado */}
+                  {androidSelectedClient && (
+                    <div className="lg:flex-1 animate-in slide-in-from-right-4">
+                      <div className={`rounded-[1.75rem] border shadow-xl overflow-hidden ${darkMode ? 'bg-slate-900 border-emerald-500/20' : 'bg-white border-emerald-200'}`}>
+                        {/* Header del panel */}
+                        <div className="p-5 border-b border-white/5 flex items-start justify-between gap-3">
+                          <div>
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="text-xs font-mono bg-emerald-500/15 text-emerald-400 px-2 py-0.5 rounded-lg border border-emerald-500/20">
+                                COD: {androidSelectedClient.client_code}
+                              </span>
+                              <span className="text-xs bg-white/5 text-slate-400 px-2 py-0.5 rounded-lg">
+                                {androidSelectedClient.total_habilitados} activos / {androidSelectedClient.total_dispositivos} total
+                              </span>
+                            </div>
+                            <h3 className="text-base font-extrabold text-white">
+                              {clients.find((c: any) => c.codigo === androidSelectedClient.client_code)?.razon_social || `Cliente ${androidSelectedClient.client_code}`}
+                            </h3>
+                            {androidSelectedClient.ultimo_acceso && (
+                              <p className="text-[11px] text-slate-500 mt-0.5">
+                                Último acceso: {new Date(androidSelectedClient.ultimo_acceso).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })}
+                              </p>
+                            )}
+                          </div>
+                          <button onClick={() => setAndroidSelectedClient(null)} className="hover:bg-white/10 p-1.5 rounded-xl transition-all shrink-0">
+                            <X size={16} className="text-slate-400" />
+                          </button>
+                        </div>
+
+                        {/* Resumen por app */}
+                        <div className="p-4 border-b border-white/5 flex flex-wrap gap-2">
+                          {Object.values(androidSelectedClient.apps || {}).map((appInfo: any) => (
+                            <div key={appInfo.app} className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-bold transition-all cursor-pointer ${androidFilterApp === appInfo.app ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300' : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'}`}
+                              onClick={() => setAndroidFilterApp(androidFilterApp === appInfo.app ? 'all' : appInfo.app)}
+                            >
+                              <span>{appInfo.app}</span>
+                              <span className="bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded-md text-[10px]">{appInfo.habilitados}</span>
+                              {appInfo.deshabilitados > 0 && (
+                                <span className="bg-red-500/10 text-red-400 px-1.5 py-0.5 rounded-md text-[10px]">{appInfo.deshabilitados} inact</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Filtro habilitado */}
+                        <div className="px-4 py-3 border-b border-white/5 flex gap-2">
+                          {['all', 'true', 'false'].map(val => (
+                            <button
+                              key={val}
+                              onClick={() => setAndroidFilterHabilitado(val)}
+                              className={`px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all ${androidFilterHabilitado === val ? 'bg-emerald-500 text-white' : 'bg-white/5 text-slate-400 hover:bg-white/10'}`}
+                            >
+                              {val === 'all' ? 'Todos' : val === 'true' ? '✅ Activos' : '❌ Inactivos'}
+                            </button>
+                          ))}
+                        </div>
+
+                        {/* Lista de dispositivos */}
+                        <div className="max-h-[520px] overflow-y-auto custom-scrollbar divide-y divide-white/5">
+                          {androidClientDevicesLoading ? (
+                            <div className="py-10 flex flex-col items-center gap-3 text-slate-500">
+                              <div className="animate-spin rounded-full h-7 w-7 border-4 border-emerald-500 border-t-transparent" />
+                              <span className="text-xs">Cargando dispositivos...</span>
+                            </div>
+                          ) : (() => {
+                            const filtered = androidClientDevices.filter(d => {
+                              const appOk = androidFilterApp === 'all' || d.app === androidFilterApp;
+                              const habOk = androidFilterHabilitado === 'all' || String(d.habilitado) === androidFilterHabilitado;
+                              return appOk && habOk;
+                            });
+                            if (filtered.length === 0) {
+                              return <div className="py-10 text-center text-slate-500 text-xs italic">No hay dispositivos con los filtros seleccionados.</div>;
+                            }
+                            return filtered.map((dev: any) => {
+                              const primary = androidDevicePrimaryLabel(dev);
+                              const identityLines = androidDeviceIdentityLines(dev).filter(
+                                l => l.label !== 'Usuario / Vendedor' || primary !== l.value
+                              );
+                              return (
+                              <div
+                                key={dev.id}
+                                onClick={() => setAndroidDeviceDetailModal(dev)}
+                                className="p-4 cursor-pointer hover:bg-white/[0.03] transition-colors flex items-start gap-3"
+                              >
+                                {/* Estado badge */}
+                                <div className={`mt-1 shrink-0 w-2 h-2 rounded-full ${dev.habilitado ? 'bg-emerald-500 shadow-emerald-500/40 shadow-sm' : 'bg-red-500'}`} />
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className={`text-[10px] px-2 py-0.5 rounded-full font-black border ${
+                                      dev.app === 'PRV' ? 'bg-blue-500/15 text-blue-400 border-blue-500/20' :
+                                      dev.app === 'ROU' ? 'bg-purple-500/15 text-purple-400 border-purple-500/20' :
+                                      dev.app === 'FIR' ? 'bg-amber-500/15 text-amber-400 border-amber-500/20' :
+                                      dev.app === 'INV' ? 'bg-cyan-500/15 text-cyan-400 border-cyan-500/20' :
+                                      dev.app === 'FRA' ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20' :
+                                      dev.app === 'TCK' ? 'bg-violet-500/15 text-violet-300 border-violet-500/25' :
+                                      'bg-slate-500/15 text-slate-400 border-slate-500/20'
+                                    }`}>
+                                      {dev.app}
+                                    </span>
+                                    <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">{dev.app_nombre || dev.app}</span>
+                                    {!dev.habilitado && <span className="text-[9px] text-red-400 font-bold">INACTIVO</span>}
+                                  </div>
+                                  <div className="text-xs font-bold text-white mt-1 truncate" title={primary}>{primary}</div>
+                                  <div className="flex flex-col gap-0.5 mt-1.5">
+                                    {identityLines.slice(0, 4).map(line => (
+                                      <div key={line.label} className="flex items-baseline gap-1.5 min-w-0">
+                                        <span className="text-[9px] text-slate-600 font-black uppercase shrink-0">{line.label}:</span>
+                                        <span
+                                          className={`text-[10px] text-slate-400 truncate ${line.mono ? 'font-mono' : ''}`}
+                                          title={line.value}
+                                        >
+                                          {line.value}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                  <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1.5">
+                                    {dev.ult_acceso && <span className="text-[10px] text-slate-500">Acc: {new Date(dev.ult_acceso).toLocaleDateString('es-AR')}</span>}
+                                    {dev.fecha_registro && <span className="text-[10px] text-slate-600">Alta: {new Date(dev.fecha_registro).toLocaleDateString('es-AR')}</span>}
+                                  </div>
+                                </div>
+                                <div
+                                  className="shrink-0 flex flex-col items-end gap-2"
+                                  onClick={e => e.stopPropagation()}
+                                >
+                                  <button
+                                    type="button"
+                                    title={dev.habilitado ? 'Desactivar' : 'Activar'}
+                                    onClick={() => handleToggleAndroidDevice(dev, !dev.habilitado)}
+                                    className={`px-2.5 py-1 rounded-lg text-[10px] font-black uppercase border transition-all ${
+                                      dev.habilitado
+                                        ? 'bg-red-950/40 text-red-400 border-red-500/20 hover:bg-red-900/50'
+                                        : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/30'
+                                    }`}
+                                  >
+                                    {dev.habilitado ? 'Desact.' : 'Activar'}
+                                  </button>
+                                  <Search size={14} className="text-slate-600" />
+                                </div>
+                              </div>
+                            );});
+                          })()}
+                        </div>
+                        <div className={`px-5 py-3 border-t border-white/5 flex items-center justify-between ${darkMode ? 'bg-black/20' : 'bg-slate-50'}`}>
+                          <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">
+                            {androidClientDevices.filter(d => {
+                              const appOk = androidFilterApp === 'all' || d.app === androidFilterApp;
+                              const habOk = androidFilterHabilitado === 'all' || String(d.habilitado) === androidFilterHabilitado;
+                              return appOk && habOk;
+                            }).length} dispositivos mostrados
+                          </span>
+                          <button
+                            onClick={() => loadAndroidClientDevices(androidSelectedClient.client_code)}
+                            className="text-[10px] text-emerald-400 hover:text-emerald-300 font-bold transition-colors"
+                          >
+                            🔄 Recargar
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ====================================================== */}
+            {/* SECCIÓN: ACTIVACIONES PENDIENTES OnLine (misi_request) */}
+            {/* ====================================================== */}
+            {activeTab === 'acti_pending' && (
+              <div className="space-y-6 animate-in slide-in-from-bottom-8">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div>
+                    <h1 className="text-4xl font-extrabold tracking-tight flex items-center gap-3">
+                      <Clock className="text-amber-400" size={36} />
+                      Activaciones OnLine
+                    </h1>
+                    <p className="text-slate-400 mt-1.5">
+                      Solicitudes de activación (misi_request) · mismo flujo que GesActi ActiPenOL
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = !actiShowAll;
+                        setActiShowAll(next);
+                        loadActiRequests(next);
+                      }}
+                      className={`px-4 py-3 rounded-2xl text-xs font-bold border transition-all ${actiShowAll ? 'bg-amber-500/20 text-amber-300 border-amber-500/30' : 'bg-slate-800 text-slate-300 border-white/5'}`}
+                    >
+                      {actiShowAll ? 'Solo pendientes' : 'Ver todas'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => loadActiRequests()}
+                      className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs px-4 py-3 rounded-2xl border border-white/5"
+                    >
+                      🔄 Actualizar
+                    </button>
+                  </div>
+                </div>
+
+                <div className={`rounded-[1.75rem] border shadow-xl overflow-hidden ${darkMode ? 'bg-slate-900 border-white/5' : 'bg-white border-slate-200'}`}>
+                  {actiRequestsLoading ? (
+                    <div className="p-12 text-center text-slate-400 text-sm">Cargando solicitudes…</div>
+                  ) : actiRequests.length === 0 ? (
+                    <div className="p-12 text-center text-slate-500 text-sm">No hay solicitudes {actiShowAll ? '' : 'pendientes'}.</div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-black/20 text-[10px] uppercase tracking-wider text-slate-500">
+                          <tr>
+                            <th className="px-4 py-3">ID</th>
+                            <th className="px-4 py-3">Cliente</th>
+                            <th className="px-4 py-3">Serial</th>
+                            <th className="px-4 py-3">PC / Usuario</th>
+                            <th className="px-4 py-3">Path / OS</th>
+                            <th className="px-4 py-3">Estado</th>
+                            <th className="px-4 py-3 text-right">Acciones</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {actiRequests.map((req) => {
+                            const cli = clients.find(c => String(c.codigo) === String(req.client_code));
+                            return (
+                              <tr key={req.KeyID} className="border-t border-white/5 hover:bg-white/[0.02]">
+                                <td className="px-4 py-3 font-mono text-slate-500">{req.KeyID}</td>
+                                <td className="px-4 py-3">
+                                  <div className="font-bold text-slate-200">{req.client_code}</div>
+                                  <div className="text-[10px] text-slate-500 truncate max-w-[140px]">{cli?.razon_social || cli?.nombre_fantasia || '—'}</div>
+                                </td>
+                                <td className="px-4 py-3 font-mono text-[11px] text-amber-300">{req.r_number}</td>
+                                <td className="px-4 py-3">
+                                  <div className="font-semibold text-slate-200 truncate max-w-[160px]">{req.r_id || '—'}</div>
+                                  <div className="text-[10px] text-slate-500">{req.r_user || '—'}</div>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <div className="truncate max-w-[180px] text-slate-400" title={req.r_path}>{req.r_path || '—'}</div>
+                                  <div className="text-[10px] text-slate-500 truncate max-w-[180px]">{req.r_OS || '—'}</div>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <span className={`px-2 py-1 rounded-lg text-[10px] font-black border ${
+                                    req.r_state === '0' ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
+                                    req.r_state === '1' || req.r_state === '3' || req.r_state === '4' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+                                    req.r_state === '2' ? 'bg-red-500/10 text-red-400 border-red-500/20' :
+                                    'bg-slate-800 text-slate-400 border-white/5'
+                                  }`}>{req.r_state_label || req.r_state}</span>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <div className="flex flex-wrap gap-1 justify-end">
+                                    <button type="button" onClick={() => handleResolveActiRequest(req, '1')} className="px-2 py-1 rounded-lg bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 text-[10px] font-black">Activar</button>
+                                    <button type="button" onClick={() => handleResolveActiRequest(req, '2')} className="px-2 py-1 rounded-lg bg-red-500/15 text-red-400 border border-red-500/20 text-[10px] font-black">Denegar</button>
+                                    <button type="button" onClick={() => handleResolveActiRequest(req, '0')} className="px-2 py-1 rounded-lg bg-slate-800 text-slate-300 border border-white/10 text-[10px] font-black">Pendiente</button>
+                                    <button type="button" onClick={() => handleResolveActiRequest(req, '3')} className="px-2 py-1 rounded-lg bg-sky-500/15 text-sky-400 border border-sky-500/20 text-[10px] font-black">+Msg</button>
+                                    <button type="button" onClick={() => handleResolveActiRequest(req, '4')} className="px-2 py-1 rounded-lg bg-violet-500/15 text-violet-400 border border-violet-500/20 text-[10px] font-black">+Fecha</button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ====================================================== */}
+            {/* SECCIÓN: EXTENSIONES OnLine (misi_extension)           */}
+            {/* ====================================================== */}
+            {activeTab === 'extensiones' && (
+              <div className="space-y-6 animate-in slide-in-from-bottom-8">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                  <div>
+                    <h1 className="text-4xl font-extrabold tracking-tight flex items-center gap-3">
+                      <CalendarDays className="text-sky-400" size={36} />
+                      Extensiones OnLine
+                    </h1>
+                    <p className="text-slate-400 mt-1.5">
+                      Pedidos de extensión (misi_extension) · Generar = e_date + l_period → nueva expiración
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const next = !extShowAll;
+                        setExtShowAll(next);
+                        loadExtensiones(next);
+                      }}
+                      className={`px-4 py-3 rounded-2xl text-xs font-bold border transition-all ${extShowAll ? 'bg-sky-500/20 text-sky-300 border-sky-500/30' : 'bg-slate-800 text-slate-300 border-white/5'}`}
+                    >
+                      {extShowAll ? 'Solo pendientes' : 'Ver todas'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => loadExtensiones()}
+                      className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs px-4 py-3 rounded-2xl border border-white/5"
+                    >
+                      🔄 Actualizar
+                    </button>
+                  </div>
+                </div>
+
+                <div className={`rounded-[1.75rem] border shadow-xl overflow-hidden ${darkMode ? 'bg-slate-900 border-white/5' : 'bg-white border-slate-200'}`}>
+                  {extensionesLoading ? (
+                    <div className="p-12 text-center text-slate-400 text-sm">Cargando extensiones…</div>
+                  ) : extensiones.length === 0 ? (
+                    <div className="p-12 text-center text-slate-500 text-sm">No hay extensiones {extShowAll ? '' : 'pendientes'}.</div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-black/20 text-[10px] uppercase tracking-wider text-slate-500">
+                          <tr>
+                            <th className="px-4 py-3">Cliente</th>
+                            <th className="px-4 py-3">Serial</th>
+                            <th className="px-4 py-3">Expiración</th>
+                            <th className="px-4 py-3">Nueva / Sugerida</th>
+                            <th className="px-4 py-3">Periodo</th>
+                            <th className="px-4 py-3 text-right">Acción</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {extensiones.map((ext) => (
+                            <tr key={ext.KeyID} className="border-t border-white/5 hover:bg-white/[0.02]">
+                              <td className="px-4 py-3">
+                                <div className="font-bold text-slate-200">{ext.client_code}</div>
+                                <div className="text-[10px] text-slate-500 truncate max-w-[160px]">{ext.client_name || '—'}</div>
+                              </td>
+                              <td className="px-4 py-3 font-mono text-[11px] text-sky-300">{ext.e_number}</td>
+                              <td className="px-4 py-3 font-mono">{ext.e_date || '—'}</td>
+                              <td className="px-4 py-3 font-mono">
+                                {ext.e_newdate ? (
+                                  <span className="text-emerald-400">{ext.e_newdate}</span>
+                                ) : (
+                                  <span className="text-amber-400">{ext.suggested_newdate || '—'}</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3">{ext.l_period ?? '—'} días</td>
+                              <td className="px-4 py-3 text-right">
+                                {ext.pending ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleApproveExtension(ext)}
+                                    className="px-3 py-1.5 rounded-xl bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/30 text-[10px] font-black uppercase"
+                                  >
+                                    Generar
+                                  </button>
+                                ) : (
+                                  <span className="text-[10px] text-emerald-500 font-bold uppercase">Generada</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
           </div>
         </div>
 
@@ -4839,11 +6937,108 @@ export default function App() {
                           <span className="text-xs font-black text-slate-200 truncate max-w-[140px]" title={session.device_name}>
                             {session.device_name || "PC Remota"}
                           </span>
-                          <span className="text-[9px] bg-slate-800/60 text-slate-400 px-1.5 py-0.5 rounded font-mono font-bold">
-                            #{session.id}
-                          </span>
+                          {deviceAssistLabel(session) ? (
+                            <span className="text-[9px] bg-sky-500/15 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded font-mono font-black" title="ID de asistencia">
+                              ID {deviceAssistLabel(session)}
+                            </span>
+                          ) : (
+                            <span className="text-[9px] bg-slate-800/60 text-slate-400 px-1.5 py-0.5 rounded font-mono font-bold">
+                              #{session.id}
+                            </span>
+                          )}
+                          {session.alt_remote_id && (
+                            <span className="text-[8px] bg-slate-800/40 text-slate-500 px-1 py-0.5 rounded font-mono" title="RustDesk">
+                              RD {session.alt_remote_id}
+                            </span>
+                          )}
                         </div>
                         <div className="flex items-center gap-1.5">
+                          {(() => {
+                            const gridSessions = winSessionsByDevice[session.id] ?? [];
+                            const gridSwitching = sessionSwitchingDeviceId === session.id
+                              || (sessionSwitching && focusedSessionId === session.id);
+                            const gridPickerOpen = sessionPickerDeviceId === session.id;
+                            const wsForCard = wsViewerConnected && focusedSessionId === session.id;
+                            return (
+                              <div className="relative">
+                                <button
+                                  type="button"
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    setFocusedSessionId(session.id);
+                                    if (gridPickerOpen) {
+                                      setSessionPickerDeviceId(null);
+                                    } else {
+                                      setSessionPickerDeviceId(session.id);
+                                      await refreshWindowsSessionsForDevice(session.id);
+                                    }
+                                  }}
+                                  className={`text-[9px] font-bold px-2 py-0.5 rounded border transition-all ${
+                                    gridSwitching
+                                      ? 'bg-amber-600/40 border-amber-500/40 text-amber-200 animate-pulse'
+                                      : 'bg-slate-800/80 border-white/10 text-slate-400 hover:text-white hover:bg-slate-700'
+                                  }`}
+                                  title="Sesiones Windows (Consola / RDP)"
+                                >
+                                  👤 {gridSwitching ? '…' : (gridSessions.find(s => s.current)?.username?.split('\\').pop() || 'Sesión')}
+                                </button>
+                                {gridPickerOpen && !gridSwitching && (
+                                  <div
+                                    className="absolute right-0 top-full mt-1 z-[80] min-w-[200px] bg-slate-900 border border-white/10 rounded-xl shadow-2xl p-1"
+                                    onClick={e => e.stopPropagation()}
+                                  >
+                                    <div className="px-2 py-1 text-[9px] text-slate-500 font-bold uppercase">Sesiones</div>
+                                    {gridSessions.length === 0 ? (
+                                      <div className="px-2 py-2 text-[10px] text-slate-500 italic">Cargando…</div>
+                                    ) : gridSessions.map(s => (
+                                      <button
+                                        key={s.id}
+                                        type="button"
+                                        onClick={async () => {
+                                          setSessionPickerDeviceId(null);
+                                          setFocusedSessionId(session.id);
+                                          if (s.current) return;
+                                          const disc = (s.state || '').toLowerCase().includes('disc');
+                                          if (disc) {
+                                            setSessionSwitchError('Sesión RDP desconectada: elegí Consola o una sesión Activa.');
+                                            return;
+                                          }
+                                          if (s.id < 1 || s.id > 65535) return;
+                                          beginSessionSwitch(session.id, s.id);
+                                          if (wsForCard) {
+                                            sendViewerCommand({ type: 'switch_session', session_id: s.id });
+                                          } else {
+                                            await sendCentinelaControl(session.id, { type: 'switch_session', session_id: s.id });
+                                          }
+                                        }}
+                                        className={`w-full text-left px-2 py-1.5 rounded text-[10px] ${
+                                          s.current ? 'bg-brand-500/20 text-brand-300' : 'hover:bg-slate-700 text-slate-300'
+                                        }`}
+                                      >
+                                        {s.name?.toLowerCase() === 'console' && !s.username
+                                          ? `Consola (#${s.id})`
+                                          : (s.username || s.name || `#${s.id}`)}
+                                        {s.current ? ' ●' : ''}
+                                      </button>
+                                    ))}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setSessionPickerDeviceId(null);
+                                        setLoginDeviceId(session.id);
+                                        setFocusedSessionId(session.id);
+                                        setShowLoginModal(true);
+                                        setLoginError('');
+                                      }}
+                                      className="w-full text-left px-2 py-1.5 rounded text-[10px] text-slate-400 hover:bg-slate-700 border-t border-white/5 mt-1"
+                                    >
+                                      🔑 Iniciar sesión
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })()}
                           {isFocused && (
                             <span className="text-[8px] bg-brand-500/20 text-brand-400 border border-brand-500/30 px-1.5 py-0.5 rounded font-extrabold flex items-center gap-1 animate-pulse">
                               ⌨️ CONTROL
@@ -4885,11 +7080,13 @@ export default function App() {
                         {frame ? (
                           <img
                             src={frame.startsWith('blob:') || frame.startsWith('data:') ? frame : `data:image;base64,${frame}`}
-
-                            onClick={(e) => handleImageInteraction(e, session.id, 'left')}
-                            onDoubleClick={(e) => handleImageInteraction(e, session.id, 'double')}
-                            onContextMenu={(e) => handleImageInteraction(e, session.id, 'right')}
-                            className="w-full h-full object-contain cursor-crosshair select-none"
+                            tabIndex={0}
+                            onMouseDown={(e) => handleMouseDown(e, session.id)}
+                            onMouseUp={(e) => handleMouseUp(e, session.id)}
+                            onMouseLeave={(e) => handleMouseUp(e, session.id)}
+                            onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                            onWheel={(e) => handleImageWheel(e, session.id)}
+                            className="w-full h-full object-contain cursor-crosshair select-none outline-none"
                             alt="Remote Screen"
                           />
                         ) : (
@@ -4973,15 +7170,141 @@ export default function App() {
           </div>
         )}
 
+        {/* Modal Detalle de Dispositivo Android */}
+        {androidToggleConfirm && (
+          <div className="fixed inset-0 z-[95] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-in fade-in">
+            <div className="bg-slate-900 border border-white/10 rounded-3xl max-w-md w-full shadow-2xl animate-in zoom-in-95 overflow-hidden">
+              <div className={`p-5 border-b border-white/10 ${androidToggleConfirm.habilitado ? 'bg-emerald-500/10' : 'bg-red-500/10'}`}>
+                <h3 className="text-lg font-black text-white flex items-center gap-2">
+                  <Power size={20} className={androidToggleConfirm.habilitado ? 'text-emerald-400' : 'text-red-400'} />
+                  {androidToggleConfirm.habilitado ? 'Activar dispositivo' : 'Desactivar dispositivo'}
+                </h3>
+              </div>
+              <div className="p-5 space-y-3">
+                <p className="text-sm text-slate-300 leading-relaxed">
+                  {androidToggleConfirm.habilitado ? '¿Confirmás la activación de este nodo?' : '¿Confirmás la desactivación de este nodo?'}
+                </p>
+                <div className="rounded-2xl border border-white/10 bg-black/25 p-4 space-y-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[10px] px-2 py-0.5 rounded-full font-black bg-violet-500/20 text-violet-300 border border-violet-500/30">
+                      {androidToggleConfirm.dev.app}
+                    </span>
+                    <span className="text-sm font-bold text-white">{androidDevicePrimaryLabel(androidToggleConfirm.dev)}</span>
+                  </div>
+                  {androidDeviceIdentityLines(androidToggleConfirm.dev).map(line => (
+                    <div key={line.label} className="flex gap-2 text-[11px] min-w-0">
+                      <span className="text-slate-500 font-black uppercase shrink-0 w-28">{line.label}</span>
+                      <span className={`text-slate-200 break-all ${line.mono ? 'font-mono text-[10px]' : ''}`}>{line.value}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="p-5 pt-0 flex gap-3">
+                <button
+                  type="button"
+                  disabled={androidToggleBusy}
+                  onClick={() => setAndroidToggleConfirm(null)}
+                  className="flex-1 py-3 rounded-2xl text-sm font-bold text-slate-400 hover:text-white hover:bg-white/5 border border-white/10 transition-all disabled:opacity-50"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={androidToggleBusy}
+                  onClick={executeAndroidDeviceToggle}
+                  className={`flex-1 py-3 rounded-2xl text-sm font-extrabold transition-all disabled:opacity-60 flex items-center justify-center gap-2 ${
+                    androidToggleConfirm.habilitado
+                      ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                      : 'bg-red-600 hover:bg-red-500 text-white'
+                  }`}
+                >
+                  {androidToggleBusy ? 'Procesando…' : androidToggleConfirm.habilitado ? 'Activar' : 'Desactivar'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {androidDeviceDetailModal && (
+          <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 backdrop-blur-sm animate-in fade-in p-4">
+            <div className={`w-full max-w-lg rounded-3xl shadow-2xl border animate-in zoom-in-95 overflow-hidden ${darkMode ? 'bg-slate-900 border-white/10 text-white' : 'bg-white border-slate-200 text-slate-800'}`}>
+              {/* Header */}
+              <div className={`p-5 border-b border-white/10 flex items-center justify-between ${androidDeviceDetailModal.habilitado ? 'bg-emerald-500/10' : 'bg-red-500/10'}`}>
+                <div className="flex items-center gap-3 min-w-0">
+                  <Smartphone size={22} className={`shrink-0 ${androidDeviceDetailModal.habilitado ? 'text-emerald-400' : 'text-red-400'}`} />
+                  <div className="min-w-0">
+                    <h3 className="text-base font-extrabold text-white truncate">{androidDevicePrimaryLabel(androidDeviceDetailModal)}</h3>
+                    <p className="text-[11px] text-slate-400 truncate">
+                      {androidDeviceDetailModal.app_nombre} ({androidDeviceDetailModal.app})
+                      {androidDeviceDetailModal.id != null ? ` · #${androidDeviceDetailModal.id}` : ''}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className={`text-[10px] font-black px-3 py-1.5 rounded-full border ${androidDeviceDetailModal.habilitado ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' : 'bg-red-500/20 text-red-400 border-red-500/30'}`}>
+                    {androidDeviceDetailModal.habilitado ? '✅ HABILITADO' : '❌ INACTIVO'}
+                  </span>
+                  <button onClick={() => setAndroidDeviceDetailModal(null)} className="hover:bg-white/10 p-2 rounded-xl transition-all">
+                    <X size={18} className="text-slate-400" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Body */}
+              <div className="p-5 space-y-3">
+                {androidDeviceIdentityLines(androidDeviceDetailModal).map(({ label, value, mono }) => (
+                  <div key={label} className={`flex items-start gap-3 p-3 rounded-xl ${darkMode ? 'bg-white/[0.03]' : 'bg-slate-50'}`}>
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider w-32 shrink-0 mt-0.5">{label}</span>
+                    <span className={`text-xs font-semibold text-slate-200 break-all ${mono ? 'font-mono text-[10px]' : ''}`}>{value}</span>
+                  </div>
+                ))}
+
+                <div className="grid grid-cols-2 gap-3 pt-1">
+                  <div className={`p-3 rounded-xl ${darkMode ? 'bg-white/[0.03]' : 'bg-slate-50'}`}>
+                    <div className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-1">Último acceso</div>
+                    <div className="text-xs font-bold text-slate-200">
+                      {androidDeviceDetailModal.ult_acceso ? new Date(androidDeviceDetailModal.ult_acceso).toLocaleString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
+                    </div>
+                  </div>
+                  <div className={`p-3 rounded-xl ${darkMode ? 'bg-white/[0.03]' : 'bg-slate-50'}`}>
+                    <div className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-1">Fecha de alta</div>
+                    <div className="text-xs font-bold text-slate-200">
+                      {androidDeviceDetailModal.fecha_registro ? new Date(androidDeviceDetailModal.fecha_registro).toLocaleString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="px-5 pb-5 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleToggleAndroidDevice(androidDeviceDetailModal, !androidDeviceDetailModal.habilitado)}
+                  className={`flex-1 py-3 rounded-2xl text-sm font-bold transition-all border flex items-center justify-center gap-2 ${
+                    androidDeviceDetailModal.habilitado
+                      ? 'bg-red-950/50 hover:bg-red-900/60 text-red-300 border-red-500/20'
+                      : 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-400/30'
+                  }`}
+                >
+                  <Power size={16} />
+                  {androidDeviceDetailModal.habilitado ? 'Desactivar' : 'Activar esta PC / dispositivo'}
+                </button>
+                <button onClick={() => setAndroidDeviceDetailModal(null)} className="px-5 py-3 bg-slate-800 hover:bg-slate-700 rounded-2xl text-sm font-bold text-slate-300 transition-all border border-white/5">
+                  Cerrar
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {isClientModalOpen && (
           <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/80 backdrop-blur-sm animate-in fade-in p-4 overflow-y-auto">
             <div className={`w-full ${clientActiveTab === 'erp_licensing' ? 'max-w-5xl font-sans' : 'max-w-2xl'} max-h-[90vh] flex flex-col p-6 rounded-3xl shadow-2xl border animate-in zoom-in-95 transition-all duration-300 ${darkMode ? 'bg-slate-900 border-white/10 text-white shadow-[0_0_50px_rgba(245,158,11,0.08)]' : 'bg-white border-slate-200 text-slate-800'}`}>
               <div className="flex justify-between items-center mb-6 border-b pb-4 dark:border-white/5 shrink-0">
                 <div>
                   <h3 className="text-xl font-extrabold tracking-tight">
-                    {editingClient ? 'Editar Información de Cliente' : 'Registrar Nuevo Cliente'}
+                    {editingClient ? 'Editar cliente GesActi' : 'Alta de cliente GesActi'}
                   </h3>
-                  <p className="text-xs text-slate-400 mt-1">Configure todos los campos operativos y datos sincronizados del ERP.</p>
+                  <p className="text-xs text-slate-400 mt-1">Mismos datos que F2 Alta de GesActi: código de 4 caracteres, producto y cliente de facturación. Después se genera el serial.</p>
                 </div>
                 <button onClick={() => setIsClientModalOpen(false)} className="hover:bg-white/10 p-2 rounded-xl transition-all">
                   <X size={20} />
@@ -5012,24 +7335,56 @@ export default function App() {
                 {/* Tab: Básico */}
                 {clientActiveTab === 'basic' && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-in fade-in duration-200">
-                    <div>
-                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Código ERP / Cliente</label>
-                      <input
-                        placeholder="Ej. 0677"
+                    <div className="md:col-span-2">
+                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Producto ApolloGesCom</label>
+                      <select
                         disabled={!!editingClient}
-                        value={clientForm.codigo}
-                        onChange={e => setClientForm({ ...clientForm, codigo: e.target.value })}
-                        className={`w-full p-3 rounded-xl border bg-transparent text-sm outline-none focus:ring-2 focus:ring-brand-500 ${editingClient ? 'opacity-60 cursor-not-allowed dark:border-white/5' : 'dark:border-white/10'}`}
-                      />
+                        value={(clientForm.version_apollo || 'E').toUpperCase().slice(0, 1)}
+                        onChange={e => {
+                          const v = e.target.value;
+                          setClientForm({ ...clientForm, version_apollo: v });
+                          if (!editingClient) suggestNextGesactiCode(v);
+                        }}
+                        className="w-full p-3 rounded-xl border bg-transparent text-sm outline-none focus:ring-2 focus:ring-brand-500 dark:border-white/10"
+                      >
+                        <option value="E">Apollo ERP (código &lt; M, ej. 0677)</option>
+                        <option value="S">ApolloGesCom Single (código M…)</option>
+                        <option value="R">Apollo Clock (código R…)</option>
+                        <option value="P">Apollo Pharmakos (código V…)</option>
+                      </select>
                     </div>
                     <div>
-                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Relación Facturación (CCLIFAC)</label>
+                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Código GesCom (4 car.)</label>
+                      <div className="flex gap-2">
+                        <input
+                          placeholder="Ej. 0677"
+                          maxLength={4}
+                          disabled={!!editingClient}
+                          value={clientForm.codigo}
+                          onChange={e => setClientForm({ ...clientForm, codigo: e.target.value.toUpperCase() })}
+                          className={`w-full p-3 rounded-xl border bg-transparent text-sm outline-none focus:ring-2 focus:ring-brand-500 font-mono ${editingClient ? 'opacity-60 cursor-not-allowed dark:border-white/5' : 'dark:border-white/10'}`}
+                        />
+                        {!editingClient && (
+                          <button type="button" onClick={() => suggestNextGesactiCode(clientForm.version_apollo || 'E')} className="px-3 rounded-xl border border-white/10 text-[10px] font-black uppercase whitespace-nowrap">Siguiente</button>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Cliente GesCom facturación (F10 / CCLIFAC)</label>
                       <input
                         placeholder="Ej. 0100154"
                         value={clientForm.cclifac}
                         onChange={e => setClientForm({ ...clientForm, cclifac: e.target.value })}
                         className="w-full p-3 rounded-xl border bg-transparent text-sm outline-none focus:ring-2 focus:ring-brand-500 dark:border-white/10 font-mono"
                       />
+                    </div>
+                    <div className="flex items-center gap-3 md:col-span-2 bg-white/5 rounded-xl px-4 py-3 border border-white/5">
+                      <input
+                        type="checkbox"
+                        checked={clientForm.activo !== false}
+                        onChange={e => setClientForm({ ...clientForm, activo: e.target.checked })}
+                      />
+                      <span className="text-xs font-bold uppercase tracking-widest text-slate-400">Cliente activo</span>
                     </div>
                     <div>
                       <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">CUIT o DNI (Identificador Fiscal)</label>
@@ -5103,22 +7458,38 @@ export default function App() {
                       </div>
                     </div>
                     <div>
-                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Código Clasificación ERP</label>
-                      <input
-                        placeholder="Código Clas."
-                        value={clientForm.clasificacion_codigo}
-                        onChange={e => setClientForm({ ...clientForm, clasificacion_codigo: e.target.value })}
-                        className="w-full p-3 rounded-xl border bg-transparent text-sm outline-none focus:ring-2 focus:ring-brand-500 dark:border-white/10"
-                      />
+                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Fecha último pago</label>
+                      <div className={`p-4 rounded-2xl border ${darkMode ? 'bg-black/20' : 'bg-slate-50'}`}>
+                        <span className="text-sm font-black font-mono text-slate-700 dark:text-slate-200">
+                          {formatFechaLocal(clientForm.fecha_ultimo_pago) || 'Sin registro'}
+                        </span>
+                      </div>
                     </div>
-                    <div>
-                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Nombre Clasificación</label>
-                      <input
-                        placeholder="Ej. DEBITO AUTOMATICO"
-                        value={clientForm.clasificacion_nombre}
-                        onChange={e => setClientForm({ ...clientForm, clasificacion_nombre: e.target.value })}
+                    <div className="md:col-span-2">
+                      <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Estado de Cuenta Corriente (ClasiCli)</label>
+                      <select
+                        value={normalizeEstadoCodigo(clientForm.clasificacion_codigo) || ''}
+                        onChange={e => {
+                          const cod = e.target.value;
+                          const est = estadosCta.find((x: any) => normalizeEstadoCodigo(x.codigo) === cod);
+                          setClientForm({
+                            ...clientForm,
+                            clasificacion_codigo: cod,
+                            clasificacion_nombre: est?.descripcion || '',
+                          });
+                        }}
                         className="w-full p-3 rounded-xl border bg-transparent text-sm outline-none focus:ring-2 focus:ring-brand-500 dark:border-white/10"
-                      />
+                      >
+                        <option value="">Sin estado</option>
+                        {estadosCta.filter((e: any) => e.activo !== false).map((e: any) => (
+                          <option key={e.id || e.codigo} value={normalizeEstadoCodigo(e.codigo)}>
+                            {e.codigo} — {e.descripcion}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-[10px] text-slate-500 mt-1.5">
+                        Mismo catálogo que ERP → Cobranzas → Estados de Ctas Ctes. Gestionar con el botón «Estados Cta».
+                      </p>
                     </div>
                     <div>
                       <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Código Vendedor</label>
@@ -5204,15 +7575,13 @@ export default function App() {
                       <div className="flex gap-2 font-sans">
                         <button
                           type="button"
-                          onClick={() => {
-                            const randomHex = Math.random().toString(16).substring(2, 10).toUpperCase();
-                            const serialSugg = `${clientForm.codigo}-VS32-${randomHex}-bf`;
-                            const oneYearLater = new Date();
-                            oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
-                            const dateSugg = oneYearLater.toISOString().split('T')[0];
-
+                          onClick={async () => {
+                            const mods = await loadErpModules();
+                            const d = new Date();
+                            d.setDate(d.getDate() + 60);
+                            const dateSugg = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
                             setNewSerialForm({
-                              l_number: serialSugg,
+                              l_number: '',
                               l_date: dateSugg,
                               l_peri2016: 30,
                               l_raso: clientForm.razon_social || '',
@@ -5221,11 +7590,16 @@ export default function App() {
                               l_tele: clientForm.telefono || '',
                               l_locali: clientForm.localidad || ''
                             });
+                            const v = (clientForm.version_apollo || 'E').toUpperCase().slice(0, 1);
+                            const preset = v === 'S' ? 'S' : v === 'R' ? 'R' : v === 'P' ? 'P' : 'E';
+                            const key = ({ E: 'm_erp', S: 'm_single', R: 'm_clock', P: 'm_pharmakos' } as Record<string, string>)[preset];
+                            setSerialAllModules(false);
+                            setSerialModuleNums((mods || []).filter((m: any) => m[key] && m.m_exe !== 'GESACTI').map((m: any) => m.m_num));
                             setShowNewSerialForm(true);
                           }}
-                          className="bg-brand-500 hover:bg-brand-600 text-white px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-md animate-pulse hover:animate-none"
+                          className="bg-brand-500 hover:bg-brand-600 text-white px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-md"
                         >
-                          <Plus size={14} /> Registrar Nuevo Serial
+                          <Plus size={14} /> Generar serial GesActi
                         </button>
                         <button
                           type="button"
@@ -5241,7 +7615,7 @@ export default function App() {
                     {showNewSerialForm && (
                       <div className="p-5 bg-slate-900/80 rounded-2xl border border-brand-500/30 space-y-4 animate-in slide-in-from-top-4 shadow-lg">
                         <div className="flex justify-between items-center border-b border-white/5 pb-2">
-                          <h5 className="text-xs font-black text-brand-400 uppercase tracking-widest">Registrar Nuevo Serial Comercial</h5>
+                          <h5 className="text-xs font-black text-brand-400 uppercase tracking-widest">Generar número de serie (GesActi)</h5>
                           <button
                             type="button"
                             onClick={() => setShowNewSerialForm(false)}
@@ -5252,16 +7626,16 @@ export default function App() {
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-sans">
                           <div>
-                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Clave de Serial (Formato ERP)</label>
+                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Serial generado (25 car.)</label>
                             <input
-                              required
+                              readOnly
                               value={newSerialForm.l_number}
-                              onChange={e => setNewSerialForm({ ...newSerialForm, l_number: e.target.value })}
-                              className="w-full p-2.5 rounded-xl border border-white/10 bg-slate-950 text-white font-mono outline-none focus:ring-1 focus:ring-brand-500"
+                              placeholder="Elegí módulos y tocá Generar"
+                              className="w-full p-2.5 rounded-xl border border-white/10 bg-slate-950 text-white font-mono outline-none"
                             />
                           </div>
                           <div>
-                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Fecha Vencimiento Inicial</label>
+                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Fecha expiración (máx. 60 días)</label>
                             <input
                               type="date"
                               required
@@ -5304,6 +7678,47 @@ export default function App() {
                             />
                           </div>
                         </div>
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap gap-1.5">
+                            {[
+                              ['E', 'ERP Enterprise'],
+                              ['C', 'Commerce'],
+                              ['S', 'Single'],
+                              ['L', 'Little'],
+                              ['R', 'Reloj'],
+                              ['P', 'Pharmakos'],
+                              ['TODOS', 'Todos (incl. futuros)'],
+                            ].map(([id, label]) => (
+                              <button
+                                key={id}
+                                type="button"
+                                onClick={() => applySerialPreset(id)}
+                                className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-black uppercase border border-white/10"
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                          {serialAllModules ? (
+                            <p className="text-[11px] text-amber-400">Serial con todos los módulos ($$$$$$$$$$$$), igual que Alt+F10 en GesActi.</p>
+                          ) : (
+                            <div className="max-h-40 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1 pr-1">
+                              {erpModules.filter((m: any) => m.m_exe !== 'GESACTI').map((m: any) => (
+                                <label key={m.m_num} className="flex items-center gap-2 text-[11px] text-slate-300 bg-black/20 rounded-lg px-2 py-1">
+                                  <input
+                                    type="checkbox"
+                                    checked={serialModuleNums.includes(m.m_num)}
+                                    onChange={() => {
+                                      setSerialModuleNums(prev => prev.includes(m.m_num) ? prev.filter(x => x !== m.m_num) : [...prev, m.m_num]);
+                                    }}
+                                  />
+                                  <span className="font-mono text-slate-500">{m.m_num}</span>
+                                  <span className="truncate">{m.m_desc || m.m_exe}</span>
+                                </label>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                         <div className="flex justify-end gap-2 pt-2">
                           <button
                             type="button"
@@ -5314,8 +7729,16 @@ export default function App() {
                           </button>
                           <button
                             type="button"
+                            onClick={handleGenerateGesactiSerial}
+                            className="px-3.5 py-1.5 rounded-lg bg-brand-500 hover:bg-brand-600 text-white font-bold text-xs"
+                          >
+                            Generar serial
+                          </button>
+                          <button
+                            type="button"
                             onClick={handleCreateNewErpSerial}
-                            className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition-colors"
+                            disabled={!newSerialForm.l_number}
+                            className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-bold text-xs transition-colors"
                           >
                             Guardar en MySQL
                           </button>
@@ -5384,8 +7807,10 @@ export default function App() {
                                             type="button"
                                             title="Configurar Cartel y Bloqueo"
                                             onClick={() => {
+                                              loadErpTemplates();
                                               setBannerForm({
                                                 serial: lic.l_number,
+                                                client_codes: [],
                                                 m_down: lic.m_down,
                                                 m_newdate: lic.m_newdate || '',
                                                 m_tipmsg: lic.m_tipmsg || 1,
@@ -5397,6 +7822,14 @@ export default function App() {
                                             className="p-1 bg-slate-800 hover:bg-slate-700 text-amber-400 rounded-lg transition-colors border border-white/5"
                                           >
                                             <AlertCircle size={13} />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            title="Reportes (GesActi) — Nodos / System"
+                                            onClick={() => openReportsForSerial(lic.l_number)}
+                                            className="p-1 bg-slate-800 hover:bg-slate-700 text-indigo-400 rounded-lg transition-colors border border-white/5"
+                                          >
+                                            <FileText size={13} />
                                           </button>
                                           <button
                                             type="button"
@@ -5450,8 +7883,10 @@ export default function App() {
                                         type="button"
                                         title="Configurar Cartel y Bloqueo"
                                         onClick={() => {
+                                          loadErpTemplates();
                                           setBannerForm({
                                             serial: lic.l_number,
+                                            client_codes: [],
                                             m_down: lic.m_down,
                                             m_newdate: lic.m_newdate || '',
                                             m_tipmsg: lic.m_tipmsg || 1,
@@ -5463,6 +7898,14 @@ export default function App() {
                                         className="p-1 bg-slate-800 hover:bg-slate-700 text-amber-400 rounded-lg transition-colors border border-white/5"
                                       >
                                         <AlertCircle size={13} />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        title="Reportes (GesActi)"
+                                        onClick={() => openReportsForSerial(lic.l_number)}
+                                        className="p-1 bg-slate-800 hover:bg-slate-700 text-indigo-400 rounded-lg transition-colors border border-white/5"
+                                      >
+                                        <FileText size={13} />
                                       </button>
                                       <button
                                         type="button"
@@ -5500,6 +7943,14 @@ export default function App() {
                                     {lic.m_tipmsg > 1 && (
                                       <span className="bg-amber-500/15 text-amber-400 border border-amber-500/20 px-1 py-0.5 rounded font-bold flex items-center gap-0.5">
                                         CARTEL
+                                      </span>
+                                    )}
+                                    {lic.m_tipmsg > 1 && (
+                                      <span
+                                        className="bg-sky-500/15 text-sky-300 border border-sky-500/25 px-1 py-0.5 rounded font-black font-mono"
+                                        title={`m_showmode=${lic.m_showmode || '01'}`}
+                                      >
+                                        {formatShowmodeLabel(lic.m_showmode) || 'OK'}
                                       </span>
                                     )}
                                   </div>
@@ -5853,8 +8304,13 @@ export default function App() {
                                 <div className="flex items-center gap-2.5">
                                   <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)] animate-pulse' : 'bg-slate-400'}`} />
                                   <span className="text-xs font-extrabold text-white">{dev.device_name}</span>
+                                  {deviceAssistLabel(dev) && (
+                                    <span className="text-[9px] font-mono font-black text-sky-400 bg-sky-500/10 border border-sky-500/20 px-1.5 py-0.5 rounded-md">
+                                      ID {deviceAssistLabel(dev)}
+                                    </span>
+                                  )}
                                 </div>
-                                <span className="text-[8px] font-mono font-bold text-slate-500 uppercase">ID #{dev.id}</span>
+                                <span className="text-[8px] font-mono font-bold text-slate-500 uppercase" title="ID interno">#{dev.id}</span>
                               </div>
 
                               {isOnline ? (
@@ -5884,7 +8340,7 @@ export default function App() {
                                     Limpiar Temp
                                   </button>
                                   <button
-                                    onClick={() => handleVerifyRemotePassword(dev.id, dev.remote_password)}
+                                    onClick={() => handleVerifyRemotePassword(dev.id, isOnline?.remote_password || dev.remote_password || "")}
                                     className="py-2 px-1 text-[8px] font-black uppercase text-white bg-brand-500 hover:bg-brand-600 rounded-xl transition-all text-center"
                                   >
                                     Control
@@ -5915,9 +8371,13 @@ export default function App() {
             <div className="flex justify-between items-center border-b border-white/5 pb-4">
               <div>
                 <h3 className="text-lg font-black text-white flex items-center gap-2 font-sans">
-                  <AlertCircle className="text-amber-500 animate-pulse" /> Control y Configuración de Cartel ERP
+                  <AlertCircle className="text-amber-500 animate-pulse" /> {bannerForm.client_codes?.length ? 'Monitoreo masivo (GesActi)' : 'Control y Configuración de Cartel ERP'}
                 </h3>
-                <p className="text-[11px] text-slate-400 mt-1">Serial Licencia: <span className="font-mono font-bold text-slate-200">{bannerForm.serial}</span></p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  {bannerForm.client_codes?.length
+                    ? `Clientes marcados: ${bannerForm.client_codes.length} · se aplica a todas las licencias activas`
+                    : <>Serial Licencia: <span className="font-mono font-bold text-slate-200">{bannerForm.serial}</span></>}
+                </p>
               </div>
               <button onClick={() => setShowBannerConfigModal(false)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400 transition-all">
                 <X size={20} />
@@ -5953,40 +8413,115 @@ export default function App() {
 
               {/* Tipo de Mensaje */}
               <div>
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">Tipo de Cartel / Mensaje de Advertencia</label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Cartel de aviso (misi_messages)</label>
+                  <button
+                    type="button"
+                    className="text-[10px] font-black uppercase text-amber-400 hover:text-amber-300"
+                    onClick={() => { loadErpTemplates(); setShowAvisosCatalog(true); }}
+                  >
+                    Editar catálogo
+                  </button>
+                </div>
                 <select
                   value={bannerForm.m_tipmsg}
-                  onChange={e => setBannerForm({ ...bannerForm, m_tipmsg: parseInt(e.target.value) || 1 })}
+                  onChange={e => {
+                    const num = parseInt(e.target.value) || 1;
+                    const tpl = erpTemplates.find((t: any) => Number(t.m_num ?? t.id) === num);
+                    const tplText = (tpl?.m_text || tpl?.text || '').replace(/CRLF/g, '\n');
+                    setBannerForm({
+                      ...bannerForm,
+                      m_tipmsg: num,
+                      m_text: num <= 1 ? bannerForm.m_text : (tplText || bannerForm.m_text)
+                    });
+                  }}
                   className="w-full bg-slate-800/80 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 transition-all text-xs"
                 >
-                  {erpTemplates.map(t => (
-                    <option key={t.id} value={t.id}>{t.label}</option>
+                  <option value={1}>1 — Sin cartel / mensaje particular</option>
+                  {erpTemplates.filter((t: any) => Number(t.m_num ?? t.id) > 1).map((t: any) => (
+                    <option key={t.m_num ?? t.id} value={t.m_num ?? t.id}>
+                      {t.m_num ?? t.id} — {t.m_des || t.label || 'Aviso'}
+                    </option>
                   ))}
                 </select>
+                {erpTemplates.length === 0 && (
+                  <p className="text-[10px] text-rose-400 mt-1">No se pudieron cargar los carteles de MySQL. Revisá el backend / conexión a misi_messages.</p>
+                )}
               </div>
 
               {/* Modo de Muestra */}
               <div>
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">Modo de Muestra en Escritorio FoxPro</label>
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                  Demora / modo de muestra (habitual: 15 · 30 · 180 s)
+                </label>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {[
+                    { code: '03', label: '15s' },
+                    { code: '04', label: '30s' },
+                    { code: '05', label: '180s' },
+                  ].map(opt => (
+                    <button
+                      key={opt.code}
+                      type="button"
+                      onClick={() => setBannerForm({ ...bannerForm, m_showmode: opt.code })}
+                      className={`px-3 py-1.5 rounded-lg text-[10px] font-black border transition-all ${
+                        bannerForm.m_showmode === opt.code
+                          ? 'bg-sky-500/25 text-sky-200 border-sky-400/40'
+                          : 'bg-slate-800 text-slate-300 border-white/10 hover:border-sky-500/30'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setBannerForm({ ...bannerForm, m_showmode: '01' })}
+                    className={`px-3 py-1.5 rounded-lg text-[10px] font-black border transition-all ${
+                      bannerForm.m_showmode === '01'
+                        ? 'bg-slate-600 text-white border-white/20'
+                        : 'bg-slate-800 text-slate-400 border-white/10'
+                    }`}
+                  >
+                    OK
+                  </button>
+                </div>
                 <select
                   value={bannerForm.m_showmode}
                   onChange={e => setBannerForm({ ...bannerForm, m_showmode: e.target.value })}
                   className="w-full bg-slate-800/80 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 transition-all text-xs font-sans"
                 >
-                  <option value="01">Mostrar en cada inicio (Recomendado)</option>
-                  <option value="02">Mostrar aleatoriamente durante el uso</option>
-                  <option value="03">Bloqueo de pantalla inmediato (No permite operar)</option>
+                  <option value="03">★ Demora 15 segundos (uso habitual)</option>
+                  <option value="04">★ Demora 30 segundos (uso habitual)</option>
+                  <option value="05">★ Demora 180 segundos (uso habitual)</option>
+                  <option value="01">Formulario con botón Aceptar (una vez al inicio)</option>
+                  <option value="02">Demora al inicio (5 segundos)</option>
+                  <option value="06">Demora al inicio (60 segundos)</option>
+                  <option value="07">Demora al inicio (120 segundos)</option>
+                  <option value="08">Demora al inicio (240 segundos)</option>
+                  <option value="09">Demora al inicio (300 segundos)</option>
                 </select>
+                <p className="text-[10px] text-slate-500 mt-1.5">
+                  En cambios masivos, si no querés pisar demoras distintas, usá «Poner cartel» y elegí <strong className="text-slate-300">keep</strong>.
+                </p>
               </div>
 
               {/* Mensaje de Cartel */}
               <div>
-                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">Mensaje Particular (Aparecerá en el cartel del usuario)</label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Texto del cartel (particular o del tipo elegido)</label>
+                  <button
+                    type="button"
+                    onClick={() => setShowAvisoPreview(true)}
+                    className="text-[10px] font-black uppercase text-brand-400 hover:text-brand-300"
+                  >
+                    Vista previa
+                  </button>
+                </div>
                 <textarea
                   value={bannerForm.m_text}
                   onChange={e => setBannerForm({ ...bannerForm, m_text: e.target.value })}
-                  placeholder="Ej. Estimado cliente, detectamos facturas impagas de soporte. Por favor regularice su situación llamando al 0800-APOLLO."
-                  rows={3}
+                  placeholder="Si está vacío, GesCom usa el texto del tipo de cartel. Si escribís acá, ese es el que ve el cliente."
+                  rows={4}
                   className="w-full bg-slate-800/80 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 transition-all text-xs resize-none"
                 />
               </div>
@@ -6004,7 +8539,7 @@ export default function App() {
                   type="submit"
                   className="flex-1 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-black uppercase tracking-wider transition-all text-xs shadow-md"
                 >
-                  Aplicar Cambios en MySQL
+                  Aplicar {bannerForm.client_codes?.length ? 'a marcados' : 'cambios'} en MySQL
                 </button>
               </div>
             </form>
@@ -6012,11 +8547,318 @@ export default function App() {
         </div>
       )}
 
+      {showAvisoPreview && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4" onClick={() => setShowAvisoPreview(false)}>
+          <div
+            className="bg-[#1e3a5f] border-2 border-amber-400 rounded-sm shadow-2xl w-full max-w-md p-5 text-white font-sans"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="text-center text-sm font-black uppercase tracking-widest text-amber-300 mb-3">Aviso ApolloGesCom</div>
+            <div className="whitespace-pre-wrap text-sm leading-relaxed bg-black/30 rounded p-4 min-h-[120px]">
+              {previewAvisoText()}
+            </div>
+            <p className="text-[10px] text-slate-300 mt-3 text-center">
+              Visualización: {
+                ({
+                  '01': 'Botón Aceptar al inicio',
+                  '02': 'Espera 5 s', '03': 'Espera 15 s', '04': 'Espera 30 s', '05': 'Espera 180 s',
+                  '06': 'Espera 60 s', '07': 'Espera 120 s', '08': 'Espera 240 s', '09': 'Espera 300 s',
+                } as Record<string, string>)[bannerForm.m_showmode] || bannerForm.m_showmode
+              }
+            </p>
+            <button
+              type="button"
+              onClick={() => setShowAvisoPreview(false)}
+              className="mt-4 w-full py-2 rounded bg-amber-500 hover:bg-amber-400 text-slate-900 font-black uppercase text-xs"
+            >
+              Aceptar
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showAvisosCatalog && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-amber-500/30 rounded-3xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto space-y-4 text-slate-300">
+            <div className="flex justify-between items-center border-b border-white/5 pb-3">
+              <div>
+                <h3 className="text-lg font-black text-white">Carteles de aviso</h3>
+                <p className="text-[11px] text-slate-400">Tabla misi_messages — los mismos textos que usa GesActi en el ERP del cliente.</p>
+              </div>
+              <button onClick={() => setShowAvisosCatalog(false)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400"><X size={20} /></button>
+            </div>
+            {erpTemplates.length === 0 ? (
+              <p className="text-xs text-rose-400">No hay carteles en MySQL o falló la conexión.</p>
+            ) : (
+              <div className="space-y-2">
+                {erpTemplates.map((t: any) => (
+                  <button
+                    type="button"
+                    key={t.m_num ?? t.id}
+                    onClick={() => setAvisoEdit({
+                      m_num: Number(t.m_num ?? t.id),
+                      m_des: t.m_des || t.label || '',
+                      m_text: (t.m_text || t.text || '').replace(/CRLF/g, '\n'),
+                    })}
+                    className={`w-full text-left p-3 rounded-xl border transition-all ${avisoEdit.m_num === Number(t.m_num ?? t.id) ? 'border-amber-500/50 bg-amber-500/10' : 'border-white/5 bg-white/5 hover:bg-white/10'}`}
+                  >
+                    <div className="text-[11px] font-black text-amber-400">{t.m_num ?? t.id} — {t.m_des || t.label}</div>
+                    <div className="text-[11px] text-slate-400 mt-1 whitespace-pre-wrap line-clamp-3">{(t.m_text || t.text || '').replace(/CRLF/g, '\n') || '(sin texto)'}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 pt-2 border-t border-white/5">
+              <input
+                type="number"
+                min={1}
+                placeholder="Nº"
+                value={avisoEdit.m_num || ''}
+                onChange={e => setAvisoEdit({ ...avisoEdit, m_num: parseInt(e.target.value) || 0 })}
+                className="sm:col-span-1 bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white"
+              />
+              <input
+                placeholder="Nombre del cartel"
+                value={avisoEdit.m_des}
+                onChange={e => setAvisoEdit({ ...avisoEdit, m_des: e.target.value })}
+                className="sm:col-span-3 bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white"
+              />
+              <textarea
+                placeholder="Texto que verá el cliente (Enter = salto de línea)"
+                value={avisoEdit.m_text}
+                onChange={e => setAvisoEdit({ ...avisoEdit, m_text: e.target.value })}
+                rows={4}
+                className="sm:col-span-4 bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white resize-none"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => setAvisoEdit({ m_num: (erpTemplates.reduce((m: number, t: any) => Math.max(m, Number(t.m_num || t.id || 0)), 0) + 1), m_des: '', m_text: '' })} className="px-4 py-2 rounded-xl border border-white/10 text-[10px] font-black uppercase">Nuevo</button>
+              <button type="button" onClick={saveAvisoTemplate} className="flex-1 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-[10px] font-black uppercase">Guardar cartel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showEstadosCtaModal && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-teal-500/30 rounded-3xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto space-y-4 text-slate-300">
+            <div className="flex justify-between items-center border-b border-white/5 pb-3">
+              <div>
+                <h3 className="text-lg font-black text-white">Estados de Cuenta Corriente</h3>
+                <p className="text-[11px] text-slate-400">
+                  Catálogo ClasiCli del ERP (Cobranzas → Estados de Ctas Ctes). Se usa para clasificar clientes (CCLAS).
+                </p>
+              </div>
+              <button onClick={() => setShowEstadosCtaModal(false)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400"><X size={20} /></button>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleSyncEstadosCtaErp}
+                className="px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-[10px] font-black uppercase"
+              >
+                Sincronizar desde ERP
+              </button>
+              <button
+                type="button"
+                onClick={() => loadEstadosCta(false)}
+                className="px-4 py-2 rounded-xl border border-white/10 text-[10px] font-black uppercase"
+              >
+                Recargar
+              </button>
+            </div>
+
+            {estadosCtaLoading ? (
+              <p className="text-xs text-slate-500 py-6 text-center">Cargando…</p>
+            ) : estadosCta.length === 0 ? (
+              <p className="text-xs text-amber-400 py-4">Sin estados. Tocá «Sincronizar desde ERP» para importar ClasiCli.</p>
+            ) : (
+              <div className="space-y-2 max-h-[40vh] overflow-y-auto">
+                {estadosCta.map((e: any) => (
+                  <div
+                    key={e.id}
+                    className={`flex items-center justify-between gap-3 p-3 rounded-xl border ${e.activo === false ? 'opacity-50 border-white/5 bg-white/[0.02]' : 'border-white/5 bg-white/5'}`}
+                  >
+                    <button
+                      type="button"
+                      className="text-left min-w-0 flex-1"
+                      onClick={() => setEstadoCtaEdit({
+                        id: e.id,
+                        codigo: e.codigo,
+                        descripcion: e.descripcion || '',
+                        activo: e.activo !== false,
+                      })}
+                    >
+                      <div className="text-[11px] font-black text-teal-400 font-mono">{e.codigo}</div>
+                      <div className="text-xs text-slate-200 truncate">{e.descripcion}</div>
+                      <div className="text-[9px] text-slate-500 uppercase mt-0.5">{e.origen || 'manual'}{e.activo === false ? ' · inactivo' : ''}</div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteEstadoCta(e)}
+                      className="px-2 py-1 rounded-lg text-[9px] font-black uppercase text-rose-400 border border-rose-500/20 hover:bg-rose-500/10"
+                    >
+                      Baja
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 pt-2 border-t border-white/5">
+              <input
+                placeholder="Código"
+                disabled={!!estadoCtaEdit.id}
+                value={estadoCtaEdit.codigo}
+                onChange={e => setEstadoCtaEdit({ ...estadoCtaEdit, codigo: e.target.value })}
+                className="sm:col-span-1 bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white font-mono disabled:opacity-60"
+              />
+              <input
+                placeholder="Descripción (ej. DEBITO AUTOMATICO)"
+                value={estadoCtaEdit.descripcion}
+                onChange={e => setEstadoCtaEdit({ ...estadoCtaEdit, descripcion: e.target.value })}
+                className="sm:col-span-2 bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white"
+              />
+              <label className="sm:col-span-1 flex items-center gap-2 text-[10px] font-bold uppercase text-slate-400 px-1">
+                <input
+                  type="checkbox"
+                  checked={estadoCtaEdit.activo}
+                  onChange={e => setEstadoCtaEdit({ ...estadoCtaEdit, activo: e.target.checked })}
+                  className="accent-teal-500"
+                />
+                Activo
+              </label>
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setEstadoCtaEdit({ codigo: '', descripcion: '', activo: true })}
+                className="px-4 py-2 rounded-xl border border-white/10 text-[10px] font-black uppercase"
+              >
+                Nuevo
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveEstadoCta}
+                className="flex-1 py-2 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-[10px] font-black uppercase"
+              >
+                {estadoCtaEdit.id ? 'Actualizar estado' : 'Alta estado'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showReportsModal && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-indigo-500/30 rounded-3xl p-6 max-w-5xl w-full max-h-[92vh] overflow-y-auto space-y-4 text-slate-300">
+            <div className="flex justify-between items-start border-b border-white/5 pb-3 gap-3">
+              <div>
+                <h3 className="text-lg font-black text-white flex items-center gap-2">
+                  <FileText className="text-indigo-400" size={18} /> Reportes serial
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-1 font-mono">{reportsSerial}</p>
+                <p className="text-[10px] text-slate-500 mt-0.5">Igual que GesActi → Licencias → Reportes → Nodos / System</p>
+              </div>
+              <button type="button" onClick={() => setShowReportsModal(false)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400"><X size={20} /></button>
+            </div>
+            <div className="flex flex-wrap gap-2 items-end">
+              <div>
+                <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Desde</label>
+                <input type="date" value={reportsFrom} onChange={e => setReportsFrom(e.target.value)} className="bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white" />
+              </div>
+              <div>
+                <label className="text-[10px] font-bold text-slate-500 uppercase block mb-1">Hasta</label>
+                <input type="date" value={reportsTo} onChange={e => setReportsTo(e.target.value)} className="bg-slate-800 border border-white/10 rounded-xl px-3 py-2 text-xs text-white" />
+              </div>
+              <button type="button" onClick={loadErpReports} className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-black uppercase">
+                Buscar reportes
+              </button>
+            </div>
+            {erpReportsLoading ? (
+              <div className="py-10 flex justify-center"><div className="animate-spin rounded-full h-8 w-8 border-2 border-indigo-500 border-t-transparent" /></div>
+            ) : erpReports.length === 0 ? (
+              <p className="text-xs text-slate-500 italic py-6 text-center">Sin reportes en el rango (o todavía no buscaste).</p>
+            ) : (
+              <div className="overflow-x-auto rounded-2xl border border-white/5">
+                <table className="w-full text-left text-[11px]">
+                  <thead>
+                    <tr className="bg-white/5 text-slate-400 font-black uppercase">
+                      <th className="p-2">Fecha</th>
+                      <th className="p-2">Hora</th>
+                      <th className="p-2 text-right"># Fac</th>
+                      <th className="p-2">Fec Fac 1</th>
+                      <th className="p-2">Fec Fac 2</th>
+                      <th className="p-2">IP Ext</th>
+                      <th className="p-2">IP+MAC</th>
+                      <th className="p-2 text-right">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {erpReports.map((r: any) => (
+                      <tr key={r.KeyID} className={`border-t border-white/5 ${selectedReportId === r.KeyID ? 'bg-indigo-500/10' : 'hover:bg-white/[0.03]'}`}>
+                        <td className="p-2 font-mono">{r.r_date || '—'}</td>
+                        <td className="p-2 font-mono">{r.r_hour || '—'}</td>
+                        <td className="p-2 text-right font-mono">{r.r_regfac ?? '—'}</td>
+                        <td className="p-2 font-mono">{r.r_FeFacI || '—'}</td>
+                        <td className="p-2 font-mono">{r.r_FeFacF || '—'}</td>
+                        <td className="p-2 font-mono text-[10px]">{r.r_ipexterna || '—'}</td>
+                        <td className="p-2 font-mono text-[10px] max-w-[160px] truncate" title={r.r_NetMac}>{r.r_NetMac || '—'}</td>
+                        <td className="p-2 text-right whitespace-nowrap">
+                          <button type="button" onClick={() => loadReportNodes(r.KeyID)} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 text-[9px] font-black uppercase mr-1">Nodos</button>
+                          <button type="button" onClick={() => loadReportSystem(r.KeyID)} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 text-[9px] font-black uppercase">System</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {reportDetailTab === 'nodes' && reportNodes && (
+              <div className="space-y-2 border-t border-white/5 pt-3">
+                <h4 className="text-xs font-black text-white uppercase">
+                  Nodos · Total {reportNodes.total} · &lt;60 días {reportNodes.recent_60} · &gt;60 días {reportNodes.stale_60}
+                </h4>
+                <div className="max-h-56 overflow-y-auto rounded-xl border border-white/5 divide-y divide-white/5">
+                  {(reportNodes.nodes || []).map((n: any) => (
+                    <div key={n.KeyID} className={`p-2 text-[10px] ${n.stale ? 'text-rose-400' : 'text-slate-300'}`}>
+                      <div className="font-bold text-white">{n.n_id || '—'} <span className="text-slate-500 font-normal">· {n.n_user || '—'}</span></div>
+                      <div className="font-mono truncate text-slate-500">{n.n_path}</div>
+                      <div className="mt-0.5">Act {n.n_active || '—'} · Acc {n.n_acces || '—'} · {n.n_netmac || ''}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {reportDetailTab === 'system' && (
+              <div className="space-y-2 border-t border-white/5 pt-3">
+                <h4 className="text-xs font-black text-white uppercase">System / Empresa</h4>
+                {reportSystem.length === 0 ? (
+                  <p className="text-xs text-slate-500 italic">Sin registros system.</p>
+                ) : reportSystem.map((s: any) => (
+                  <div key={s.KeyID} className="p-3 rounded-xl bg-white/5 text-[11px] grid grid-cols-2 gap-2">
+                    <div><span className="text-slate-500">Nombre</span><div className="font-bold text-white">{s.s_name || '—'}</div></div>
+                    <div><span className="text-slate-500">Empresa</span><div className="font-bold text-white">{s.s_empre || '—'}</div></div>
+                    <div className="col-span-2"><span className="text-slate-500">Razón</span><div className="font-bold text-white">{s.s_raso || '—'}</div></div>
+                    <div><span className="text-slate-500">CUIT</span><div className="font-mono">{s.s_cuit || '—'}</div></div>
+                    <div><span className="text-slate-500">CliGes</span><div className="font-mono">{s.s_cliges || '—'}</div></div>
+                    <div><span className="text-slate-500">Localidad</span><div>{s.s_loc || '—'}</div></div>
+                    <div><span className="text-slate-500">Tel</span><div>{s.s_tel || '—'}</div></div>
+                    <div className="col-span-2"><span className="text-slate-500">Mail</span><div>{s.s_mail || '—'}</div></div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {showLicenseModal && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in">
-          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl p-8 max-w-md w-full space-y-6 shadow-2xl animate-in zoom-in-95">
+          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl px-6 pt-6 pb-5 max-w-[360px] w-full space-y-5 shadow-2xl animate-in zoom-in-95">
             <div className="flex justify-between items-center">
-              <h3 className="text-xl font-black text-white flex items-center gap-2">
+              <h3 className="text-lg font-black text-white flex items-center gap-2">
                 <Sparkles className="text-brand-500" /> Generar Licencia
               </h3>
               <button onClick={() => setShowLicenseModal(false)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400 transition-all">
@@ -6024,9 +8866,9 @@ export default function App() {
               </button>
             </div>
             
-            <div className="space-y-4">
+            <div className="space-y-4 pt-2">
               <div>
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Cliente Asociado</label>
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2.5">Cliente Asociado</label>
                 <select 
                   className="w-full bg-slate-800/80 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 transition-all text-sm" 
                   value={licClientId}
@@ -6086,9 +8928,9 @@ export default function App() {
 
       {deviceNotesModal && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in">
-          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl p-8 max-w-lg w-full space-y-6 shadow-2xl animate-in zoom-in-95">
+          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl px-6 pt-6 pb-5 max-w-[420px] w-full space-y-5 shadow-2xl animate-in zoom-in-95">
             <div className="flex justify-between items-center">
-              <h3 className="text-xl font-black text-white flex items-center gap-2">
+              <h3 className="text-lg font-black text-white flex items-center gap-2">
                 <FileText className="text-purple-500 animate-pulse" /> Notas de {deviceNotesModal.name}
               </h3>
               <button onClick={() => setDeviceNotesModal(null)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400 transition-all">
@@ -6096,7 +8938,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="space-y-4">
+            <div className="space-y-4 pt-2">
               <p className="text-xs text-slate-400">
                 Guarda recordatorios, claves de Windows, usuarios de red o cualquier anotación importante sobre esta terminal.
               </p>
@@ -6104,7 +8946,7 @@ export default function App() {
               <div>
                 <textarea
                   rows={10}
-                  className="w-full bg-slate-800/80 border border-white/10 rounded-2xl px-4 py-3.5 text-white outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/20 transition-all text-sm font-mono"
+                  className="w-full bg-slate-800/80 border border-white/10 rounded-2xl px-4 py-3.5 leading-5 text-white outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-500/20 transition-all text-sm font-mono"
                   value={deviceNotesModal.notes}
                   onChange={(e) => setDeviceNotesModal({ ...deviceNotesModal, notes: e.target.value })}
                   placeholder="Escribe aquí las claves de Windows, usuarios de red o notas..."
@@ -6132,9 +8974,9 @@ export default function App() {
 
       {assignModal && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in">
-          <div className="bg-slate-900 border border-indigo-500/30 rounded-3xl p-8 max-w-md w-full space-y-6 shadow-2xl animate-in zoom-in-95">
+          <div className="bg-slate-900 border border-indigo-500/30 rounded-3xl px-6 pt-6 pb-5 max-w-[360px] w-full space-y-5 shadow-2xl animate-in zoom-in-95">
             <div className="flex justify-between items-center">
-              <h3 className="text-xl font-black text-white flex items-center gap-2">
+              <h3 className="text-lg font-black text-white flex items-center gap-2">
                 <Sparkles className="text-indigo-500 animate-pulse" /> Activar Terminal
               </h3>
               <button onClick={() => setAssignModal(null)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400 transition-all">
@@ -6142,7 +8984,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="space-y-4">
+            <div className="space-y-4 pt-2">
               <p className="text-xs text-slate-400">
                 Selecciona la empresa o cliente al que deseas asignar la PC <strong className="text-white">{assignModal.device_name}</strong>. El agente Centinela recibirá la licencia asignada automáticamente.
               </p>
@@ -6279,9 +9121,9 @@ export default function App() {
 
       {showProfileModal && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in">
-          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl p-8 max-w-md w-full space-y-6 shadow-2xl animate-in zoom-in-95">
+          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl px-6 pt-6 pb-5 max-w-[360px] w-full space-y-5 shadow-2xl animate-in zoom-in-95">
             <div className="flex justify-between items-center">
-              <h3 className="text-xl font-black text-white flex items-center gap-2">
+              <h3 className="text-lg font-black text-white flex items-center gap-2">
                 <Camera className="text-brand-500 animate-pulse" /> Mi Perfil de Agente
               </h3>
               <button onClick={() => setShowProfileModal(false)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400 transition-all">
@@ -6289,7 +9131,7 @@ export default function App() {
               </button>
             </div>
 
-            <form onSubmit={handleSaveProfile} className="space-y-4">
+            <form onSubmit={handleSaveProfile} className="space-y-4 pt-2">
               {/* Imagen de Perfil y Preview */}
               <div className="flex flex-col items-center gap-3">
                 {profileForm.profile_picture ? (
@@ -6376,9 +9218,9 @@ export default function App() {
 
       {showUserAbmModal && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in">
-          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl p-8 max-w-md w-full space-y-6 shadow-2xl animate-in zoom-in-95 max-h-[90vh] overflow-y-auto scrollbar-thin">
+          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl px-6 pt-6 pb-5 max-w-[360px] w-full space-y-5 shadow-2xl animate-in zoom-in-95 max-h-[90vh] overflow-y-auto scrollbar-thin">
             <div className="flex justify-between items-center">
-              <h3 className="text-xl font-black text-white flex items-center gap-2">
+              <h3 className="text-lg font-black text-white flex items-center gap-2">
                 <Shield className="text-brand-500 animate-pulse" /> {selectedUserForEdit ? 'Editar Miembro del Plantel' : 'Registrar Nuevo Personal'}
               </h3>
               <button onClick={() => setShowUserAbmModal(false)} className="hover:bg-white/10 p-2 rounded-xl text-slate-400 transition-all">
@@ -6386,7 +9228,7 @@ export default function App() {
               </button>
             </div>
 
-            <form onSubmit={handleSaveUserAbm} className="space-y-4">
+            <form onSubmit={handleSaveUserAbm} className="space-y-4 pt-2">
               {/* Imagen de Perfil y Preview */}
               <div className="flex flex-col items-center gap-3">
                 {userAbmForm.profile_picture ? (
@@ -6525,6 +9367,77 @@ export default function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Lic Facturadas (LisArtC) */}
+      {licFactModal.isOpen && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-50 flex items-center justify-center p-4 overflow-y-auto animate-in fade-in duration-200">
+          <div className={`relative w-full max-w-3xl rounded-3xl p-6 sm:p-8 flex flex-col max-h-[90vh] shadow-2xl border animate-in zoom-in-95 duration-200 ${darkMode ? 'glass-dark border-white/10 text-white' : 'bg-white border-slate-200 text-slate-800'}`}>
+            <div className="flex justify-between items-start gap-4 border-b pb-4 dark:border-white/10">
+              <div>
+                <span className="text-[10px] uppercase font-black tracking-widest text-teal-400 bg-teal-500/10 px-2.5 py-1 rounded-full">
+                  LisArtC · ERP
+                </span>
+                <h3 className="text-xl sm:text-2xl font-black mt-2 leading-none">
+                  Lic Facturadas: <span className="text-teal-400">{licFactModal.client?.razon_social}</span>
+                </h3>
+                <p className="text-xs text-slate-400 mt-1 font-medium">
+                  CCLIFAC: <strong className="font-mono text-slate-300">{licFactModal.client?.cclifac}</strong>
+                </p>
+              </div>
+              <button
+                onClick={() => setLicFactModal(prev => ({ ...prev, isOpen: false }))}
+                className="hover:bg-red-500/10 hover:text-red-500 p-2 rounded-xl transition-all"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto mt-4">
+              {licFactModal.loading ? (
+                <div className="py-16 text-center text-slate-400 text-sm">Consultando LisArtC…</div>
+              ) : licFactModal.items.length === 0 ? (
+                <div className="py-16 text-center text-slate-500 text-sm">Sin artículos facturados (códigos de 7 dígitos) para este cliente.</div>
+              ) : (
+                <table className="w-full text-left text-xs">
+                  <thead className="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+                    <tr>
+                      <th className="py-2 pr-2">Cód.</th>
+                      <th className="py-2 pr-2">Descripción</th>
+                      <th className="py-2 pr-2 text-right">Neto</th>
+                      <th className="py-2 pr-2 text-right">Final</th>
+                      <th className="py-2 pr-2 text-right">Cant.</th>
+                      <th className="py-2 text-right">Parte</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {licFactModal.items.map((row, idx) => (
+                      <tr key={`${row.l_art}-${idx}`} className="border-b border-white/5">
+                        <td className="py-2.5 pr-2 font-mono text-teal-300">{row.l_art}</td>
+                        <td className="py-2.5 pr-2 text-slate-200">{row.a_des || '—'}</td>
+                        <td className="py-2.5 pr-2 text-right font-mono">{Number(row.precio_neto || 0).toLocaleString('es-AR', { minimumFractionDigits: 2 })}</td>
+                        <td className="py-2.5 pr-2 text-right font-mono font-bold">{Number(row.precio_final || 0).toLocaleString('es-AR', { minimumFractionDigits: 2 })}</td>
+                        <td className="py-2.5 pr-2 text-right font-mono">{row.l_can}</td>
+                        <td className="py-2.5 text-right font-mono text-slate-500">{row.l_parte || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            <div className="mt-4 pt-4 border-t dark:border-white/10 flex justify-between items-center">
+              <span className="text-xs text-slate-400">{licFactModal.items.length} ítem(s)</span>
+              <button
+                type="button"
+                onClick={() => setLicFactModal(prev => ({ ...prev, isOpen: false }))}
+                className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-bold text-white border border-white/5"
+              >
+                Cerrar
+              </button>
+            </div>
           </div>
         </div>
       )}

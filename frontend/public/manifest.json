@@ -1,23 +1,41 @@
 {
+  "id": "/",
   "short_name": "ApolloSoporte",
-  "name": "ApolloSoporte: Asistencia Remota Activa",
+  "name": "ApolloSupport: Asistencia Remota",
+  "description": "Panel de soporte remoto y monitoreo Centinela — Master IS",
   "icons": [
     {
-      "src": "icon-192.png",
+      "src": "/icon-192.png",
       "type": "image/png",
       "sizes": "192x192",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
-      "src": "icon-512.png",
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon-512.png",
       "type": "image/png",
       "sizes": "512x512",
-      "purpose": "any maskable"
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "maskable"
     }
   ],
   "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "browser"],
+  "orientation": "any",
   "background_color": "#0f172a",
   "theme_color": "#f59e0b",
-  "display": "standalone",
-  "orientation": "any"
+  "categories": ["business", "productivity"],
+  "prefer_related_applications": false
 }

@@ -1,0 +1,28 @@
+ApolloSupport — Novedades 3.2.6j
+Fecha: 2026-08-31
+
+1) Teclado / mouse en control remoto
+   - Clic en la pantalla remota quita el foco de TECLADO/CONSOLA.
+   - Backend: input a la sesión activa + write-lock (no corrompe el WS).
+   - Agente: Input Desktop + keybd_event + texto Unicode SendInput.
+
+2) Un solo companion (Consola vs AnyDesk)
+   - El servicio mata companions de otras sesiones Windows.
+
+3) Centinela compilado 3.2.6 (en el puente)
+   - dist\: ApolloCentinela_x86/x64 + Service x86/x64
+   - installer_output\:
+       ApolloSetup_v3.2.6.exe
+       ApolloSetup_v3.2.6_x64.exe
+       ApolloSetup_v3.2.6_x86.exe
+
+4) Duplicado pending + asignado (ej. ID 456 453 Schanton)
+   - Reconexión sin licencia ya no crea fila fantasma "Asignar Licencia".
+   - /pending autolimpia huérfanos gemelos al refrescar.
+
+5) Guía de despliegue
+   - Ver ACTUALIZAR_3.2.6j.txt en la raíz del puente.
+
+Pruebas internas:
+   python scripts/test_remote_control.py
+   python scripts/test_pending_dedup.py

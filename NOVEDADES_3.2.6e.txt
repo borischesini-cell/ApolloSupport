@@ -1,0 +1,21 @@
+ApolloSupport — Novedades 3.2.6e
+Fecha: 2026-08-26
+
+1) Fix: habilitar / desactivar dispositivo Android o PC (TCK)
+   - Causa: android_proxy.php en masterisi.com.ar no tenía acción toggle.
+   - Subir backend/deploy/android_proxy.php al hosting www.masterisi.com.ar
+     (misma carpeta donde está el proxy actual).
+   - Backend usa POST toggle; valida filas afectadas y mensajes claros.
+
+2) UI: toasts en lugar de alert() rojos
+   - Éxito en verde, error en rojo, avisos en índigo/ámbar.
+   - Aplica a activar dispositivo, asignar licencia Centinela y guardar cliente.
+
+Despliegue:
+   - masterisi.com.ar: reemplazar android_proxy.php (CRÍTICO para toggle)
+   - Servidor Support: backend erp_licensing.py + frontend dist
+   - Reiniciar ApolloBackend
+
+Verificación:
+   - Dispositivos Android → cliente → Activar → debe quedar habilitado.
+   - Si falla, toast con mensaje detallado (no alert genérico).

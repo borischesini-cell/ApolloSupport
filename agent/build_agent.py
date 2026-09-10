@@ -9,9 +9,13 @@ output_dir = os.path.join(base_dir, "dist")
 
 print(f"[*] Iniciando compilación de ApolloSupport Centinela...")
 
-# Limpiar compilaciones anteriores
-if os.path.exists(output_dir):
-    shutil.rmtree(output_dir)
+# Limpiar compilación anterior de ApolloCentinela
+exe_target = os.path.join(output_dir, "ApolloCentinela.exe")
+if os.path.exists(exe_target):
+    try:
+        os.remove(exe_target)
+    except Exception as e:
+        print(f"[!] Advertencia al eliminar {exe_target}: {e}")
 
 PyInstaller.__main__.run([
     script_path,

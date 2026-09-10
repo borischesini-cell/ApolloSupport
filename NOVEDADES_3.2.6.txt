@@ -1,0 +1,59 @@
+ApolloSupport — Novedades 3.2.6 (actualización 2026-08-20)
+============================================================
+
+Build portal: 2026-08-20 · Agente Centinela: sin cambio (3.2.5)
+
+
+NUEVO EN ESTA ENTREGA
+---------------------
+1) Lic Facturadas (LisArtC)
+   - Base Clientes → botón "Lic Fac" (requiere CCLIFAC).
+   - Muestra artículos facturados del ERP: código, descripción, neto, final, cantidad, parte.
+   - Equivalente a GesActi → Lic Facturadas / ListArt.
+
+2) Activaciones OnLine (misi_request)
+   - Menú lateral: "Activaciones OL".
+   - Solicitudes pendientes (o todas).
+   - Acciones: Activar / Denegar / Pendiente / +Msg / +Fecha.
+   - Equivalente a GesActi ActiPenOL / ActivarNormal (MySQL web).
+
+3) Extensiones OnLine (misi_extension)
+   - Menú lateral: "Extensiones OL".
+   - Pedidos con e_newdate vacío.
+   - "Generar" → nueva fecha de licencia (e_date + l_period o fecha elegida).
+   - Equivalente a GesActi ExtenOl.
+
+
+YA INCLUIDO EN 3.2.6 (recordatorio)
+-----------------------------------
+- Panel marcas Todo/Nada/Invierte + Monitoreo masivo (cartel/corte/fecha)
+- Catálogo carteles misi_messages + filtro por tipo
+- Extracto / Saldo / Últ. pago (CULPA)
+- Activaciones ERP: seriales, terminales, reportes/nodos/system
+- Alta cliente GesActi + escritura CLIGESCO.DBF (M:\programa)
+- Generar serial GesActi (módulos + CRC)
+- Dispositivos Móviles (misi_licand activar/desactivar)
+
+
+API NUEVAS
+----------
+GET  /api/erp/clientes/{id}/lic-facturadas
+GET  /api/erp-licenses/activation-requests?pending_only=
+POST /api/erp-licenses/activation-requests/{id}/resolve
+GET  /api/erp-licenses/extensions?pending_only=
+POST /api/erp-licenses/extensions/{id}/approve
+
+
+DESPLIEGUE
+----------
+1. Reiniciar backend en el servidor (cargar main.py / erp_licensing / erp_bridge).
+2. Publicar frontend/dist (incluye sw-v3.2.6.js).
+3. Hard refresh o esperar banner PWA de actualización.
+
+
+NOTAS
+-----
+- Activaciones/Extensiones OL escriben solo MySQL web (apolloge_masterisi),
+  no el servidor local 192.168.10.24.
+- Lic Facturadas: neto con IVA 21% (aprox. GetDgi).
+- No hace falta reinstalar el agente MSI.

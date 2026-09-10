@@ -1,0 +1,51 @@
+ApolloSupport — Novedades 3.2.6b
+Fecha: 2026-08-20
+
+Base Clientes / GesActi OnLine (complemento a 3.2.6)
+
+
+NUEVO
+=====
+1) Lic Facturadas (LisArtC)
+   - En Base Clientes: botón "Lic Fac" (requiere CCLIFAC).
+   - Lista artículos facturados del ERP (código, descripción, neto, final, cantidad, parte).
+   - Misma lógica que GesActi → Lic Facturadas / ListArt.
+
+2) Activaciones OnLine (misi_request)
+   - Menú lateral: "Activaciones OL".
+   - Listado de solicitudes pendientes (o todas).
+   - Acciones: Activar / Denegar / Pendiente / +Msg / +Fecha.
+   - Equivalente a GesActi ActiPenOL / ActivarNormal (sobre MySQL web).
+
+3) Extensiones OnLine (misi_extension)
+   - Menú lateral: "Extensiones OL".
+   - Listado de extensiones pendientes (e_newdate vacío).
+   - Botón "Generar": actualiza fecha de licencia + e_newdate.
+   - Equivalente a GesActi ExtenOl.
+
+
+API (backend)
+=============
+- GET  /api/erp/clientes/{id}/lic-facturadas
+- GET  /api/erp-licenses/activation-requests
+- POST /api/erp-licenses/activation-requests/{id}/resolve
+- GET  /api/erp-licenses/extensions
+- POST /api/erp-licenses/extensions/{id}/approve
+
+
+NOTAS
+=====
+- Activaciones/Extensiones escriben solo MySQL web (apolloge_masterisi),
+  no el servidor local 192.168.10.24.
+- Lic Facturadas calcula neto con IVA 21% (aproximación GetDgi).
+- No requiere actualizar el agente Centinela (sigue en 3.2.5).
+
+
+ARCHIVOS PRINCIPALES
+====================
+- backend/core/erp_bridge.py
+- backend/erp_licensing.py
+- backend/main.py
+- frontend/src/App.tsx
+- frontend/src/api.ts
+- docs/GESACTI_PARIDAD.md

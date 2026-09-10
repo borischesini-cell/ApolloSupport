@@ -1,0 +1,26 @@
+ApolloSupport — Novedades 3.2.6g
+Fecha: 2026-08-26
+
+ACTIVAR DISPOSITIVOS — paso obligatorio en masterisi.com.ar
+-----------------------------------------------------------
+El error del toast es correcto: el hosting aún no tiene el endpoint de toggle.
+
+Subir UN archivo NUEVO (no rompe el listado actual):
+  Y:\ApolloSupport\backend\deploy\android_proxy_toggle.php
+  → www.masterisi.com.ar/android_proxy_toggle.php
+
+Instrucciones detalladas:
+  Y:\ApolloSupport\backend\deploy\SUBIR_A_MASTERISI.txt
+
+Luego en Support:
+  - Copiar backend\erp_licensing.py
+  - Reiniciar ApolloBackend
+
+Prueba rápida (navegador):
+  https://www.masterisi.com.ar/android_proxy_toggle.php?key=Apollo_Masterisi_Proxy_2025_SecureKey&id=1&status=0
+  → JSON (success o not_found), no HTML 404
+
+Backend 3.2.6g intenta en orden:
+  1) MySQL directo (si LICENMOVIL_MYSQL_HOST en .env)
+  2) android_proxy_toggle.php (nuevo)
+  3) android_proxy.php?action=toggle (proxy completo actualizado)

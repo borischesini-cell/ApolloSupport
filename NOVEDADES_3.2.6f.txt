@@ -1,0 +1,22 @@
+ApolloSupport — Novedades 3.2.6f
+Fecha: 2026-08-26
+
+1) Fix Unauthorized al activar dispositivo TCK/Android
+   - El toggle usaba POST y la clave iba en el body; el proxy solo leía ?key= en la URL.
+   - Backend ahora usa GET con todos los parámetros en query (misma auth que summary/client).
+
+2) PASO OBLIGATORIO en masterisi.com.ar
+   - Subir/reemplazar android_proxy.php (carpeta pública del sitio).
+   - Archivo: Y:\ApolloSupport\backend\deploy\android_proxy.php
+   - Sin esto sigue respondiendo "Invalid action" (proxy viejo sin toggle).
+
+3) UI dispositivos móviles
+   - Sin window.confirm ni alert: modal de confirmación integrado al portal.
+   - Toasts verde/rojo para resultado.
+
+Despliegue Support:
+   - backend\erp_licensing.py + frontend\dist\
+   - Reiniciar ApolloBackend
+
+Verificación:
+   - Dispositivos Móviles → Activar TCK → modal → Activar → toast verde.

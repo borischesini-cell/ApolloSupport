@@ -1,0 +1,94 @@
+ApolloSupport — Instrucciones para agente Cursor (SERVIDOR DE PRODUCCIÓN)
+Versión: 3.2.6j
+Fecha: 2026-09-07
+Máquina: servidor Support (Apache + ApolloBackend + PostgreSQL 192.168.11.223)
+
+================================================================================
+CONTEXTO
+================================================================================
+Puente de archivos (origen):
+  \\192.168.11.20\Puente\ApolloSupport
+  (o Y:\ApolloSupport si está mapeado)
+
+Destino en ESTE servidor:
+  Backend:   C:\ApolloSupport\backend\
+  Frontend:  C:\Apache24\htdocs\apollosupport\
+  Servicio:  ApolloBackend  (uvicorn puerto 127.0.0.1:8001, proxy Apache /api)
+
+Cambios incluidos en el puente:
+  - Teclado/mouse remoto (routing WS + inyección agente)
+  - Dedup pending + asignado (mismo assist_id / hostname)
+  - Fix pantalla negra: send_json_safe usa send_json_to_device (sesiones WS vivas)
+  - verify_remote_password siempre manda technician_joined + refresh_frame
+  - Dashboard: botones "Liberar sesión" (candado) y "Forzar refresh" (flecha circular) en cada device
+
+DB (ya hecho desde dev, no repetir salvo duplicados nuevos):
+  - Schanton: eliminado duplicado assist 331446 (id 804). Queda 456453 (id 811).
+
+================================================================================
+TAREA PARA EL AGENTE CURSOR — EJECUTAR EN ORDEN
+================================================================================
+
+1) COPIAR DESDE EL PUENTE
+
+   $puente = "\\192.168.11.20\Puente\ApolloSupport"
+   # Si no existe, probar: Y:\ApolloSupport
+
+   Copy-Item "$puente\backend\main.py"      "C:\ApolloSupport\backend\main.py" -Force
+   Copy-Item "$puente\backend\models.py"    "C:\ApolloSupport\backend\models.py" -Force
+   Copy-Item "$puente\backend\schemas.py"   "C:\ApolloSupport\backend\schemas.py" -Force
+   Copy-Item "$puente\backend\updates\version.json" "C:\ApolloSupport\backend\updates\version.json" -Force
+
+   robocopy "$puente\frontend\dist" "C:\Apache24\htdocs\apollosupport" /MIR /R:2 /W:3
+
+2) REINICIAR BACKEND
+
+   nssm restart ApolloBackend
+   # Si nssm no está en PATH:
+   #   C:\ApolloSupport\backend\venv\Scripts\nssm.exe restart ApolloBackend
+   # Alternativa:
+   #   Restart-Service ApolloBackend -Force
+   #   sc stop ApolloBackend && timeout /t 3 && sc start ApolloBackend
+
+3) VERIFICAR
+
+   sc query ApolloBackend
+   # Debe estar RUNNING
+
+   curl -s http://127.0.0.1:8001/api/version
+   # Debe responder JSON con versión 3.2.6
+
+   curl -s http://127.0.0.1:8001/api/hq-test
+   # Debe responder (health del módulo HQ)
+
+   type C:\Apache24\htdocs\apollosupport\version.txt
+   # Debe mostrar build 2026-08-31
+
+4) NO TOCAR EN ESTE SERVIDOR (salvo pedido explícito)
+
+   - No reinstalar ApolloCentinela aquí (eso es en PCs cliente)
+   - No modificar .env ni credenciales DB
+   - No hacer commit git
+
+================================================================================
+PRUEBA POST-DEPLOY (manual en navegador)
+================================================================================
+  https://support.ultimate.net.ar  → Ctrl+F5
+  Terminal Remota → CASA SCHANTON → ServidorWS2022 ID 456453
+  Debe mostrar imagen (no quedarse en "Esperando imagen..." con agente online)
+  Probar teclado: clic en pantalla + Enter en campo TECLADO
+
+================================================================================
+SI SIGUE PANTALLA NEGRA CON AGENTE ONLINE
+================================================================================
+  - Confirmar que main.py copiado tiene send_json_safe delegando a send_json_to_device
+  - Revisar C:\ApolloSupport\backend\logs\backend.log (errores WS)
+  - En la PC cliente ServidorWS2022 (AnyDesk): taskkill /F /IM ApolloCentinela.exe && net start ApolloCentinela
+
+================================================================================
+CHECKLIST
+================================================================================
+[ ] main.py + models + schemas + frontend/dist copiados
+[ ] ApolloBackend reiniciado y RUNNING
+[ ] /api/version responde 3.2.6
+[ ] Portal Ctrl+F5 — Schanton 456453 muestra video

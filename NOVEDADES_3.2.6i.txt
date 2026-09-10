@@ -1,0 +1,18 @@
+ApolloSupport — Novedades 3.2.6i
+Fecha: 2026-08-31
+
+1) ID de asistencia en el dashboard (= el que muestra ApolloSoporte)
+   - Antes el portal mostraba el ID de RustDesk (ej. 1885838254) y no
+     coincidía con el ID corto "645 750" que dicta el cliente.
+   - Ahora se guarda assist_id al conectar el agente y se muestra como ID.
+   - RustDesk / AnyDesk aparece aparte como "RD: ...".
+
+2) Si la PC no aparece en el dashboard
+   - Si ApolloSoporte dice "Conectando (Intento #N)..." NO llegó al servidor.
+   - Revisar firewall / salida HTTPS-WSS a support.ultimate.net.ar
+   - Cuando pase a "Listo para Recibir Soporte" → aparece en
+     Control Remoto → Terminales en Espera de Licencia.
+
+Despliegue:
+   - backend: main.py, models.py, schemas.py + reiniciar ApolloBackend
+   - frontend: dist/

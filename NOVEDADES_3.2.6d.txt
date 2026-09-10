@@ -1,0 +1,16 @@
+ApolloSupport — Novedades 3.2.6d
+Fecha: 2026-08-24
+
+1) Fix: editar cliente ya guarda correctamente
+   - Las fechas vacías del formulario ya no rechazan el guardado (422).
+   - Si falla CLIGESCO o la API, el alert muestra el error real del backend.
+   - Al guardar con código GesActi se actualiza PostgreSQL + M:\programa\CLIGESCO.DBF.
+
+Despliegue:
+   - Copiar frontend\dist\ al htdocs de Apache.
+   - Copiar backend\schemas.py (y resto del backend si aplica).
+   - Reiniciar servicio ApolloBackend.
+
+Verificación:
+   - Editar un cliente existente (ej. razón social / email) → Guardar → sin error.
+   - Cambio visible en GesActi tras sync o al reabrir el cliente.

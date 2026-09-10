@@ -70,24 +70,191 @@ class ERPBridge:
             raise RuntimeError(f"Error al consultar el ERP remoto en {url}: {e}")
 
     @classmethod
+    def parse_erp_date(cls, raw):
+        """Normaliza CULPA / fechas Harbour o DBF a datetime.date o None."""
+        from datetime import datetime, date
+        if raw in (None, "", "  /  /    ", "0000-00-00"):
+            return None
+        if isinstance(raw, date) and not isinstance(raw, datetime):
+            return raw
+        if isinstance(raw, datetime):
+            return raw.date()
+        text = str(raw).strip()
+        if "T" in text:
+            text = text.split("T", 1)[0]
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def get_client_account(cls, client_code: str) -> dict:
+        """Saldo (CSaldo) y fecha de último pago (CULPA) desde Ventas\\Clientes del ERP."""
+        code = str(client_code or "").strip()
+        if not code:
+            return {"saldo": 0.0, "fecha_ultimo_pago": None}
+
+        codes = [code]
+        if code.isdigit():
+            for n in (7, 5, 4):
+                padded = code.zfill(n)
+                if padded not in codes:
+                    codes.append(padded)
+            stripped = code.lstrip("0") or "0"
+            if stripped not in codes:
+                codes.append(stripped)
+
+        for c in codes:
+            args = {
+                "action": "browse",
+                "folder": "ventas",
+                "table": "clientes",
+                "orden": "Nil",
+                "filter": f'CCod=="{c}"',
+                "fields": '["CCod","CSaldo","CULPA"]',
+                "user": "--",
+            }
+            records = cls.execute(args) or []
+            for rec in records:
+                if not isinstance(rec, dict) or rec.get("error"):
+                    continue
+                saldo = float(rec.get("CSaldo", rec.get("CSALDO", 0.0)) or 0.0)
+                fecha = cls.parse_erp_date(rec.get("CULPA") or rec.get("CUlPa") or rec.get("Culpa"))
+                return {"saldo": saldo, "fecha_ultimo_pago": fecha, "ccod": str(rec.get("CCod") or c).strip()}
+
+        return {"saldo": 0.0, "fecha_ultimo_pago": None}
+
+    @classmethod
+    def browse_clientes_saldos(cls) -> dict:
+        """
+        Mapa CCod -> {saldo, fecha_ultimo_pago} desde Ventas\\Clientes (CSaldo / CULPA).
+        Una sola lectura del ERP para refrescar saldos en Support.
+        """
+        rows = cls.execute({
+            "action": "browse",
+            "folder": "ventas",
+            "table": "clientes",
+            "fields": '["CCod","CSaldo","CULPA"]',
+            "user": "--",
+        }) or []
+        out = {}
+        for rec in rows:
+            if not isinstance(rec, dict) or rec.get("error"):
+                continue
+            ccod = str(rec.get("CCod") or rec.get("CCOD") or "").strip()
+            if not ccod:
+                continue
+            saldo = float(rec.get("CSaldo", rec.get("CSALDO", 0.0)) or 0.0)
+            fecha = cls.parse_erp_date(rec.get("CULPA") or rec.get("CUlPa") or rec.get("Culpa"))
+            entry = {"saldo": saldo, "fecha_ultimo_pago": fecha}
+            out[ccod] = entry
+            # alias sin ceros a la izquierda
+            if ccod.isdigit():
+                out[ccod.lstrip("0") or "0"] = entry
+                out[ccod.zfill(7)] = entry
+        return out
+
+    @classmethod
     def get_client_balance(cls, client_code: str) -> float:
         """
         Consulta el saldo real actual del cliente en el ERP de gestión.
         """
-        args = {
+        return cls.get_client_account(client_code)["saldo"]
+
+    @classmethod
+    def get_estados_cuenta_corriente(cls) -> list:
+        """
+        Catálogo Ventas\\ClasiCli (Estados de Ctas Ctes del ERP).
+        Campos: CCod / CDesc (DaClasi en GesActi).
+        """
+        rows = cls.execute({
             "action": "browse",
             "folder": "ventas",
-            "table": "clientes",
-            "orden": "Nil",
-            "filter": f'CCod=="{client_code}"',
-            "fields": '["CSaldo"]',
-            "user": "--"
-        }
-        
-        records = cls.execute(args)
-        if records and len(records) > 0:
-            return float(records[0].get("CSaldo", 0.0))
-        return 0.0
+            "table": "clasicli",
+            "fields": '["CCod","CDesc"]',
+            "user": "--",
+        }) or []
+        out = []
+        for r in rows:
+            if not isinstance(r, dict) or r.get("error"):
+                continue
+            codigo = str(r.get("CCod") or r.get("CCOD") or "").strip()
+            if not codigo:
+                continue
+            desc = str(r.get("CDesc") or r.get("CDESC") or r.get("CDes") or "").strip()
+            out.append({"codigo": codigo, "descripcion": desc})
+        out.sort(key=lambda x: x["codigo"])
+        return out
+
+    @classmethod
+    def get_client_lic_facturadas(cls, client_code: str, iva_pct: float = 21.0) -> list:
+        """
+        Artículos facturados al cliente (Ventas\\LisArtC + Stock\\Articulo),
+        mismo listado que GesActi → Lic Facturadas / ListArt.
+        """
+        code = str(client_code or "").strip()
+        if not code:
+            return []
+
+        codes = [code]
+        if code.isdigit() and len(code) < 7:
+            codes.append(code.zfill(7))
+
+        rows = []
+        for c in codes:
+            args = {
+                "action": "browse",
+                "folder": "ventas",
+                "table": "lisartc",
+                "filter": f'LCli=="{c}"',
+                "fields": '["LCli","LArt","LPre","LCan","LParte","LCC"]',
+                "user": "--",
+            }
+            rows = cls.execute(args) or []
+            if rows:
+                break
+
+        art_map = {}
+        try:
+            arts = cls.execute({
+                "action": "browse",
+                "folder": "stock",
+                "table": "articulo",
+                "fields": '["ACod","ADes"]',
+                "user": "--",
+            }) or []
+            for a in arts:
+                if isinstance(a, dict) and a.get("error"):
+                    continue
+                acod = str(a.get("ACod") or "").strip()
+                if acod:
+                    art_map[acod] = str(a.get("ADes") or "").strip()
+        except Exception:
+            art_map = {}
+
+        iva = float(iva_pct or 0.0)
+        out = []
+        for r in rows:
+            if not isinstance(r, dict) or r.get("error"):
+                continue
+            art = str(r.get("LArt") or "").strip()
+            if len(art) != 7:
+                continue
+            pre = float(r.get("LPre") or 0.0)
+            neto = pre / ((100.0 + iva) / 100.0) if iva > 0 else pre
+            out.append({
+                "l_cli": str(r.get("LCli") or "").strip(),
+                "l_art": art,
+                "a_des": art_map.get(art, ""),
+                "precio_neto": round(neto, 5),
+                "precio_final": round(pre, 5),
+                "l_can": float(r.get("LCan") or 0.0),
+                "l_parte": str(r.get("LParte") or "").strip(),
+                "l_cc": str(r.get("LCC") or "").strip(),
+            })
+        return out
 
     @classmethod
     def get_client_extracto(cls, client_code: str, desde_iso: str = None, hasta_iso: str = None) -> list:

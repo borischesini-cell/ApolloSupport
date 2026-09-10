@@ -90,6 +90,21 @@ class Client(Base):
     devices = relationship("CentinelaDevice", back_populates="cliente")
     tickets = relationship("Ticket", back_populates="cliente")
 
+
+class EstadoCuentaCorriente(Base):
+    """
+    Catálogo ERP Ventas\\ClasiCli — Estados de Cuenta Corriente (Cobranzas).
+    Código = CCOD, descripción = CDESC. Los clientes lo referencian vía CCLAS.
+    """
+    __tablename__ = "estados_cuenta_corriente"
+
+    id = Column(Integer, primary_key=True, index=True)
+    codigo = Column(String(10), unique=True, index=True, nullable=False)
+    descripcion = Column(String(60), nullable=False, default="")
+    activo = Column(Boolean, default=True)
+    origen = Column(String(20), default="manual")  # 'erp' | 'manual'
+
+
 class Ticket(Base):
     """
     Representa una Tarea o Requerimiento que puede viajar entre áreas.
@@ -171,6 +186,8 @@ class CentinelaDevice(Base):
     device_name = Column(String, index=True)
     last_seen = Column(DateTime, default=datetime.datetime.utcnow)
     remote_password = Column(String, nullable=True)
+    # ID de asistencia mostrado en ApolloSoporte ("Dicte este ID"): 6 dígitos del config local
+    assist_id = Column(String, nullable=True, index=True)
     alt_remote_id = Column(String, nullable=True)
     is_online = Column(Boolean, default=False)
     current_technician_id = Column(Integer, ForeignKey("users.id"), nullable=True)
@@ -233,3 +250,66 @@ class RemoteLog(Base):
     level = Column(String, default="INFO")
     message = Column(Text)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class ScheduledRecording(Base):
+    """Grabación programada del escritorio remoto (Centinela)."""
+    __tablename__ = "scheduled_recordings"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    device_id = Column(Integer, ForeignKey("centinela_devices.id"), nullable=False)
+    technician_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    scheduled_at = Column(DateTime, nullable=False, index=True)
+    duration_minutes = Column(Integer, default=30)
+    status = Column(String, default="scheduled", index=True)  # scheduled|running|completed|failed|cancelled
+    support_session_id = Column(Integer, ForeignKey("support_sessions.id"), nullable=True)
+    file_path = Column(String, nullable=True)
+    file_size = Column(Integer, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    client = relationship("Client")
+    device = relationship("CentinelaDevice")
+    technician = relationship("User")
+
+
+class ScheduledMeeting(Base):
+    """Videoconferencia agendada (Jitsi)."""
+    __tablename__ = "scheduled_meetings"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    host_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String, nullable=False)
+    agenda = Column(Text, nullable=True)
+    starts_at = Column(DateTime, nullable=False, index=True)
+    duration_minutes = Column(Integer, default=30)
+    join_url = Column(String, nullable=False)
+    status = Column(String, default="scheduled", index=True)  # scheduled|live|completed|cancelled
+    notify_minutes_before = Column(Integer, default=15)
+    client_email = Column(String, nullable=True)
+    client_phone = Column(String, nullable=True)
+    alert_sent_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    client = relationship("Client")
+    host = relationship("User")
+
+
+class NotificationOutbox(Base):
+    """Cola de notificaciones (email / push / agent / internal)."""
+    __tablename__ = "notification_outbox"
+    id = Column(Integer, primary_key=True, index=True)
+    channel = Column(String, nullable=False)  # email|push|agent|internal
+    target = Column(String, nullable=True)
+    subject = Column(String, nullable=True)
+    body = Column(Text, nullable=False)
+    send_at = Column(DateTime, nullable=False, index=True)
+    sent_at = Column(DateTime, nullable=True)
+    status = Column(String, default="pending", index=True)  # pending|sent|failed
+    error_message = Column(Text, nullable=True)
+    ref_type = Column(String, nullable=True)  # meeting|recording
+    ref_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
