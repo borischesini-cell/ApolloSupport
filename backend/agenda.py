@@ -9,7 +9,7 @@ import os
 import smtplib
 import ssl
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import List, Optional
@@ -37,6 +37,15 @@ router = APIRouter(prefix="/api/agenda", tags=["Agenda"])
 
 _manager = None
 _send_push = None
+
+
+def as_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize API datetimes to naive UTC for DB columns / utcnow() comparisons."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def build_meeting_message(meeting: models.ScheduledMeeting, client_name: str = "") -> str:
@@ -141,6 +150,8 @@ def recording_out(row: models.ScheduledRecording) -> schemas.ScheduledRecordingO
         ended_at=row.ended_at,
         error_message=row.error_message,
         notes=row.notes,
+        windows_session_id=getattr(row, "windows_session_id", None),
+        windows_session_label=getattr(row, "windows_session_label", None),
         created_at=row.created_at,
         client_name=client_name,
         device_name=device_name,
@@ -206,6 +217,64 @@ async def notify_client_devices(client_id: int, message: str) -> bool:
     return sent
 
 
+async def _wait_device_online(device_id: int, timeout_sec: float = 90.0) -> bool:
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+    while asyncio.get_event_loop().time() < deadline:
+        if device_id in getattr(_manager, "active_connections", {}):
+            return True
+        await asyncio.sleep(1.5)
+    return False
+
+
+def _current_windows_session_id(device_id: int) -> Optional[int]:
+    sessions = getattr(_manager, "client_sessions", {}).get(device_id) or []
+    for s in sessions:
+        if s.get("current"):
+            try:
+                return int(s.get("id"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _ensure_recording_windows_session(device_id: int, target_session_id: Optional[int]) -> bool:
+    """Cambia a la sesión Windows pedida y espera a que Centinela vuelva online ahí."""
+    if not target_session_id or not _manager:
+        return True
+    target = int(target_session_id)
+    # Pedir lista fresca
+    await _manager.send_json_safe(device_id, {"type": "get_sessions"})
+    await asyncio.sleep(1.0)
+    cur = _current_windows_session_id(device_id)
+    if cur == target:
+        logger.info("[AGENDA] Device %s ya en sesión Windows %s", device_id, target)
+        return True
+
+    logger.info("[AGENDA] Switch device %s → sesión Windows %s (actual=%s)", device_id, target, cur)
+    ok = await _manager.send_json_safe(device_id, {"type": "switch_session", "session_id": target})
+    if not ok:
+        return False
+
+    # El companion suele desconectarse y reconectar en la sesión destino
+    await asyncio.sleep(3.0)
+    if not await _wait_device_online(device_id, timeout_sec=100.0):
+        return False
+
+    deadline = asyncio.get_event_loop().time() + 45.0
+    while asyncio.get_event_loop().time() < deadline:
+        await _manager.send_json_safe(device_id, {"type": "get_sessions"})
+        await asyncio.sleep(1.5)
+        cur = _current_windows_session_id(device_id)
+        if cur == target:
+            logger.info("[AGENDA] Device %s confirmado en sesión %s", device_id, target)
+            return True
+        # Si no hay lista aún pero el agente ya volvió, seguir esperando
+        if cur is None and device_id in getattr(_manager, "active_connections", {}):
+            continue
+    # Último recurso: agente online tras el switch (puede no haber reportado current)
+    return device_id in getattr(_manager, "active_connections", {})
+
+
 async def start_recording_job(row_id: int):
     db = SessionLocal()
     try:
@@ -220,13 +289,25 @@ async def start_recording_job(row_id: int):
             db.commit()
             return
 
+        target_sid = getattr(row, "windows_session_id", None)
+        if target_sid:
+            switched = await _ensure_recording_windows_session(row.device_id, int(target_sid))
+            if not switched:
+                row.status = "failed"
+                label = getattr(row, "windows_session_label", None) or f"sesión {target_sid}"
+                row.error_message = f"No se pudo cambiar a la sesión Windows pedida ({label})"
+                row.ended_at = datetime.utcnow()
+                db.commit()
+                return
+
         row.status = "running"
         row.started_at = datetime.utcnow()
         sess = models.SupportSession(
             device_id=row.device_id,
             technician_id=row.technician_id,
             start_time=datetime.utcnow(),
-            comments=f"Grabación programada #{row.id}",
+            comments=f"Grabación programada #{row.id}"
+            + (f" · WinSes {row.windows_session_id}" if getattr(row, "windows_session_id", None) else ""),
         )
         db.add(sess)
         db.flush()
@@ -457,20 +538,24 @@ def setup_agenda(app: FastAPI, manager, get_current_user, send_push_notification
         tech = db.query(models.User).filter(models.User.id == payload.technician_id).first()
         if not tech:
             raise HTTPException(status_code=404, detail="Técnico no encontrado")
+        scheduled_at = as_naive_utc(payload.scheduled_at)
+        now = datetime.utcnow()
         row = models.ScheduledRecording(
             client_id=payload.client_id,
             device_id=payload.device_id,
             technician_id=payload.technician_id,
-            scheduled_at=payload.scheduled_at,
+            scheduled_at=scheduled_at,
             duration_minutes=payload.duration_minutes or 30,
             notes=payload.notes,
+            windows_session_id=payload.windows_session_id,
+            windows_session_label=payload.windows_session_label,
             status="scheduled",
         )
         db.add(row)
         db.flush()
-        alert_at = payload.scheduled_at - timedelta(minutes=10)
-        if alert_at < datetime.utcnow():
-            alert_at = datetime.utcnow()
+        alert_at = scheduled_at - timedelta(minutes=10)
+        if alert_at < now:
+            alert_at = now
         enqueue_outbox(
             db, "push", f"En breve inicia grabación remota del device #{payload.device_id}",
             alert_at, target=str(tech.id), subject="Grabación programada",
@@ -499,7 +584,10 @@ def setup_agenda(app: FastAPI, manager, get_current_user, send_push_notification
         row = db.query(models.ScheduledRecording).filter(models.ScheduledRecording.id == recording_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="Grabación no encontrada")
-        for k, v in payload.model_dump(exclude_unset=True).items():
+        data = payload.model_dump(exclude_unset=True)
+        if "scheduled_at" in data:
+            data["scheduled_at"] = as_naive_utc(data["scheduled_at"])
+        for k, v in data.items():
             setattr(row, k, v)
         db.commit()
         row = (
@@ -586,7 +674,8 @@ def setup_agenda(app: FastAPI, manager, get_current_user, send_push_notification
         client = db.query(models.Client).filter(models.Client.id == payload.client_id).first()
         if not client:
             raise HTTPException(status_code=404, detail="Cliente no encontrado")
-        room = sanitize_jitsi_room(f"Apollo-{client.codigo or client.id}-{int(payload.starts_at.timestamp())}")
+        starts_at = as_naive_utc(payload.starts_at)
+        room = sanitize_jitsi_room(f"Apollo-{client.codigo or client.id}-{int(starts_at.timestamp())}")
         join_url = f"{JITSI_BASE_URL}/{room}"
         email = payload.client_email or client.email
         phone = payload.client_phone or client.telefono
@@ -595,7 +684,7 @@ def setup_agenda(app: FastAPI, manager, get_current_user, send_push_notification
             host_user_id=current_user.id,
             title=payload.title,
             agenda=payload.agenda,
-            starts_at=payload.starts_at,
+            starts_at=starts_at,
             duration_minutes=payload.duration_minutes or 30,
             join_url=join_url,
             status="scheduled",
@@ -605,7 +694,10 @@ def setup_agenda(app: FastAPI, manager, get_current_user, send_push_notification
         )
         db.add(row)
         db.flush()
-        notify_at = payload.starts_at - timedelta(minutes=row.notify_minutes_before)
+        notify_at = starts_at - timedelta(minutes=row.notify_minutes_before)
+        now = datetime.utcnow()
+        if notify_at < now:
+            notify_at = now
         msg = build_meeting_message(row, client.razon_social)
         if email:
             enqueue_outbox(
@@ -640,7 +732,10 @@ def setup_agenda(app: FastAPI, manager, get_current_user, send_push_notification
         row = db.query(models.ScheduledMeeting).filter(models.ScheduledMeeting.id == meeting_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="Reunión no encontrada")
-        for k, v in payload.model_dump(exclude_unset=True).items():
+        data = payload.model_dump(exclude_unset=True)
+        if "starts_at" in data:
+            data["starts_at"] = as_naive_utc(data["starts_at"])
+        for k, v in data.items():
             setattr(row, k, v)
         db.commit()
         row = (

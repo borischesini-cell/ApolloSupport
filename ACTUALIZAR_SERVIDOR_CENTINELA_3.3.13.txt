@@ -1,0 +1,8 @@
+ACTUALIZAR SERVIDOR — Centinela 3.3.13
+======================================
+Fix: en RDP sin HD la captura WebP salia negra; cascada mss/GDI/PrintWindow.
+HD en RDP se rechaza (barras verdes).
+
+Copia Y:\ApolloSupport\backend\updates\ → C:\ApolloSupport\backend\updates\
+nssm restart ApolloBackend
+update_check → 3.3.13

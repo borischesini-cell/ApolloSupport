@@ -1,0 +1,19 @@
+ACTUALIZAR SERVIDOR — Centinela 3.3.12
+======================================
+Problema cliente (SRV2016RDP): companion online en sesion 2, el servicio
+mataba el de sesion 8 (escritorio AnyDesk) → no se veia la ventana.
+
+Copia desde Y:\ApolloSupport\backend\updates\ hacia
+C:\ApolloSupport\backend\updates\ :
+
+  - version.json
+  - ApolloSetup.exe
+  - ApolloSetup_x64.exe
+
+Luego:
+  nssm restart ApolloBackend
+
+Verificar update_check → "version": "3.3.12"
+
+En el cliente: reinstalar/actualizar. Tras UAC, sc query debe ser RUNNING
+y debe abrir ApolloSoporte en el escritorio que estas viendo.

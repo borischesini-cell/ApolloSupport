@@ -1,0 +1,15 @@
+ApolloSupport / Centinela v3.3.0
+
+Escritorio remoto
+- Captura DXGI (Desktop Duplication) para WebP y modo HQ.
+  Si DXGI no esta disponible (RDP viejo / Session 0) cae a GDI.
+- HQ intenta ddagrab de ffmpeg; si no existe, alimenta H.264 desde DXGI.
+- El viewer y el input por WebSocket de 3.2.9 se mantienen.
+
+Instalador mas chico
+- ffmpeg essentials ~98 MB (antes ~193 MB). El full queda en agent\ffmpeg_full.bak.exe
+  solo en esta maquina de build, no va en el instalador.
+- ffmpeg ya no se embebe dentro de ApolloCentinela.exe (el setup lo copia a {app}).
+- El instalador unificado es solo x64. Para 32-bit: ApolloSetup_v3.3.0_x86.iss
+
+Para publicar: correr agent\build_all_and_installer.bat (o solo x64 + ApolloSetup.iss / ApolloSetup_x64.iss).

@@ -13,6 +13,10 @@ import logging.handlers
 # - Salida simultánea a consola y archivo
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+if LOG_DIR.startswith("\\\\?\\UNC\\"):
+    LOG_DIR = "\\\\" + LOG_DIR[8:]
+elif LOG_DIR.startswith("\\\\?\\"):
+    LOG_DIR = LOG_DIR[4:]
 os.makedirs(LOG_DIR, exist_ok=True)
 
 log_formatter = logging.Formatter(
@@ -20,13 +24,16 @@ log_formatter = logging.Formatter(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# Handler de archivo rotativo diario (solo WARNING+ para no llenar disco)
-file_handler = logging.handlers.RotatingFileHandler(
-    filename=os.path.join(LOG_DIR, "apollo.log"),
-    maxBytes=10 * 1024 * 1024,  # 10 MB por archivo
-    backupCount=5,              # Retener 5 archivos históricos (50 MB total max)
-    encoding="utf-8"
-)
+_log_filename = os.path.join(LOG_DIR, "apollo.log")
+try:
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename=_log_filename,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8"
+    )
+except OSError:
+    file_handler = logging.FileHandler(_log_filename, encoding="utf-8")
 file_handler.setFormatter(log_formatter)
 file_handler.setLevel(logging.INFO)  # Cambiado a INFO temporalmente para capturar logs de WebSocket
 
@@ -49,17 +56,18 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("apollo")
 logger.info("=== ApolloSupport Backend iniciando ===")
 
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, File, UploadFile, Body
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, File, UploadFile, Body, Header, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, joinedload, selectinload
-from sqlalchemy import text
+from sqlalchemy import text, or_
 from typing import List, Dict, Any, Optional
 from jose import JWTError, jwt
 from datetime import datetime
 import shutil
 import asyncio
+import struct
 
 import subprocess
 import tempfile
@@ -77,9 +85,10 @@ import auth
 import httpx
 from core.erp_bridge import ERPBridge
 
-BACKEND_VERSION = "3.2.6"
-BACKEND_BUILD = "2026-06-02"
-BACKEND_VERSION_TAG = "WebCodecs-HD"
+BACKEND_VERSION = "3.3.22"
+BACKEND_BUILD = "2026-09-25"
+BACKEND_VERSION_TAG = "Inject-Helper-UAC"
+GESACTI_SYNC_KEY = os.getenv("GESACTI_SYNC_KEY", "Apollo_GesActi_Sync_2026")
 
 # Instanciamos la Aplicación FastAPI
 app = FastAPI(
@@ -179,6 +188,77 @@ def _ensure_centinela_assist_id_column():
 
 _ensure_centinela_assist_id_column()
 
+
+def _ensure_agenda_windows_session_columns():
+    """Agrega columnas de sesión Windows en scheduled_recordings si faltan."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE scheduled_recordings ADD COLUMN IF NOT EXISTS windows_session_id INTEGER"
+            ))
+            conn.execute(text(
+                "ALTER TABLE scheduled_recordings ADD COLUMN IF NOT EXISTS windows_session_label VARCHAR"
+            ))
+    except Exception as e:
+        logger.warning("[SCHEMA] No se pudo asegurar columnas windows_session_*: %s", e)
+
+
+_ensure_agenda_windows_session_columns()
+
+
+def _ensure_ticket_dev_columns():
+    """Pedidos a Programación: origen interno/cliente, creador, cliente opcional."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS origen VARCHAR DEFAULT 'cliente'"
+            ))
+            conn.execute(text(
+                "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS created_by_id INTEGER"
+            ))
+            conn.execute(text(
+                "ALTER TABLE tickets ALTER COLUMN client_id DROP NOT NULL"
+            ))
+            conn.execute(text(
+                "UPDATE tickets SET origen = 'cliente' WHERE origen IS NULL OR origen = ''"
+            ))
+    except Exception as e:
+        logger.warning("[SCHEMA] No se pudo asegurar columnas de tickets: %s", e)
+
+
+_ensure_ticket_dev_columns()
+
+
+def _ensure_reseller_columns():
+    """Agrega tabla resellers y columna reseller_id en users/clients si faltan."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS resellers (
+                    id SERIAL PRIMARY KEY,
+                    nombre VARCHAR NOT NULL,
+                    contacto VARCHAR,
+                    email VARCHAR,
+                    telefono VARCHAR,
+                    comision_pct FLOAT DEFAULT 0.0,
+                    notas TEXT,
+                    activo BOOLEAN DEFAULT TRUE,
+                    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS reseller_id INTEGER REFERENCES resellers(id)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN IF NOT EXISTS reseller_id INTEGER REFERENCES resellers(id)"
+            ))
+    except Exception as e:
+        logger.warning("[SCHEMA] No se pudo asegurar esquema reseller: %s", e)
+
+
+_ensure_reseller_columns()
+
+
 async def server_ping_loop(device_id: int):
     """ Mantiene viva la conexión WebSocket enviando un ping cada 20 segundos. """
     while True:
@@ -261,6 +341,10 @@ async def periodic_viewer_cleanup():
         except Exception as e:
             logger.error(f"[CLEANUP ERROR] Error en limpieza periódica de espectadores: {e}")
 
+# En dev la DB es compartida con produccion: con este flag el backend local NO
+# pisa el estado online de dispositivos que no estan conectados a el.
+DEV_DB_SHARED_SAFE = os.getenv("APOLLO_DEV_DB_SAFE", "0") == "1"
+
 # Resetear estado online de dispositivos al iniciar el servidor
 @app.on_event("startup")
 def startup_event():
@@ -274,16 +358,26 @@ def startup_event():
         logger.info("[STARTUP] Agenda worker programado")
     except Exception as e:
         logger.error("[STARTUP] No se pudo iniciar agenda worker: %s", e)
+    try:
+        # WhatsApp Cloud API: cierra ventanas vencidas, drena el outbox y reprisa webhooks crudos
+        from whatsapp import periodic_whatsapp_worker as _whatsapp_worker
+        asyncio.get_event_loop().create_task(_whatsapp_worker())
+        logger.info("[STARTUP] WhatsApp worker programado")
+    except Exception as e:
+        logger.error("[STARTUP] No se pudo iniciar whatsapp worker: %s", e)
 
     db = SessionLocal()
     try:
-        db.query(models.CentinelaDevice).update({
-            models.CentinelaDevice.is_online: False,
-            models.CentinelaDevice.current_technician_id: None,
-            models.CentinelaDevice.session_start: None
-        })
-        db.commit()
-        logger.info("[STARTUP] Reset de estado online y liberación de dispositivos completado.")
+        if DEV_DB_SHARED_SAFE:
+            logger.warning("[STARTUP] APOLLO_DEV_DB_SAFE=1: se omite el reset global de is_online (DB compartida con produccion).")
+        else:
+            db.query(models.CentinelaDevice).update({
+                models.CentinelaDevice.is_online: False,
+                models.CentinelaDevice.current_technician_id: None,
+                models.CentinelaDevice.session_start: None
+            })
+            db.commit()
+            logger.info("[STARTUP] Reset de estado online y liberación de dispositivos completado.")
 
         # Cerrar sesiones huérfanas que quedaron abiertas del reinicio anterior
         _close_orphaned_sessions(db)
@@ -344,6 +438,8 @@ async def periodic_orphan_session_cleanup():
 
 
 def _db_run_zombie_cleanup():
+    if DEV_DB_SHARED_SAFE:
+        return
     db = SessionLocal()
     try:
         online_devices = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.is_online == True).all()
@@ -449,17 +545,19 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     access_token = auth.create_access_token(data={"sub": user.email, "rol": user.rol})
     
     return {
-        "access_token": access_token, 
-        "token_type": "bearer", 
+        "access_token": access_token,
+        "token_type": "bearer",
         "usuario": {
-            "nombre": user.nombre, 
-            "rol": user.rol, 
+            "nombre": user.nombre,
+            "rol": user.rol,
             "email": user.email,
             "id": user.id,
             "full_name": user.full_name,
             "departamento": user.departamento,
             "profile_picture": user.profile_picture,
-            "celular": user.celular
+            "celular": user.celular,
+            "reseller_id": user.reseller_id,
+            "areas": _user_areas_payload(user)
         }
     }
 
@@ -499,6 +597,8 @@ def crear_cliente(cliente: schemas.ClientCreate, db: Session = Depends(get_db), 
     import erp_licensing as _el
     payload = cliente.model_dump()
     payload = _apply_clasificacion_from_catalog(db, payload)
+    if payload.get("apikey_apollo") == "":
+        payload["apikey_apollo"] = None
     codigo = (payload.get("codigo") or "").strip().upper()
     if codigo.isdigit():
         codigo = codigo.zfill(4)[:4]
@@ -510,13 +610,15 @@ def crear_cliente(cliente: schemas.ClientCreate, db: Session = Depends(get_db), 
         payload["version_apollo"] = versi
         if versi in "ESRP" and not _el.check_client_code_version(codigo, versi):
             raise HTTPException(status_code=400, detail="El número de Cliente (Serie) no coincide con la Versión de AGC.")
-        import cligesco_dbf
-        if cligesco_dbf.code_exists(codigo):
-            raise HTTPException(status_code=400, detail=f"El número de cliente ya existe en CLIGESCO.DBF ({codigo})")
         try:
+            import cligesco_dbf
+            if cligesco_dbf.code_exists(codigo):
+                raise HTTPException(status_code=400, detail=f"El número de cliente ya existe en CLIGESCO.DBF ({codigo})")
             cligesco_dbf.upsert_client(payload, create=True)
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"No se pudo grabar CLIGESCO.DBF: {e}")
+            logger.warning("[CLIENTS] CLIGESCO.DBF omitido en create: %s", e)
     db_client = models.Client(**payload)
     db.add(db_client)
     db.commit()
@@ -525,7 +627,131 @@ def crear_cliente(cliente: schemas.ClientCreate, db: Session = Depends(get_db), 
 
 @app.get("/api/clients/", response_model=List[schemas.ClientOut], tags=["Clientes"])
 def obtener_clientes(skip: int = 0, limit: int = 5000, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return db.query(models.Client).options(joinedload(models.Client.devices).joinedload(models.CentinelaDevice.technician)).order_by(models.Client.codigo.asc().nulls_last(), models.Client.razon_social.asc()).offset(skip).limit(limit).all()
+    query = db.query(models.Client).options(joinedload(models.Client.devices).joinedload(models.CentinelaDevice.technician))
+    if current_user.rol == "reseller" and current_user.reseller_id:
+        query = query.filter(models.Client.reseller_id == current_user.reseller_id)
+    return query.order_by(models.Client.codigo.asc().nulls_last(), models.Client.razon_social.asc()).offset(skip).limit(limit).all()
+
+
+def _client_code_variants(code: str) -> list[str]:
+    raw = (code or "").strip()
+    if not raw:
+        return []
+    out = {raw, raw.upper()}
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits:
+        stripped = digits.lstrip("0") or "0"
+        out.update({digits, stripped, stripped.zfill(4), stripped.zfill(6), stripped.zfill(7)})
+        if len(digits) >= 4:
+            last4 = digits[-4:]
+            out.update({last4, last4.zfill(4), last4.zfill(6), last4.zfill(7)})
+    return [x for x in out if x]
+
+
+def _upsert_client_from_dbf(db: Session, row: dict) -> models.Client:
+    codigo = (row.get("codigo") or "").strip().upper()
+    cclifac = (row.get("cclifac") or "").strip() or None
+    variants = list({*(_client_code_variants(codigo)), *(_client_code_variants(cclifac or ""))})
+    cli = db.query(models.Client).filter(models.Client.codigo == codigo).first() if codigo else None
+    if not cli and variants:
+        cli = (
+            db.query(models.Client)
+            .filter(or_(models.Client.codigo.in_(variants), models.Client.cclifac.in_(variants)))
+            .first()
+        )
+    if not cli:
+        cli = models.Client(
+            codigo=codigo or None,
+            razon_social=row.get("razon_social") or f"Cliente {codigo}",
+            nombre_fantasia=row.get("nombre_fantasia"),
+            cclifac=cclifac,
+            activo=row.get("activo", True) is not False,
+        )
+        db.add(cli)
+        db.flush()
+        return cli
+    if row.get("razon_social"):
+        cli.razon_social = row["razon_social"]
+    if row.get("nombre_fantasia") is not None:
+        cli.nombre_fantasia = row["nombre_fantasia"]
+    if cclifac and not cli.cclifac:
+        cli.cclifac = cclifac
+    if row.get("activo") is not None:
+        cli.activo = bool(row["activo"])
+    return cli
+
+
+def _merge_external_clients(db: Session, found: list, have: set, rows: list, limit: int) -> bool:
+    added = False
+    for row in rows:
+        code = (row.get("codigo") or "").strip().upper()
+        fac = (row.get("cclifac") or "").strip().upper()
+        keys = {k for k in (code, fac) if k}
+        keys.update(v.upper() for v in _client_code_variants(code) + _client_code_variants(fac))
+        if keys & have:
+            continue
+        cli = _upsert_client_from_dbf(db, row)
+        mark = (cli.codigo or code or "").strip().upper()
+        if mark:
+            have.add(mark)
+        if cli.cclifac:
+            have.add(str(cli.cclifac).strip().upper())
+            have.update(v.upper() for v in _client_code_variants(cli.cclifac))
+        found.append(cli)
+        added = True
+        if len(found) >= limit:
+            break
+    return added
+
+
+@app.get("/api/clients/search", response_model=List[schemas.ClientOut], tags=["Clientes"])
+def buscar_clientes(q: str = "", limit: int = 80, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """Busca en PostgreSQL, CLIGESCO (UNC/IP) y GesCom SQL (ej. 1514 Aguilar / 0101307)."""
+    term = (q or "").strip()
+    if len(term) < 2:
+        return []
+    like = f"%{term}%"
+    digits = "".join(ch for ch in term if ch.isdigit()).lstrip("0")
+    conds = [
+        models.Client.razon_social.ilike(like),
+        models.Client.nombre_fantasia.ilike(like),
+        models.Client.codigo.ilike(like),
+        models.Client.cclifac.ilike(like),
+    ]
+    if digits:
+        conds.extend([
+            models.Client.codigo.ilike(f"%{digits}%"),
+            models.Client.cclifac.ilike(f"%{digits}%"),
+            models.Client.cclifac.ilike(f"%{digits.zfill(7)}%"),
+        ])
+    found = (
+        db.query(models.Client)
+        .filter(or_(*conds))
+        .order_by(models.Client.codigo.asc().nulls_last())
+        .limit(limit)
+        .all()
+    )
+    have = {(c.codigo or "").strip().upper() for c in found if c.codigo}
+    have.update((c.cclifac or "").strip().upper() for c in found if c.cclifac)
+    added = False
+    try:
+        import cligesco_dbf
+        extra = cligesco_dbf.search_clients(term, limit=limit)
+        added = _merge_external_clients(db, found, have, extra, limit) or added
+    except Exception as e:
+        logger.warning("[CLIENTS] Búsqueda CLIGESCO omitida: %s", e)
+    if len(found) < limit:
+        try:
+            import gescom_sql
+            extra = gescom_sql.search_clients(term, limit=limit)
+            added = _merge_external_clients(db, found, have, extra, limit) or added
+        except Exception as e:
+            logger.warning("[CLIENTS] Búsqueda GesCom SQL omitida: %s", e)
+    if added:
+        db.commit()
+        ids = [c.id for c in found if c.id]
+        found = db.query(models.Client).filter(models.Client.id.in_(ids)).all() if ids else found
+    return found[:limit]
 
 @app.get("/api/clients/next-code", tags=["Clientes"])
 def siguiente_codigo_gesacti(version: str = "E", db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
@@ -564,20 +790,105 @@ def siguiente_codigo_gesacti(version: str = "E", db: Session = Depends(get_db), 
         suggested = {"E": "0001", "S": "M001", "R": "R001", "P": "V001"}.get(versi, "0001")
     return {"codigo": suggested, "version": versi}
 
+def _require_gesacti_key(x_gesacti_key: Optional[str] = Header(None, alias="X-GesActi-Key")):
+    if not x_gesacti_key or x_gesacti_key != GESACTI_SYNC_KEY:
+        raise HTTPException(status_code=401, detail="Clave GesActi inválida")
+    return True
+
+
+@app.post("/api/clients/gesacti/push", tags=["Clientes"])
+def gesacti_push_cliente(payload: schemas.GesActiClientIn, db: Session = Depends(get_db), _: bool = Depends(_require_gesacti_key)):
+    """GesActi: un cliente dado de alta, modificado o dado de baja."""
+    from sync_dbf_to_postgres import apply_client_row
+    data = payload.model_dump()
+    if not (data.get("codigo") or "").strip():
+        raise HTTPException(status_code=400, detail="Falta código de cliente")
+    action = apply_client_row(db, data, partial=True)
+    if action == "skipped":
+        raise HTTPException(status_code=400, detail="Cliente sin código")
+    db.commit()
+    return {"status": "ok", "action": action, "codigo": (data.get("codigo") or "").strip().upper()}
+
+
+@app.post("/api/clients/gesacti/sync", tags=["Clientes"])
+def gesacti_sync_lote(payload: schemas.GesActiSyncIn, db: Session = Depends(get_db), _: bool = Depends(_require_gesacti_key)):
+    """GesActi: lote completo (botón Sincronizar Support)."""
+    from sync_dbf_to_postgres import apply_clients_batch
+    stats = apply_clients_batch(db, [c.model_dump() for c in payload.clients])
+    db.commit()
+    stats["status"] = "ok"
+    return stats
+
+
+@app.post("/api/clients/gesacti/import-dbf", tags=["Clientes"])
+async def gesacti_import_dbf(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """Portal: sube CLIGESCO.DBF (desde X:\\ o M:\\) y lo aplica en Support."""
+    name = (file.filename or "").lower()
+    if not name.endswith(".dbf"):
+        raise HTTPException(status_code=400, detail="Subí un archivo CLIGESCO.DBF")
+    tmp_path = None
+    try:
+        suffix = os.path.splitext(file.filename or "CLIGESCO.DBF")[1] or ".DBF"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(file.file, tmp)
+        from sync_dbf_to_postgres import sync_data
+        stats = sync_data(tmp_path, db=db)
+        try:
+            saldos = _sync_saldos_from_clientes_erp(db)
+        except Exception as e:
+            logger.warning("[CLIENTS] Saldos ERP omitidos tras import GesActi: %s", e)
+            saldos = {"updated": 0, "error": str(e)}
+        stats["saldos"] = saldos
+        stats["status"] = "ok"
+        return stats
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"No se pudo importar CLIGESCO.DBF: {e}")
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 @app.post("/api/clients/sync", tags=["Clientes"])
 def sincronizar_clientes_dbf(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    """Sincroniza CLIGESCO.DBF y luego refresca saldos desde Ventas\\Clientes.CSaldo."""
+    """Sincroniza CLIGESCO.DBF (si el servidor lo ve) y siempre refresca saldos ERP.
+
+    En cloud/prod el UNC de CLIGESCO suele no existir: en ese caso se omiten
+    altas/bajas desde DBF y solo se actualizan saldos (Clientes:CSaldo).
+    """
+    dbf_stats = None
+    dbf_note = None
     try:
         from sync_dbf_to_postgres import sync_data
-        sync_data()
-        saldos = _sync_saldos_from_clientes_erp(db)
-        return {
-            "status": "success",
-            "message": "Sincronización DBF + saldos ERP (Clientes:CSaldo) completada.",
-            "saldos": saldos,
-        }
+        dbf_stats = sync_data(db=db)
+    except FileNotFoundError:
+        dbf_note = (
+            "CLIGESCO.DBF no visible en el servidor; solo se actualizaron saldos ERP. "
+            "Para importar clientes: subí el DBF con «Sincronizar GesActi» o usá el botón de GesActi."
+        )
+        logger.warning("[CLIENTS] sync sin CLIGESCO.DBF — solo saldos ERP")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error durante la sincronización: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error durante la sincronización DBF: {str(e)}")
+    try:
+        saldos = _sync_saldos_from_clientes_erp(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error sincronizando saldos ERP: {str(e)}")
+    out = {
+        "status": "success",
+        "message": dbf_note
+        or "Sincronización DBF + saldos ERP (Clientes:CSaldo) completada.",
+        "saldos": saldos,
+    }
+    if dbf_stats:
+        out.update(dbf_stats)
+    if dbf_note:
+        out["dbf_skipped"] = True
+    return out
 
 
 def _sync_saldos_from_clientes_erp(db: Session) -> dict:
@@ -799,17 +1110,11 @@ def actualizar_cliente(client_id: int, cliente: schemas.ClientCreate, db: Sessio
     
     payload = cliente.model_dump()
     payload = _apply_clasificacion_from_catalog(db, payload)
+    if payload.get("apikey_apollo") == "":
+        payload["apikey_apollo"] = None
     for key, value in payload.items():
         setattr(db_client, key, value)
 
-    if db_client.codigo:
-        payload["codigo"] = db_client.codigo
-        try:
-            import cligesco_dbf
-            cligesco_dbf.upsert_client(payload, create=False)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"No se pudo actualizar CLIGESCO.DBF: {e}")
-    
     db.commit()
     db.refresh(db_client)
     return db_client
@@ -826,7 +1131,7 @@ def eliminar_cliente(client_id: int, db: Session = Depends(get_db), current_user
             import cligesco_dbf
             cligesco_dbf.set_activo(db_client.codigo, db_client.activo)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"No se pudo actualizar CACTI en CLIGESCO.DBF: {e}")
+            logger.warning("[CLIENTS] CLIGESCO.DBF omitido en toggle activo: %s", e)
     db.commit()
     return {"status": "success", "activo": db_client.activo}
 
@@ -936,6 +1241,39 @@ def obtener_lic_facturadas_erp(client_id_or_code: str, db: Session = Depends(get
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error consultando LisArtC en el ERP: {str(e)}")
+
+@app.get("/api/erp/clientes/{client_id_or_code}/cbus", tags=["Integración ERP"])
+def obtener_cbus_cliente(client_id_or_code: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    """CBU cargados en ventas_ClienDA (débito automático) + cuenta bancaria y estado."""
+    db_client = None
+    if client_id_or_code.isdigit():
+        db_client = db.query(models.Client).filter(models.Client.id == int(client_id_or_code)).first()
+    if not db_client:
+        db_client = db.query(models.Client).filter(
+            (models.Client.cclifac == client_id_or_code) |
+            (models.Client.codigo == client_id_or_code)
+        ).first()
+    if not db_client:
+        raise HTTPException(status_code=404, detail="Cliente no registrado en el sistema local.")
+
+    lookup = (db_client.cclifac or db_client.codigo or "").strip()
+    if not lookup:
+        raise HTTPException(status_code=400, detail="El cliente no tiene CCLIFAC ni código ERP para buscar CBU.")
+
+    try:
+        import gescom_sql
+        items = gescom_sql.get_client_cbus(lookup)
+        if not items and db_client.codigo and db_client.codigo != lookup:
+            items = gescom_sql.get_client_cbus(db_client.codigo)
+        return {
+            "cliente_id": db_client.id,
+            "codigo": db_client.codigo,
+            "cclifac": db_client.cclifac,
+            "razon_social": db_client.razon_social,
+            "items": items,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error consultando ventas_ClienDA: {str(e)}")
 
 @app.get("/api/erp/comprobantes/{hash_fac}/pdf", tags=["Integración ERP"])
 def obtener_pdf_comprobante(hash_fac: str, current_user: models.User = Depends(get_current_user)):
@@ -1263,10 +1601,119 @@ def obtener_areas(db: Session = Depends(get_db), current_user: models.User = Dep
 # ==========================================
 # RUTAS DE USUARIOS / ABM / PERFIL (NUEVO)
 # ==========================================
+def _parse_activity_names(departamento: Optional[str]) -> List[str]:
+    if not departamento:
+        return []
+    names = []
+    for part in departamento.replace(",", "/").split("/"):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _sync_user_areas(db: Session, db_user: models.User, area_ids: Optional[List[int]] = None, departamento: Optional[str] = None):
+    """Asigna una o varias actividades (áreas) al usuario y deja departamento como resumen."""
+    selected = []
+    seen = set()
+
+    if area_ids:
+        for area in db.query(models.Area).filter(models.Area.id.in_(area_ids)).all():
+            if area.id not in seen:
+                selected.append(area)
+                seen.add(area.id)
+
+    names = _parse_activity_names(departamento)
+    for name in names:
+        area = db.query(models.Area).filter(models.Area.nombre == name).first()
+        if area and area.id not in seen:
+            selected.append(area)
+            seen.add(area.id)
+
+    db_user.areas = selected
+    area_names = [a.nombre for a in selected]
+    extras = [n for n in names if n not in area_names]
+    summary = area_names + extras
+    if summary:
+        db_user.departamento = " / ".join(summary)
+
+
+def _user_areas_payload(user: models.User) -> List[Dict[str, Any]]:
+    return [{"id": a.id, "nombre": a.nombre, "descripcion": a.descripcion} for a in (user.areas or [])]
+
+
+# ==========================================
+# RESELLERS — CRUD
+# ==========================================
+@app.get("/api/resellers", response_model=List[schemas.ResellerOut], tags=["Resellers"])
+def obtener_resellers(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if current_user.rol not in ("admin", "reseller"):
+        raise HTTPException(status_code=403, detail="Permiso denegado.")
+    if current_user.rol == "reseller":
+        return db.query(models.Reseller).filter(models.Reseller.id == current_user.reseller_id).all()
+    rows = db.query(models.Reseller).order_by(models.Reseller.nombre.asc()).all()
+    out = []
+    for r in rows:
+        data = schemas.ResellerOut.model_validate(r)
+        data.cantidad_clientes = db.query(models.Client).filter(models.Client.reseller_id == r.id).count()
+        data.cantidad_usuarios = db.query(models.User).filter(models.User.reseller_id == r.id).count()
+        out.append(data)
+    return out
+
+
+@app.post("/api/resellers", response_model=schemas.ResellerOut, tags=["Resellers"])
+def crear_reseller(data: schemas.ResellerCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if current_user.rol != "admin":
+        raise HTTPException(status_code=403, detail="Solo administradores pueden crear resellers.")
+    db_obj = models.Reseller(**data.model_dump(exclude_unset=True))
+    db.add(db_obj)
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+
+
+@app.put("/api/resellers/{reseller_id}", response_model=schemas.ResellerOut, tags=["Resellers"])
+def actualizar_reseller(reseller_id: int, data: schemas.ResellerUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if current_user.rol == "reseller" and current_user.reseller_id != reseller_id:
+        raise HTTPException(status_code=403, detail="Solo puede editar su propio reseller.")
+    if current_user.rol not in ("admin", "reseller"):
+        raise HTTPException(status_code=403, detail="Permiso denegado.")
+    db_obj = db.query(models.Reseller).filter(models.Reseller.id == reseller_id).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Reseller no encontrado.")
+    update_data = data.model_dump(exclude_unset=True)
+    if current_user.rol == "reseller":
+        update_data.pop("comision_pct", None)
+    for key, value in update_data.items():
+        setattr(db_obj, key, value)
+    db.commit()
+    db.refresh(db_obj)
+    return db_obj
+
+
+@app.delete("/api/resellers/{reseller_id}", tags=["Resellers"])
+def eliminar_reseller(reseller_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if current_user.rol != "admin":
+        raise HTTPException(status_code=403, detail="Solo administradores pueden eliminar resellers.")
+    db_obj = db.query(models.Reseller).filter(models.Reseller.id == reseller_id).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Reseller no encontrado.")
+    db.query(models.Client).filter(models.Client.reseller_id == reseller_id).update({"reseller_id": None})
+    db.query(models.User).filter(models.User.reseller_id == reseller_id).update({"reseller_id": None})
+    db.delete(db_obj)
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/users", response_model=List[schemas.UserOut], tags=["Usuarios"])
 def obtener_usuarios(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     """ Retorna todos los usuarios ordenados por si están online primero """
-    return db.query(models.User).order_by(models.User.is_online.desc(), models.User.nombre.asc()).all()
+    query = db.query(models.User).options(selectinload(models.User.areas))
+    if current_user.rol == "reseller" and current_user.reseller_id:
+        query = query.filter(
+            (models.User.reseller_id == current_user.reseller_id) | (models.User.id == current_user.id)
+        )
+    return query.order_by(models.User.is_online.desc(), models.User.nombre.asc()).all()
 
 @app.get("/api/users/me", response_model=schemas.UserOut, tags=["Usuarios"])
 def obtener_perfil_propio(current_user: models.User = Depends(get_current_user)):
@@ -1293,9 +1740,12 @@ def crear_usuario(user_data: schemas.UserCreate, db: Session = Depends(get_db), 
         celular=user_data.celular,
         departamento=user_data.departamento,
         profile_picture=user_data.profile_picture,
+        reseller_id=user_data.reseller_id,
         activo=True
     )
     db.add(db_user)
+    db.flush()
+    _sync_user_areas(db, db_user, user_data.area_ids, user_data.departamento)
     db.commit()
     db.refresh(db_user)
     return db_user
@@ -1312,20 +1762,30 @@ def actualizar_usuario(user_id: int, user_data: schemas.UserUpdate, db: Session 
         raise HTTPException(status_code=403, detail="No tienes permisos para modificar este perfil.")
         
     update_data = user_data.model_dump(exclude_unset=True)
+    area_ids_provided = "area_ids" in update_data
+    area_ids = update_data.pop("area_ids", None)
     
     if "password" in update_data and update_data["password"]:
         db_user.hashed_password = auth.get_password_hash(update_data["password"])
         del update_data["password"]
         
-    # El usuario común no puede cambiarse el rol ni el estado activo
+    # El usuario común no puede cambiarse el rol, el estado activo ni las actividades
     if current_user.rol != "admin":
         if "rol" in update_data:
             del update_data["rol"]
         if "activo" in update_data:
             del update_data["activo"]
+        if "departamento" in update_data:
+            del update_data["departamento"]
+        if "reseller_id" in update_data:
+            del update_data["reseller_id"]
+        area_ids_provided = False
             
     for key, value in update_data.items():
         setattr(db_user, key, value)
+
+    if current_user.rol == "admin" and (area_ids_provided or "departamento" in update_data):
+        _sync_user_areas(db, db_user, area_ids if area_ids_provided else None, db_user.departamento)
         
     db.commit()
     db.refresh(db_user)
@@ -1377,43 +1837,306 @@ def logout_usuario(db: Session = Depends(get_db), current_user: models.User = De
 # ==========================================
 # RUTAS DE TICKETS (TAREAS)
 # ==========================================
+def _resolve_area_id(db: Session, area_id: Optional[int], fallback_nombre: str) -> Optional[int]:
+    if area_id:
+        area = db.query(models.Area).filter(models.Area.id == area_id).first()
+        if area:
+            return area.id
+    area = db.query(models.Area).filter(models.Area.nombre == fallback_nombre).first()
+    return area.id if area else None
+
+
+def _ticket_with_rels(db: Session, ticket_id: int):
+    return (
+        db.query(models.Ticket)
+        .options(
+            joinedload(models.Ticket.cliente),
+            joinedload(models.Ticket.area_actual),
+            joinedload(models.Ticket.asignado_a),
+            joinedload(models.Ticket.creado_por),
+            selectinload(models.Ticket.intervenciones).joinedload(models.Intervention.usuario),
+            selectinload(models.Ticket.intervenciones).joinedload(models.Intervention.area_origen),
+            selectinload(models.Ticket.intervenciones).joinedload(models.Intervention.area_destino),
+        )
+        .filter(models.Ticket.id == ticket_id)
+        .first()
+    )
+
+
 @app.post("/api/tickets/", response_model=schemas.TicketOut, tags=["Tickets"])
 def crear_ticket(ticket: schemas.TicketCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    cliente = db.query(models.Client).filter(models.Client.id == ticket.client_id).first()
-    if not cliente:
-        raise HTTPException(status_code=404, detail="El cliente especificado no existe.")
-        
-    area_id = ticket.initial_area_id
-    if not area_id:
-        # Default a 'Atención al Cliente'
-        area = db.query(models.Area).filter(models.Area.nombre == "Atención al Cliente").first()
-        area_id = area.id if area else None
+    origen = (ticket.origen or "cliente").strip().lower()
+    if origen not in ("cliente", "interno"):
+        raise HTTPException(status_code=400, detail="origen debe ser 'cliente' o 'interno'")
+
+    client_id = ticket.client_id
+    if origen == "cliente":
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Seleccioná el cliente del pedido.")
+        cliente = db.query(models.Client).filter(models.Client.id == client_id).first()
+        if not cliente:
+            raise HTTPException(status_code=404, detail="El cliente especificado no existe.")
+    elif client_id:
+        cliente = db.query(models.Client).filter(models.Client.id == client_id).first()
+        if not cliente:
+            raise HTTPException(status_code=404, detail="El cliente especificado no existe.")
+    else:
+        client_id = None
+
+    if current_user.rol == "reseller" and current_user.reseller_id and client_id:
+        if not cliente or cliente.reseller_id != current_user.reseller_id:
+            raise HTTPException(status_code=403, detail="El cliente no pertenece a tu reseller.")
+
+    assigned_user_id = ticket.assigned_user_id
+    if assigned_user_id:
+        dest = db.query(models.User).filter(models.User.id == assigned_user_id).first()
+        if not dest:
+            raise HTTPException(status_code=404, detail="El usuario asignado no existe.")
+
+    # Pedidos de Atención → Programación. Si no indican área, van a Desarrollo.
+    area_id = _resolve_area_id(db, ticket.initial_area_id, "Desarrollo")
 
     db_ticket = models.Ticket(
-        client_id=ticket.client_id,
-        asunto=ticket.asunto,
-        descripcion=ticket.descripcion,
-        prioridad=ticket.prioridad,
-        current_area_id=area_id
+        client_id=client_id,
+        asunto=ticket.asunto.strip(),
+        descripcion=ticket.descripcion.strip(),
+        prioridad=ticket.prioridad or "media",
+        origen=origen,
+        assigned_user_id=assigned_user_id,
+        created_by_id=current_user.id,
+        current_area_id=area_id,
+        estado="nuevo",
     )
     db.add(db_ticket)
+    db.flush()
+
+    for adj in ticket.adjuntos or []:
+        if not adj.url:
+            continue
+        filename = (adj.filename or adj.url.split("/")[-1] or "archivo").strip()
+        db.add(models.Intervention(
+            ticket_id=db_ticket.id,
+            user_id=current_user.id,
+            mensaje=f"Adjunto del pedido: {filename}",
+            tipo="comentario",
+            adjunto_url=adj.url,
+            adjunto_tipo=adj.tipo or "documento",
+        ))
+
     db.commit()
     db.refresh(db_ticket)
-    return db_ticket
+    return _ticket_with_rels(db, db_ticket.id)
 
 @app.get("/api/tickets/", response_model=List[schemas.TicketOut], tags=["Tickets"])
-def obtener_tickets(skip: int = 0, limit: int = 100, area_id: Optional[int] = None, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+def obtener_tickets(
+    skip: int = 0,
+    limit: int = 300,
+    area_id: Optional[int] = None,
+    vista: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Lista del sector. vista=activa (default) | historico | todas.
+    Un asignado puntual NO oculta el ticket al resto del área."""
     query = db.query(models.Ticket).options(
         joinedload(models.Ticket.cliente),
         joinedload(models.Ticket.area_actual),
+        joinedload(models.Ticket.asignado_a),
+        joinedload(models.Ticket.creado_por),
         selectinload(models.Ticket.intervenciones).joinedload(models.Intervention.usuario),
         selectinload(models.Ticket.intervenciones).joinedload(models.Intervention.area_origen),
         selectinload(models.Ticket.intervenciones).joinedload(models.Intervention.area_destino)
     )
     if area_id:
         query = query.filter(models.Ticket.current_area_id == area_id)
-    
-    return query.offset(skip).limit(limit).all()
+
+    if current_user.rol == "reseller" and current_user.reseller_id:
+        query = query.join(models.Client).filter(models.Client.reseller_id == current_user.reseller_id)
+
+    vista_n = (vista or "activa").strip().lower()
+    if vista_n == "historico":
+        query = query.filter(models.Ticket.estado == "entregado")
+    elif vista_n != "todas":
+        # Bandeja activa: todo menos entregado (resuelto queda visible para Atención)
+        query = query.filter(models.Ticket.estado != "entregado")
+
+    return (
+        query.order_by(models.Ticket.fecha_creacion.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+
+@app.patch("/api/tickets/{ticket_id}", response_model=schemas.TicketOut, tags=["Tickets"])
+def actualizar_ticket(
+    ticket_id: int,
+    payload: schemas.TicketUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Corrige datos del pedido (asunto, detalle, cliente, origen, prioridad)."""
+    ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket no encontrado")
+    if (ticket.estado or "").lower() == "entregado":
+        raise HTTPException(status_code=400, detail="No se puede editar un pedido ya entregado (histórico).")
+
+    if current_user.rol == "reseller" and current_user.reseller_id:
+        if not ticket.client_id:
+            raise HTTPException(status_code=403, detail="No podés editar pedidos internos.")
+        cliente = db.query(models.Client).filter(models.Client.id == ticket.client_id).first()
+        if not cliente or cliente.reseller_id != current_user.reseller_id:
+            raise HTTPException(status_code=403, detail="Este pedido no es de tu reseller.")
+
+    data = payload.model_dump(exclude_unset=True)
+    clear_client = bool(data.pop("clear_client", False))
+
+    if "origen" in data and data["origen"] is not None:
+        origen = str(data["origen"]).strip().lower()
+        if origen not in ("cliente", "interno"):
+            raise HTTPException(status_code=400, detail="origen debe ser 'cliente' o 'interno'")
+        ticket.origen = origen
+
+    origen_final = (ticket.origen or "cliente").strip().lower()
+
+    if clear_client:
+        if origen_final == "cliente":
+            raise HTTPException(status_code=400, detail="Un pedido de cliente necesita empresa.")
+        ticket.client_id = None
+    elif "client_id" in data:
+        client_id = data["client_id"]
+        if client_id is None:
+            if origen_final == "cliente":
+                raise HTTPException(status_code=400, detail="Seleccioná el cliente del pedido.")
+            ticket.client_id = None
+        else:
+            cliente = db.query(models.Client).filter(models.Client.id == client_id).first()
+            if not cliente:
+                raise HTTPException(status_code=404, detail="El cliente especificado no existe.")
+            ticket.client_id = client_id
+
+    if origen_final == "cliente" and not ticket.client_id:
+        raise HTTPException(status_code=400, detail="Seleccioná el cliente del pedido.")
+
+    if "asunto" in data and data["asunto"] is not None:
+        asunto = str(data["asunto"]).strip()
+        if not asunto:
+            raise HTTPException(status_code=400, detail="El asunto no puede quedar vacío.")
+        ticket.asunto = asunto
+
+    if "descripcion" in data and data["descripcion"] is not None:
+        descripcion = str(data["descripcion"]).strip()
+        if not descripcion:
+            raise HTTPException(status_code=400, detail="La descripción no puede quedar vacía.")
+        ticket.descripcion = descripcion
+
+    if "prioridad" in data and data["prioridad"] is not None:
+        prioridad = str(data["prioridad"]).strip().lower()
+        if prioridad not in ("baja", "media", "alta", "critica"):
+            raise HTTPException(status_code=400, detail="Prioridad inválida.")
+        ticket.prioridad = prioridad
+
+    db.add(models.Intervention(
+        ticket_id=ticket.id,
+        user_id=current_user.id,
+        mensaje=f"Pedido editado por {current_user.full_name or current_user.nombre}",
+        tipo="comentario",
+    ))
+    db.commit()
+    return _ticket_with_rels(db, ticket.id)
+
+
+@app.patch("/api/tickets/{ticket_id}/assign", response_model=schemas.TicketOut, tags=["Tickets"])
+def asignar_ticket(ticket_id: int, payload: schemas.TicketAssign, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket no encontrado")
+    if payload.assigned_user_id:
+        dest = db.query(models.User).filter(models.User.id == payload.assigned_user_id).first()
+        if not dest:
+            raise HTTPException(status_code=404, detail="El usuario asignado no existe.")
+    ticket.assigned_user_id = payload.assigned_user_id
+    if ticket.estado == "nuevo" and payload.assigned_user_id:
+        ticket.estado = "en_curso"
+    db.commit()
+    return _ticket_with_rels(db, ticket.id)
+
+
+_TICKET_ESTADOS = {"nuevo", "en_curso", "resuelto", "bloqueado", "entregado"}
+_TICKET_ACTIVOS = {"nuevo", "en_curso", "resuelto", "bloqueado"}
+
+
+def _area_soporte_id(db: Session) -> Optional[int]:
+    for nombre in ("Atención al Cliente", "Atencion al Cliente", "Soporte"):
+        area = db.query(models.Area).filter(models.Area.nombre == nombre).first()
+        if area:
+            return area.id
+    return None
+
+
+def _area_es_programacion(db: Session, area_id: Optional[int]) -> bool:
+    if not area_id:
+        return False
+    area = db.query(models.Area).filter(models.Area.id == area_id).first()
+    if not area:
+        return False
+    nom = (area.nombre or "").lower()
+    return ("desarroll" in nom) or ("programac" in nom)
+
+
+@app.patch("/api/tickets/{ticket_id}/status", response_model=schemas.TicketOut, tags=["Tickets"])
+def actualizar_estado_ticket(
+    ticket_id: int,
+    payload: schemas.TicketStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket no encontrado")
+    if current_user.rol == "reseller":
+        raise HTTPException(status_code=403, detail="Los resellers no pueden modificar el estado de los pedidos.")
+    estado = (payload.estado or "").strip().lower()
+    if estado not in _TICKET_ESTADOS:
+        raise HTTPException(status_code=400, detail=f"Estado inválido. Use: {', '.join(sorted(_TICKET_ESTADOS))}")
+
+    prev_area = ticket.current_area_id
+    ticket.estado = estado
+
+    if estado == "resuelto":
+        # Programación terminó → vuelve a Atención para que cierren con el cliente
+        sop_id = _area_soporte_id(db) if _area_es_programacion(db, prev_area) else None
+        to_area = sop_id or None
+        if to_area and to_area != prev_area:
+            ticket.current_area_id = to_area
+            # Liberar asignación de programación; Atención lo retoma
+            ticket.assigned_user_id = ticket.created_by_id or None
+        who = current_user.full_name or current_user.nombre or "usuario"
+        msg = f"Pedido marcado como resuelto por {who}."
+        if to_area and to_area != prev_area:
+            msg += " Devuelto a Atención al Cliente para entrega / cierre con el cliente."
+        db.add(models.Intervention(
+            ticket_id=ticket_id,
+            user_id=current_user.id,
+            from_area_id=prev_area,
+            to_area_id=to_area if to_area and to_area != prev_area else None,
+            mensaje=msg,
+            tipo="resolucion" if not (to_area and to_area != prev_area) else "transferencia",
+        ))
+    elif estado == "entregado":
+        who = current_user.full_name or current_user.nombre or "usuario"
+        db.add(models.Intervention(
+            ticket_id=ticket_id,
+            user_id=current_user.id,
+            from_area_id=ticket.current_area_id,
+            to_area_id=None,
+            mensaje=f"Pedido dado por entregado / cerrado por {who}. Pasa a histórico.",
+            tipo="resolucion",
+        ))
+
+    db.commit()
+    return _ticket_with_rels(db, ticket.id)
 
 # ==========================================
 # RUTAS DE INTERVENCIONES (HISTORIAL)
@@ -1428,7 +2151,16 @@ async def crear_intervencion(
     ticket = db.query(models.Ticket).filter(models.Ticket.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket no encontrado")
-    
+
+    if current_user.rol == "reseller" and current_user.reseller_id:
+        if not ticket.client_id:
+            raise HTTPException(status_code=403, detail="No podés comentar en pedidos internos.")
+        cliente = db.query(models.Client).filter(models.Client.id == ticket.client_id).first()
+        if not cliente or cliente.reseller_id != current_user.reseller_id:
+            raise HTTPException(status_code=403, detail="Este pedido no es de tu reseller.")
+        if intervencion.tipo in ("transferencia", "resolucion"):
+            raise HTTPException(status_code=403, detail="Los resellers solo pueden agregar comentarios.")
+
     from_area_id = ticket.current_area_id
     to_area_id = intervencion.to_area_id
     
@@ -1447,23 +2179,49 @@ async def crear_intervencion(
     # Si es una transferencia, actualizamos el área del ticket
     if intervencion.tipo == "transferencia" and to_area_id:
         ticket.current_area_id = to_area_id
+    if intervencion.tipo == "resolucion":
+        ticket.estado = "resuelto"
     
     db.add(db_intervention)
     db.commit()
     db.refresh(db_intervention)
     return db_intervention
 
+_UPLOAD_BLOCKED_EXT = {".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".scr", ".com", ".pif", ".dll"}
+_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+
+
 @app.post("/api/upload", tags=["Utilidades"])
 async def upload_file(file: UploadFile = File(...), current_user: models.User = Depends(get_current_user)):
-    """ Sube un archivo (audio, imagen, doc) al servidor para adjuntar a una intervención. """
+    """ Sube un archivo (excel, imagen, txt, pdf, etc.) para adjuntar a un pedido o intervención. """
+    original = os.path.basename(file.filename or "archivo")
+    _, ext = os.path.splitext(original)
+    if ext.lower() in _UPLOAD_BLOCKED_EXT:
+        raise HTTPException(status_code=400, detail="Este tipo de archivo no está permitido.")
+
+    safe_name = "".join(ch if ch.isalnum() or ch in ".-_" else "_" for ch in original)[:120] or "archivo"
     temp_dir = "temp_files/uploads"
-    if not os.path.exists(temp_dir): os.makedirs(temp_dir)
-    
-    file_path = os.path.join(temp_dir, f"{datetime.now().timestamp()}_{file.filename}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    dest_name = f"{int(datetime.now().timestamp())}_{safe_name}"
+    file_path = os.path.join(temp_dir, dest_name)
+    size = 0
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    return {"url": f"/api/temp/uploads/{os.path.basename(file_path)}", "filename": file.filename}
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > _UPLOAD_MAX_BYTES:
+                buffer.close()
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+                raise HTTPException(status_code=400, detail="El archivo supera el límite de 20 MB.")
+            buffer.write(chunk)
+
+    return {"url": f"/api/temp/uploads/{dest_name}", "filename": original}
 
 # Integrar StaticFiles para las subidas temporales (ya montado vía /api/temp, pero damos ruta directa)
 # app.mount("/api/temp/uploads", StaticFiles(directory="temp_files/uploads"), name="temp_uploads")
@@ -1642,10 +2400,15 @@ class ConnectionManager:
         self.session_info: Dict[int, dict] = {}
         # client_clipboard[device_id] = last copied text from client
         self.client_clipboard: Dict[int, str] = {}
+        # Archivos copiados en el cliente (rutas remotas + URLs ya bajadas)
+        self.client_clipboard_files: Dict[int, list] = {}
+        self.client_clipboard_ready: Dict[int, list] = {}
         # client_sessions[device_id] = list of Windows sessions
         self.client_sessions: Dict[int, list] = {}
         # write_locks[device_id] = asyncio.Lock()
         self.write_locks: Dict[int, asyncio.Lock] = {}
+        # input_locks[device_id] = asyncio.Lock() - lock de alta prioridad para input
+        self.input_locks: Dict[int, asyncio.Lock] = {}
         # frame_buffer per device (last 30 frames)
         self.frame_buffer: Dict[int, deque] = {}
         # device_viewers[device_id] = {user_id: (user_name, last_seen_datetime)}
@@ -1661,6 +2424,10 @@ class ConnectionManager:
         # viewer_connections[device_id] = {ws_id: WebSocket}
         self.viewer_connections: Dict[int, Dict[str, WebSocket]] = {}
         self.viewer_write_locks: Dict[str, asyncio.Lock] = {}  # lock por ws_id individual
+        self.pending_viewer_frames: Dict[int, tuple] = {}
+        self.frame_push_tasks: Dict[int, asyncio.Task] = {}
+        self.frame_resync_needed: set[int] = set()
+        self.frame_resync_requests: set[int] = set()
         # â”€â”€â”€ HQ VIEWER WEBSOCKETS (binary H.264) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # hq_viewer_connections[device_id] = {ws_id: WebSocket}
         # Forward raw H.264/fMP4 bytes directamente del agente al browser (MSE).
@@ -1852,6 +2619,8 @@ class ConnectionManager:
                 del self.client_alerts[device_id]
             if device_id in self.client_clipboard:
                 del self.client_clipboard[device_id]
+            self.client_clipboard_files.pop(device_id, None)
+            self.client_clipboard_ready.pop(device_id, None)
             if device_id in self.write_locks:
                 del self.write_locks[device_id]
             if device_id in self.device_viewers:
@@ -1884,9 +2653,10 @@ class ConnectionManager:
 
         cmd_type = (data.get("type") or "") if isinstance(data, dict) else ""
         input_types = {
-            "key_press", "key_down", "key_up", "write_text",
+            "key_press", "key_down", "key_up", "write_text", "paste_text",
             "mouse_click", "mouse_down", "mouse_up", "mouse_move", "mouse_scroll",
             "clipboard_sync", "clipboard_files", "clipboard_files_sync",
+            "receive_files_for_paste", "release_input",
         }
 
         sessions = self.device_sessions.get(device_id, {})
@@ -1908,6 +2678,35 @@ class ConnectionManager:
             return False
 
         async with self.write_locks[device_id]:
+            sent = False
+            for ws in targets:
+                try:
+                    await ws.send_json(data)
+                    sent = True
+                except Exception:
+                    pass
+            return sent
+
+    async def send_input_to_device(self, device_id: int, data: dict) -> bool:
+        """Envía comandos de input (teclado/mouse) con lock de alta prioridad.
+        Usa un lock separado para evitar bloqueos con frames/telemetría."""
+        if device_id not in self.input_locks:
+            self.input_locks[device_id] = asyncio.Lock()
+
+        sessions = self.device_sessions.get(device_id, {})
+        sel = self.selected_sessions.get(device_id)
+        targets = []
+        if sel is not None and sel in sessions:
+            targets = [sessions[sel]]
+        elif device_id in self.active_connections:
+            targets = [self.active_connections[device_id]]
+        else:
+            targets = list(sessions.values())
+
+        if not targets:
+            return False
+
+        async with self.input_locks[device_id]:
             sent = False
             for ws in targets:
                 try:
@@ -2011,6 +2810,66 @@ class ConnectionManager:
             "Tiempo de espera agotado al cambiar de sesión. Verifique que el agente esté actualizado.",
         )
 
+    async def _request_full_frame(self, device_id: int):
+        try:
+            await self.send_json_safe(device_id, {"type": "refresh_frame"})
+        except Exception:
+            logger.exception("[FRAME RESYNC] No se pudo solicitar frame completo para device %d", device_id)
+
+    def queue_frame_to_viewers(self, device_id: int, frame_data: str, delta: dict = None):
+        if device_id in self.pending_viewer_frames:
+            self.pending_viewer_frames.pop(device_id, None)
+            self.frame_resync_needed.add(device_id)
+            if device_id not in self.frame_resync_requests:
+                self.frame_resync_requests.add(device_id)
+                asyncio.create_task(self._request_full_frame(device_id))
+
+        if device_id in self.frame_resync_needed:
+            if delta:
+                return
+            self.frame_resync_needed.discard(device_id)
+            self.frame_resync_requests.discard(device_id)
+
+        self.pending_viewer_frames[device_id] = (frame_data, delta)
+        task = self.frame_push_tasks.get(device_id)
+        if task is None or task.done():
+            self.frame_push_tasks[device_id] = asyncio.create_task(self._flush_pending_frames(device_id))
+
+    async def _flush_pending_frames(self, device_id: int):
+        try:
+            while True:
+                pending = self.pending_viewer_frames.pop(device_id, None)
+                if pending is None:
+                    return
+                if len(pending) == 3:
+                    image_bytes, delta, _is_binary = pending
+                    await self.push_binary_frame_to_viewers(device_id, image_bytes, delta)
+                else:
+                    frame_data, delta = pending
+                    await self.push_frame_to_viewers(device_id, frame_data, delta)
+        finally:
+            if self.frame_push_tasks.get(device_id) is asyncio.current_task():
+                self.frame_push_tasks.pop(device_id, None)
+
+    def queue_binary_frame_to_viewers(self, device_id: int, image_bytes: bytes, delta: dict = None):
+        if device_id in self.pending_viewer_frames:
+            self.pending_viewer_frames.pop(device_id, None)
+            self.frame_resync_needed.add(device_id)
+            if device_id not in self.frame_resync_requests:
+                self.frame_resync_requests.add(device_id)
+                asyncio.create_task(self._request_full_frame(device_id))
+
+        if device_id in self.frame_resync_needed:
+            if delta:
+                return
+            self.frame_resync_needed.discard(device_id)
+            self.frame_resync_requests.discard(device_id)
+
+        self.pending_viewer_frames[device_id] = (image_bytes, delta, True)
+        task = self.frame_push_tasks.get(device_id)
+        if task is None or task.done():
+            self.frame_push_tasks[device_id] = asyncio.create_task(self._flush_pending_frames(device_id))
+
     async def push_frame_to_viewers(self, device_id: int, frame_data: str, delta: dict = None):
         """
         Envía el frame recién llegado del agente a TODOS los técnicos que tienen
@@ -2020,15 +2879,15 @@ class ConnectionManager:
         """
         try:
             from session_recorder import recorder_manager
-            await recorder_manager.ingest_frame(device_id, frame_data, delta)
+            if recorder_manager.is_recording_device(device_id):
+                await recorder_manager.ingest_frame(device_id, frame_data, delta)
         except Exception:
             pass
 
         if device_id not in self.viewer_connections:
             return
 
-        # Log before sending frame to viewers
-        logger.info("[FRAME SEND] device_id=%d viewers=%d delta=%s", device_id, len(self.viewer_connections.get(device_id, {})), bool(delta))
+        logger.debug("[FRAME SEND] device_id=%d viewers=%d delta=%s", device_id, len(self.viewer_connections.get(device_id, {})), bool(delta))
 
         # DIRTY_RECT_START: incluir delta en payload si el agente lo envió
         payload = {"type": "frame", "frame": frame_data}
@@ -2063,6 +2922,35 @@ class ConnectionManager:
                     self.viewer_connections.pop(device_id, None)
             self.viewer_write_locks.pop(ws_id, None)
             logger.debug("[VIEWER] Viewer %s desconectado de device %d", ws_id, device_id)
+
+    async def push_binary_frame_to_viewers(self, device_id: int, image_bytes: bytes, delta: dict = None):
+        if device_id not in self.viewer_connections:
+            return
+
+        if delta:
+            delta_json = json.dumps(delta).encode('utf-8')
+            packet = b'\x02' + struct.pack('>I', len(delta_json)) + delta_json + image_bytes
+        else:
+            packet = b'\x01' + image_bytes
+
+        dead_viewers = []
+        for ws_id, ws in list(self.viewer_connections[device_id].items()):
+            lock = self.viewer_write_locks.get(ws_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self.viewer_write_locks[ws_id] = lock
+            try:
+                async with lock:
+                    await ws.send_bytes(packet)
+            except Exception:
+                dead_viewers.append(ws_id)
+
+        for ws_id in dead_viewers:
+            if device_id in self.viewer_connections:
+                self.viewer_connections[device_id].pop(ws_id, None)
+                if not self.viewer_connections[device_id]:
+                    self.viewer_connections.pop(device_id, None)
+            self.viewer_write_locks.pop(ws_id, None)
 
     def add_viewer(self, device_id: int, ws_id: str, ws: WebSocket):
         if device_id not in self.viewer_connections:
@@ -2186,6 +3074,12 @@ manager = ConnectionManager()
 from agenda import setup_agenda, periodic_agenda_worker
 setup_agenda(app, manager, get_current_user, send_push_notification)
 
+# WhatsApp Business Platform (Cloud API): cuentas, plantillas, webhook y facturación
+from whatsapp import setup_whatsapp, ensure_erp_columns
+setup_whatsapp(app, get_current_user, GESACTI_SYNC_KEY)
+# Columnas del canal ERP (ApolloGesCom): create_all no agrega columnas a tablas existentes
+ensure_erp_columns()
+
 
 @app.websocket("/api/ws/viewer/{device_id}")
 async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Query("")):
@@ -2257,15 +3151,26 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
                     FORWARDED_CMDS = {
                         "get_sessions", "switch_session", "login_session",
                         "set_monitor", "refresh_frame", "mouse_click",
-                        "mouse_move", "mouse_scroll", "key_press",
-                        "key_down", "key_up", "write_text", "set_clipboard",
-                        "set_stream_params", "start_hq", "stop_hq"
+                        "mouse_down", "mouse_up", "mouse_move", "mouse_scroll",
+                        "key_press", "key_down", "key_up", "write_text", "paste_text",
+                        "set_clipboard", "clipboard_sync", "clipboard_files",
+                        "clipboard_files_sync", "receive_files_for_paste", "release_input",
+                        "set_stream_params", "start_hq", "stop_hq",
+                        "webrtc_offer", "webrtc_ice", "webrtc_hangup",
                     }
                     if cmd_type in FORWARDED_CMDS:
                         if cmd_type == "start_hq":
                             manager.hq_wanted.add(device_id)
                         elif cmd_type == "stop_hq":
                             manager.hq_wanted.discard(device_id)
+                        
+                        # INPUT_PRIORITY: comandos de input van con lock de alta prioridad
+                        INPUT_TYPES = {
+                            "mouse_click", "mouse_down", "mouse_up", "mouse_move", "mouse_scroll",
+                            "key_press", "key_down", "key_up", "write_text", "paste_text",
+                            "release_input",
+                        }
+                        
                         if cmd_type == "switch_session":
                             await manager.handle_session_switch(device_id, cmd)
                             if not await manager.send_json_to_device(device_id, cmd):
@@ -2302,6 +3207,9 @@ async def websocket_viewer(websocket: WebSocket, device_id: int, token: str = Qu
                                     "[SESSION-SWITCH] login_session no llegó al agente (sin WS)",
                                     "ERROR",
                                 )
+                        elif cmd_type in INPUT_TYPES:
+                            # INPUT_PRIORITY: enviar inmediatamente con lock de alta prioridad
+                            asyncio.create_task(manager.send_input_to_device(device_id, cmd))
                         else:
                             await manager.send_json_to_device(device_id, cmd)
                 except Exception:
@@ -2417,9 +3325,6 @@ def _purge_duplicate_pending_devices(db, keep: models.CentinelaDevice) -> int:
         clauses.append(models.CentinelaDevice.assist_id == keep.assist_id)
     if keep.alt_remote_id:
         clauses.append(models.CentinelaDevice.alt_remote_id == keep.alt_remote_id)
-    # Mismo hostname solo si el keeper ya está asignado (evita borrar otro pending distinto)
-    if keep.device_name and keep.client_id is not None:
-        clauses.append(models.CentinelaDevice.device_name == keep.device_name)
     if not clauses:
         return 0
 
@@ -2545,14 +3450,16 @@ def handle_centinela_handshake(client_id_param: int, device_name: str, license_k
                     models.CentinelaDevice.device_name == device_name,
                 ).first()
             if not device:
-                # Cualquier fila con mismo hostname (asignada o pendiente)
+                # Mismo hostname SOLO si está pendiente. Nombres como
+                # "Servidor" / "SERVER" son comunes: no fusionar una PC
+                # nueva con una ya asignada a otro cliente.
                 device = (
                     db.query(models.CentinelaDevice)
-                    .filter(models.CentinelaDevice.device_name == device_name)
-                    .order_by(
-                        models.CentinelaDevice.client_id.is_(None).asc(),
-                        models.CentinelaDevice.id.desc(),
+                    .filter(
+                        models.CentinelaDevice.device_name == device_name,
+                        models.CentinelaDevice.client_id == None,
                     )
+                    .order_by(models.CentinelaDevice.id.desc())
                     .first()
                 )
 
@@ -2861,11 +3768,39 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
         try:
             while True:
                 try:
-                    # Timeout ampliado a 45s: tolera picos de CPU/red sin desconectar prematuramente
-                    data = await asyncio.wait_for(websocket.receive_json(), timeout=45.0)
+                    raw_msg = await asyncio.wait_for(websocket.receive(), timeout=45.0)
                 except asyncio.TimeoutError:
                     logger.warning("[HEARTBEAT] Sin senales del dispositivo. Forzando desconexion.")
                     raise WebSocketDisconnect()
+
+                if raw_msg.get("bytes") is not None:
+                    raw_b = raw_msg["bytes"]
+                    if len(raw_b) < 2:
+                        continue
+                    tag = raw_b[0]
+                    if tag == 0x01:
+                        _img_bytes, _delta = raw_b[1:], None
+                    elif tag == 0x02 and len(raw_b) > 5:
+                        _dlen = struct.unpack('>I', raw_b[1:5])[0]
+                        if len(raw_b) < 5 + _dlen:
+                            continue
+                        _delta = json.loads(raw_b[5:5+_dlen].decode('utf-8'))
+                        _img_bytes = raw_b[5+_dlen:]
+                    else:
+                        continue
+                    _is_active = True
+                    if device_id in manager.selected_sessions:
+                        _aws = manager.device_sessions.get(device_id, {}).get(manager.selected_sessions[device_id])
+                        if _aws and _aws != websocket:
+                            _is_active = False
+                    if _is_active:
+                        manager.queue_binary_frame_to_viewers(device_id, _img_bytes, _delta)
+                    continue
+
+                try:
+                    data = json.loads(raw_msg.get("text", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    continue
 
                 try:
                     is_active_session = True
@@ -2931,8 +3866,7 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                             delta = data.get("delta")  # None si es frame completo
                             if not delta:  # Solo sobreescribir cache con frames completos
                                 manager.client_frames[device_id] = frame_data
-                            # PUSH INMEDIATO a todos los viewers WS conectados
-                            asyncio.create_task(manager.push_frame_to_viewers(device_id, frame_data, delta))
+                            manager.queue_frame_to_viewers(device_id, frame_data, delta)
 
 
                     elif data["type"] == "chat_message":
@@ -2953,10 +3887,40 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
                         # Offload DB call a hilo secundario
                         asyncio.create_task(asyncio.to_thread(save_remote_log, device_id, final_msg, level))
 
+                    elif data["type"] in ("webrtc_answer", "webrtc_ice", "webrtc_state", "webrtc_error"):
+                        asyncio.create_task(manager.push_to_viewers(device_id, data))
+
+                    elif data["type"] in ("capture_warning", "capture_ok"):
+                        asyncio.create_task(manager.push_to_viewers(device_id, data))
+
                     elif data["type"] == "clipboard_sync":
                         text = data.get("text", "")
                         manager.client_clipboard[device_id] = text
-                        logger.debug("[CLIPBOARD] Datos recibidos")
+                        asyncio.create_task(manager.push_to_viewers(device_id, {
+                            "type": "clipboard_sync",
+                            "text": text,
+                        }))
+                        logger.debug("[CLIPBOARD] Texto recibido (%d chars)", len(text or ""))
+
+                    elif data["type"] == "clipboard_files_sync":
+                        raw_files = data.get("files") or []
+                        manager.client_clipboard_files[device_id] = raw_files
+                        asyncio.create_task(manager.push_to_viewers(device_id, {
+                            "type": "clipboard_files_sync",
+                            "files": raw_files,
+                        }))
+                        asyncio.create_task(_ingest_remote_clipboard_files(device_id, raw_files))
+                        logger.info("[CLIPBOARD] Archivos remotos detectados: %s", raw_files)
+
+                    elif data["type"] == "clipboard_files_set":
+                        ok = bool(data.get("ok"))
+                        count = int(data.get("count") or 0)
+                        asyncio.create_task(manager.push_to_viewers(device_id, {
+                            "type": "clipboard_files_set",
+                            "ok": ok,
+                            "count": count,
+                        }))
+                        logger.info("[CLIPBOARD] Archivos enviados al cliente: count=%d ok=%s", count, ok)
 
                     elif data["type"] == "session_list":
                         sessions = data.get("sessions", [])
@@ -2993,6 +3957,9 @@ async def websocket_centinela(websocket: WebSocket, client_id: int, device_name:
 
                     elif data["type"] in ["file_list", "file_content", "dir_list"]:
                         manager.client_files[device_id] = data
+
+                    elif data["type"] == "ping" and "t" in data:
+                        await websocket.send_json({"type": "pong", "t": data["t"]})
 
                     elif data["type"] in ["pong", "ping_ack"]:
                         # Heartbeat: el agente respondió al ping, actualizar last_seen de forma no bloqueante
@@ -3121,10 +4088,35 @@ def update_centinela_device_notes(device_id: int, payload: schemas.DeviceNotesUp
     return {"status": "success", "message": "Notas actualizadas correctamente", "notes": device.notes}
 
 
+@app.post("/api/centinelas/import-teamviewer", tags=["Centinela"])
+async def import_teamviewer_computers(
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """CSV de TeamViewer (alias, ID, grupo, descripción) → PCs y notas del cliente."""
+    name = (file.filename or "").lower()
+    if not name.endswith(".csv") and not name.endswith(".txt"):
+        raise HTTPException(status_code=400, detail="Subí el CSV exportado de TeamViewer.")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="El archivo está vacío.")
+    if len(raw) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="El CSV supera 8 MB.")
+    try:
+        from teamviewer_import import import_teamviewer_csv
+        return import_teamviewer_csv(db, raw, dry_run=dry_run)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @app.get("/api/centinelas/pending", response_model=List[schemas.CentinelaDeviceOut], tags=["Centinela"])
 def get_pending_centinelas(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     """ Devuelve dispositivos pendientes de licencia.
     Autolimpia huérfanos que ya tienen gemelo asignado (mismo assist_id / alt / hostname). """
+    if current_user.rol == "reseller":
+        return []
     devices = db.query(models.CentinelaDevice).filter(models.CentinelaDevice.client_id == None).all()
 
     # Autodedup: si hay un PC asignado con mismo assist/alt/nombre, borrar el pending
@@ -3146,16 +4138,6 @@ def get_pending_centinelas(db: Session = Depends(get_db), current_user: models.U
                 db.query(models.CentinelaDevice)
                 .filter(
                     models.CentinelaDevice.alt_remote_id == dev.alt_remote_id,
-                    models.CentinelaDevice.client_id != None,
-                    models.CentinelaDevice.id != dev.id,
-                )
-                .first()
-            )
-        if not twin and dev.device_name:
-            twin = (
-                db.query(models.CentinelaDevice)
-                .filter(
-                    models.CentinelaDevice.device_name == dev.device_name,
                     models.CentinelaDevice.client_id != None,
                     models.CentinelaDevice.id != dev.id,
                 )
@@ -3403,6 +4385,97 @@ def get_centinela_chat_history(device_id: int, db: Session = Depends(get_db), cu
     """ Recupera los últimos 50 mensajes de chat entre técnicos y este dispositivo. """
     return db.query(models.RemoteChat).filter(models.RemoteChat.device_id == device_id).order_by(models.RemoteChat.timestamp.asc()).limit(50).all()
 
+CLIPBOARD_FILE_MAX = 25 * 1024 * 1024
+REMOTE_INBOX = r"C:\Users\Public\ApolloInbox"
+
+
+def _clipboard_public_base() -> str:
+    return API_URL.replace("/api", "").rstrip("/")
+
+
+def _agent_version_tuple(ver: str):
+    nums = []
+    for part in str(ver or "").split("."):
+        digits = "".join(c for c in part if c.isdigit())
+        nums.append(int(digits) if digits else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+
+def _normalize_clip_files(raw_files) -> list:
+    out = []
+    for item in raw_files or []:
+        if isinstance(item, str):
+            path = item.strip()
+            if not path:
+                continue
+            out.append({"path": path, "name": os.path.basename(path), "size": None, "is_dir": False})
+            continue
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        out.append({
+            "path": path,
+            "name": str(item.get("name") or os.path.basename(path)),
+            "size": item.get("size"),
+            "is_dir": bool(item.get("is_dir")),
+        })
+    return out
+
+
+async def _ingest_remote_clipboard_files(device_id: int, raw_files):
+    """Pide al agente que suba los archivos copiados (Ctrl+C) para bajarlos al técnico."""
+    from urllib.parse import quote
+    items = _normalize_clip_files(raw_files)
+    ready = []
+    base = _clipboard_public_base()
+    for idx, item in enumerate(items[:8]):
+        path_l = str(item.get("path") or "").replace("/", "\\").lower()
+        if item["is_dir"] or "apolloinbox" in path_l:
+            continue
+        size = item.get("size")
+        if isinstance(size, (int, float)) and (size < 0 or size > CLIPBOARD_FILE_MAX):
+            continue
+        safe_name = os.path.basename(item["name"] or item["path"]) or "archivo"
+        dest_name = f"clip_{device_id}_{idx}_{safe_name}"
+        # No borrar client_files de otro upload en curso de forma agresiva
+        prev = manager.client_files.get(device_id) or {}
+        if prev.get("status") == "ready" and prev.get("filename") in (dest_name, safe_name):
+            ready.append({
+                "name": safe_name,
+                "url": f"/api/temp/{dest_name}",
+                "size": item.get("size"),
+            })
+            continue
+        manager.client_files.pop(device_id, None)
+        await manager.send_json_safe(device_id, {
+            "type": "upload_to_server",
+            "path": item["path"],
+            "upload_url": f"{base}/api/centinelas/devices/{device_id}/files/receive?as={quote(dest_name)}",
+        })
+        got = False
+        for _ in range(100):  # hasta ~20s
+            await asyncio.sleep(0.2)
+            st = manager.client_files.get(device_id) or {}
+            fn = st.get("filename") or st.get("saved_as") or ""
+            if st.get("status") == "ready" and fn in (dest_name, safe_name, f"{device_id}_{safe_name}"):
+                ready.append({
+                    "name": safe_name,
+                    "url": f"/api/temp/{dest_name if dest_name in (fn, st.get('saved_as')) else (st.get('saved_as') or dest_name)}",
+                    "size": item.get("size"),
+                })
+                got = True
+                break
+        if not got:
+            logger.warning("[CLIPBOARD] Timeout subiendo %s desde device %s", safe_name, device_id)
+    if ready:
+        manager.client_clipboard_ready[device_id] = ready
+        await manager.push_to_viewers(device_id, {"type": "clipboard_files_ready", "files": ready})
+
+
 @app.post("/api/centinelas/devices/{device_id}/clipboard", tags=["Centinela"])
 async def sync_centinela_clipboard(device_id: int, clip_data: dict, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     """ Sincroniza el portapapeles con un dispositivo específico. """
@@ -3412,11 +4485,91 @@ async def sync_centinela_clipboard(device_id: int, clip_data: dict, db: Session 
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Dispositivo offline")
 
+
+def _webrtc_ice_servers() -> list:
+    servers = []
+    stun = os.getenv(
+        "WEBRTC_STUN_URLS",
+        "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
+    )
+    for url in stun.split(","):
+        url = url.strip()
+        if url:
+            servers.append({"urls": [url]})
+    turn = (os.getenv("WEBRTC_TURN_URL") or "").strip()
+    if turn:
+        entry = {"urls": [turn]}
+        user = (os.getenv("WEBRTC_TURN_USER") or "").strip()
+        cred = (os.getenv("WEBRTC_TURN_PASS") or "").strip()
+        if user:
+            entry["username"] = user
+        if cred:
+            entry["credential"] = cred
+        servers.append(entry)
+    return servers
+
+
+@app.get("/api/centinelas/webrtc/ice", tags=["Centinela"])
+def get_webrtc_ice(current_user: models.User = Depends(get_current_user)):
+    """STUN/TURN para el canal rápido (P2P). El media no pasa por este API."""
+    return {"iceServers": _webrtc_ice_servers()}
+
+
 @app.get("/api/centinelas/devices/{device_id}/clipboard", tags=["Centinela"])
 def get_centinela_clipboard(device_id: int, current_user: models.User = Depends(get_current_user)):
-    """ Recupera el último texto del portapapeles reportado por el cliente. """
-    text = manager.client_clipboard.get(device_id, "")
-    return {"text": text}
+    """Texto y archivos listos del portapapeles remoto."""
+    return {
+        "text": manager.client_clipboard.get(device_id, ""),
+        "files": manager.client_clipboard_ready.get(device_id, []),
+        "remote_paths": manager.client_clipboard_files.get(device_id, []),
+    }
+
+
+@app.post("/api/centinelas/devices/{device_id}/clipboard/files", tags=["Centinela"])
+async def paste_files_to_centinela(
+    device_id: int,
+    files: List[UploadFile] = File(...),
+    current_user: models.User = Depends(get_current_user),
+):
+    """El técnico pega/arrastra archivos: se suben al cliente y quedan en el portapapeles para clic derecho → Pegar."""
+    if device_id not in manager.active_connections:
+        raise HTTPException(status_code=404, detail="Dispositivo offline")
+    temp_dir = "temp_files"
+    os.makedirs(temp_dir, exist_ok=True)
+    payload = []
+    remote_paths = []
+    base = _clipboard_public_base()
+    for up in files[:8]:
+        name = os.path.basename(up.filename or "archivo")
+        save_name = f"out_{device_id}_{name}"
+        save_path = os.path.join(temp_dir, save_name)
+        with open(save_path, "wb") as buffer:
+            shutil.copyfileobj(up.file, buffer)
+        if os.path.getsize(save_path) > CLIPBOARD_FILE_MAX:
+            raise HTTPException(status_code=413, detail=f"{name} supera 25 MB")
+        url = f"{base}/api/temp/{save_name}"
+        dest = os.path.join(REMOTE_INBOX, name)
+        payload.append({"url": url, "name": name})
+        remote_paths.append(dest)
+    telem = manager.client_telemetry.get(device_id) or {}
+    ver = str(telem.get("agent_version") or "")
+    if _agent_version_tuple(ver) >= (3, 3, 3):
+        await manager.send_json_safe(device_id, {
+            "type": "receive_files_for_paste",
+            "files": payload,
+            "dest_dir": REMOTE_INBOX,
+            "paste": False,
+        })
+    else:
+        for item, dest in zip(payload, remote_paths):
+            await manager.send_json_safe(device_id, {
+                "type": "download_from_server",
+                "url": item["url"],
+                "dest_path": dest,
+            })
+        await asyncio.sleep(min(4.0, 0.8 + 0.4 * len(remote_paths)))
+        await manager.send_json_safe(device_id, {"type": "clipboard_files", "files": remote_paths})
+    return {"status": "ok", "count": len(payload), "dest": REMOTE_INBOX}
 
 @app.get("/api/centinelas/devices/{device_id}/files", tags=["Centinela"])
 async def get_centinela_files(device_id: int, path: str = "C:\\", current_user: models.User = Depends(get_current_user)):
@@ -3484,16 +4637,22 @@ async def request_file_download(device_id: int, path: str, db: Session = Depends
     raise HTTPException(status_code=408, detail="Tiempo de espera agotado. El agente no pudo transmitir el archivo.")
 
 @app.post("/api/centinelas/devices/{device_id}/files/receive", tags=["Centinela"])
-async def receive_file_from_agent(device_id: int, file: UploadFile = File(...)):
+async def receive_file_from_agent(device_id: int, file: UploadFile = File(...), as_name: Optional[str] = Query(None, alias="as")):
     """ Endpoint donde el agente sube el archivo solicitado por el técnico. """
     temp_dir = "temp_files"
     if not os.path.exists(temp_dir): os.makedirs(temp_dir)
-    
-    file_path = os.path.join(temp_dir, f"{device_id}_{file.filename}")
+    orig_name = file.filename or "archivo"
+    dest_name = os.path.basename(as_name) if as_name else f"{device_id}_{orig_name}"
+    file_path = os.path.join(temp_dir, dest_name)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    manager.client_files[device_id] = {"status": "ready", "filename": file.filename, "download_path": f"/api/temp/{device_id}_{file.filename}"}
+    manager.client_files[device_id] = {
+        "status": "ready",
+        "filename": dest_name if as_name else orig_name,
+        "saved_as": dest_name,
+        "download_path": f"/api/temp/{dest_name}",
+    }
     return {"status": "ok"}
 
 @app.post("/api/centinelas/devices/{device_id}/files/upload", tags=["Centinela"])
@@ -3953,22 +5112,84 @@ async def force_update(device_id: int):
     return {"status": "error", "message": "Agent not connected"}
 
 @app.get("/api/centinela/download_update")
-def download_update():
-    file_path = os.path.join("updates", "ApolloSetup.exe")
-    if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="application/octet-stream", filename="ApolloSetup.exe")
-    return {"error": "File not found"}
+def download_update(arch: Optional[str] = None):
+    """Descarga pública del instalador Centinela (sin login).
+    arch: auto|x64|x86|combined  (default: combined = ApolloSetup.exe histórico)
+    """
+    updates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "updates")
+    if not os.path.isdir(updates_dir):
+        updates_dir = "updates"
+
+    choice = (arch or "combined").strip().lower()
+    candidates = []
+    if choice in ("x64", "amd64", "64"):
+        candidates = ["ApolloSetup_x64.exe", "ApolloSetup.exe"]
+    elif choice in ("x86", "win32", "32"):
+        candidates = ["ApolloSetup_x86.exe", "ApolloSetup.exe"]
+    else:
+        # combined / auto / vacío → setup unificado o fallback por arch
+        candidates = ["ApolloSetup.exe", "ApolloSetup_x64.exe", "ApolloSetup_x86.exe"]
+
+    for name in candidates:
+        file_path = os.path.join(updates_dir, name)
+        if os.path.exists(file_path):
+            return FileResponse(
+                file_path,
+                media_type="application/octet-stream",
+                filename=name if name != "ApolloSetup.exe" else "ApolloSetup.exe",
+            )
+    raise HTTPException(status_code=404, detail="Instalador no publicado en el servidor (updates/)")
+
 
 @app.get("/api/centinela/update_check")
-def check_update():
-    version_file = os.path.join("updates", "version.json")
+def check_update(request: Request):
+    """Info pública de versión / enlaces de descarga (sin login)."""
+    updates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "updates")
+    if not os.path.isdir(updates_dir):
+        updates_dir = "updates"
+    version_file = os.path.join(updates_dir, "version.json")
+    data = {"version": "0.0.0", "url": "", "downloads": {}}
     if os.path.exists(version_file):
         try:
-            with open(version_file, "r") as f:
-                return json.load(f)
+            with open(version_file, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data.update(loaded)
         except Exception as e:
-            return {"error": str(e)}
-    return {"version": "0.0.0", "url": ""}
+            data["error"] = str(e)
+
+    public_base = str(request.base_url).rstrip("/")
+    base = f"{public_base}/api/centinela/download_update"
+    configured_url = str(data.get("url") or "").strip()
+    if configured_url.startswith("/"):
+        data["url"] = f"{public_base}{configured_url}"
+    files = {
+        "combined": "ApolloSetup.exe",
+        "x64": "ApolloSetup_x64.exe",
+        "x86": "ApolloSetup_x86.exe",
+    }
+    downloads = {}
+    for key, fname in files.items():
+        path = os.path.join(updates_dir, fname)
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            downloads[key] = {
+                "filename": fname,
+                "url": f"{base}?arch={key}",
+                "size_bytes": size,
+                "size_mb": round(size / (1024 * 1024), 1),
+            }
+    data["downloads"] = downloads
+    if not data.get("url") and downloads:
+        data["url"] = downloads.get("combined", downloads.get("x64", next(iter(downloads.values()))))["url"]
+    data["published"] = bool(downloads)
+    return data
+
+
+@app.get("/api/public/centinela")
+def public_centinela_info(request: Request):
+    """Alias amigable para la landing pública de instalación."""
+    return check_update(request)
 
 
 

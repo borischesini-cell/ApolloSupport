@@ -1,18 +1,22 @@
 import asyncio
+from asyncio import PriorityQueue
 import websockets
 import json
+import struct
 import psutil
 import socket
 import platform
 import threading
 import random
 import tkinter as tk
+from tkinter import messagebox
 import pyautogui
 import base64
 import io
 from PIL import Image
 import os
 import ctypes
+from ctypes import wintypes
 import pystray
 
 # --- OPTIMIZACIONES DE MOUSE Y DPI ---
@@ -52,8 +56,8 @@ import mss
 # ==============================================================================
 # CONFIGURACION Y VERSIONADO
 # ==============================================================================
-CLIENT_VERSION = "3.2.6"
-BUILD_DATE     = "2026-08-31 11:00"  # <--- SE ACTUALIZA MANUALMENTE EN CADA RELEASE
+CLIENT_VERSION = "3.3.36"
+BUILD_DATE     = "2026-10-05"  # <--- SE ACTUALIZA MANUALMENTE EN CADA RELEASE
 # ==============================================================================
 
 class _CentinelaFilter(logging.Filter):
@@ -150,9 +154,59 @@ VK_MAP = {
     "'": 0xDE, 'quote': 0xDE, '"': 0xDE,
     '[': 0xDB, '{': 0xDB, ']': 0xDD, '}': 0xDD,
     '`': 0xC0, '~': 0xC0,
+    '*': 0x6A, 'multiply': 0x6A,
+    'numpad0': 0x60, 'numpad1': 0x61, 'numpad2': 0x62, 'numpad3': 0x63,
+    'numpad4': 0x64, 'numpad5': 0x65, 'numpad6': 0x66, 'numpad7': 0x67,
+    'numpad8': 0x68, 'numpad9': 0x69,
+    'numpadmultiply': 0x6A, 'numpadadd': 0x6B,
+    'numpadsubtract': 0x6D, 'numpaddecimal': 0x6E,
+    'numpaddivide': 0x6F, 'numpadenter': 0x0D,
+    'oem102': 0xE2,
+}
+
+CODE_TO_KEY = {
+    **{f"Key{letter.upper()}": letter for letter in "abcdefghijklmnopqrstuvwxyz"},
+    **{f"Digit{digit}": digit for digit in "0123456789"},
+    **{f"Numpad{digit}": f"numpad{digit}" for digit in "0123456789"},
+    'ControlLeft': 'lctrl', 'ControlRight': 'rctrl',
+    'ShiftLeft': 'lshift', 'ShiftRight': 'rshift',
+    'AltLeft': 'lalt', 'AltRight': 'ralt',
+    'MetaLeft': 'winleft', 'MetaRight': 'winright',
+    'NumpadAdd': 'numpadadd', 'NumpadSubtract': 'numpadsubtract',
+    'NumpadMultiply': 'numpadmultiply', 'NumpadDivide': 'numpaddivide',
+    'NumpadDecimal': 'numpaddecimal', 'NumpadComma': 'numpaddecimal',
+    'NumpadEnter': 'numpadenter',
+    'Minus': '-', 'Equal': '=', 'Comma': ',', 'Period': '.', 'Slash': '/',
+    'Backslash': '\\', 'Semicolon': ';', 'Quote': "'", 'BracketLeft': '[',
+    'BracketRight': ']', 'Backquote': '`', 'IntlBackslash': 'oem102',
+    'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right',
+    'Enter': 'enter', 'Escape': 'escape', 'Tab': 'tab', 'Backspace': 'backspace',
+    'Space': 'space', 'Insert': 'insert', 'Delete': 'delete', 'Home': 'home',
+    'End': 'end', 'PageUp': 'pgup', 'PageDown': 'pgdn', 'CapsLock': 'capslock',
+    'NumLock': 'numlock', 'ScrollLock': 'scrolllock', 'Pause': 'pause',
+    'PrintScreen': 'printscreen', 'ContextMenu': 'apps',
+    **{f"F{number}": f"f{number}" for number in range(1, 13)},
+}
+
+CODE_TO_SCANCODE = {
+    'ShiftLeft': 0x2A, 'ShiftRight': 0x36,
+    'Digit1': 0x02, 'Digit2': 0x03, 'Digit3': 0x04, 'Digit4': 0x05,
+    'Digit5': 0x06, 'Digit6': 0x07, 'Digit7': 0x08, 'Digit8': 0x09,
+    'Digit9': 0x0A, 'Digit0': 0x0B,
+    'Minus': 0x0C, 'Equal': 0x0D,
+    'BracketLeft': 0x1A, 'BracketRight': 0x1B,
+    'Semicolon': 0x27, 'Quote': 0x28, 'Backquote': 0x29,
+    'Backslash': 0x2B, 'Comma': 0x33, 'Period': 0x34, 'Slash': 0x35,
+    'IntlBackslash': 0x56,
+    'NumpadMultiply': 0x37, 'NumpadSubtract': 0x4A,
+    'NumpadAdd': 0x4E, 'NumpadDivide': 0x35, 'NumpadEnter': 0x1C,
 }
 
 LAST_LOCAL_CLIPBOARD = ""
+_CLIPBOARD_LOCK = threading.Lock()
+# Mientras dure, el monitor no pisa CF_HDROP ni reenvía eco de archivos que pusimos nosotros.
+_CLIPBOARD_OWN_UNTIL = 0.0
+_CLIPBOARD_OWN_SIGNATURE = None
 
 def _hotkey(*vk_codes):
     """Presiona y suelta una secuencia de VK codes via keybd_event.
@@ -167,6 +221,21 @@ def _hotkey(*vk_codes):
     # Release en orden inverso
     for vk in reversed(vk_codes):
         _u32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _clipboard_claim_own(paths, hold_s: float = 12.0):
+    """Marca que el agente es dueño del portapapeles de archivos por un rato."""
+    global _CLIPBOARD_OWN_UNTIL, _CLIPBOARD_OWN_SIGNATURE
+    try:
+        sig = tuple(sorted(str(p) for p in (paths or []) if p))
+    except Exception:
+        sig = tuple(str(p) for p in (paths or []) if p)
+    _CLIPBOARD_OWN_SIGNATURE = sig
+    _CLIPBOARD_OWN_UNTIL = time.time() + max(2.0, float(hold_s))
+
+
+def _clipboard_owned_now() -> bool:
+    return time.time() < float(_CLIPBOARD_OWN_UNTIL or 0)
 
 def _wake_screen_and_restore_windows():
     """Restaura ventanas minimizadas en Windows y despierta el motor de renderizado
@@ -216,30 +285,225 @@ def _wake_screen_and_restore_windows():
 
 
 def _panic_release():
-    """Libera todos los modificadores de teclado y botones de mouse que puedan
-    haber quedado presionados virtualmente tras un corte de conexion.
-    Se llama al conectar/desconectar un tecnico para evitar que el equipo del
-    cliente quede con Ctrl/Shift/Alt o un boton del mouse 'trabado'.
+    """Libera modificadores y botones que hayan quedado trabados.
+    Solo suelta el mouse si Windows lo ve abajo: un RIGHTUP ciego abre el menú contextual.
     """
     try:
-        import ctypes, pyautogui
         ku = ctypes.windll.user32
         KEYEVENTF_KEYUP = 0x0002
-        # Shift, Ctrl, Alt, WinLeft, WinRight
-        for vk in [0x10, 0x11, 0x12, 0x5B, 0x5C]:
+        _attach_input_desktop()
+        for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
             try:
                 ku.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
             except Exception:
                 pass
-        # Soltar botones del mouse
-        for btn in ('left', 'right'):
-            try:
-                pyautogui.mouseUp(button=btn)
-            except Exception:
-                pass
-        logger.info("[INPUT] panic_release: modificadores y botones liberados")
+        released_right = False
+        # VK_LBUTTON=1, VK_RBUTTON=2, VK_MBUTTON=4
+        if ku.GetAsyncKeyState(0x01) & 0x8000:
+            ku.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+        if ku.GetAsyncKeyState(0x02) & 0x8000:
+            ku.mouse_event(0x0010, 0, 0, 0, 0)  # RIGHTUP
+            released_right = True
+        if ku.GetAsyncKeyState(0x04) & 0x8000:
+            ku.mouse_event(0x0040, 0, 0, 0, 0)  # MIDDLEUP
+        if released_right:
+            time.sleep(0.03)
+            ku.keybd_event(0x1B, 0, 0, 0)
+            ku.keybd_event(0x1B, 0, KEYEVENTF_KEYUP, 0)
+        logger.info("[INPUT] panic_release: modificadores liberados right=%s", released_right)
     except Exception as e:
         logger.warning("[INPUT] panic_release error: %s", e)
+
+
+# ── Puente de inyeccion SYSTEM (para UAC / ventanas elevadas) ────────────────
+# El companion corre con el token del usuario (integridad MEDIA) y Windows (UIPI)
+# le impide inyectar clicks/teclas en ventanas ELEVADAS: el cartel de UAC, apps
+# abiertas "como administrador", regedit, etc. -> el tecnico las ve pero no puede
+# operarlas.
+# Solucion: el servicio lanza un helper de este MISMO exe con --inject-helper que
+# corre como SYSTEM dentro de la sesion del usuario. SYSTEM NO esta limitado por
+# UIPI, asi que puede inyectar en cualquier ventana. El companion le reenvia la
+# entrada por un socket loopback (127.0.0.1). Si el helper no esta disponible, cae
+# a inyeccion directa (comportamiento historico) sin romper nada.
+_IS_INJECT_HELPER = False
+_inject_sock = None
+_inject_lock = threading.Lock()
+_inject_unavail_until = 0.0
+_inject_token = None
+_inject_port = 0
+
+
+def _inject_info_path():
+    # Por-sesion: en servidores RDP cada sesion tiene su propio helper/companion.
+    try:
+        sid = int(get_current_session_id())
+    except Exception:
+        sid = 0
+    return os.path.join(
+        os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
+        "ApolloSupport", f"inject_helper_S{sid}.json",
+    )
+
+
+def _inject_helper_send(cmd: dict) -> bool:
+    """Reenvia una accion de input al helper SYSTEM. True si la tomo el helper."""
+    global _inject_sock, _inject_unavail_until, _inject_port, _inject_token
+    if _IS_INJECT_HELPER:
+        return False  # el propio helper inyecta directo (evita bucle)
+    now = time.time()
+    if now < _inject_unavail_until:
+        return False
+    with _inject_lock:
+        try:
+            if _inject_sock is None:
+                if not _inject_port or not _inject_token:
+                    with open(_inject_info_path(), "r", encoding="utf-8") as f:
+                        info = json.load(f)
+                    _inject_port = int(info.get("port") or 0)
+                    _inject_token = info.get("token") or ""
+                if not _inject_port:
+                    _inject_unavail_until = now + 2.0
+                    return False
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.4)
+                s.connect(("127.0.0.1", _inject_port))
+                _inject_sock = s
+            _inject_sock.sendall((json.dumps({**cmd, "tk": _inject_token}) + "\n").encode("utf-8"))
+            return True
+        except Exception:
+            try:
+                if _inject_sock:
+                    _inject_sock.close()
+            except Exception:
+                pass
+            _inject_sock = None
+            _inject_port = 0
+            _inject_token = None
+            _inject_unavail_until = time.time() + 2.0
+            return False
+
+
+def _mouse_move_norm(x_norm, y_norm):
+    if _inject_helper_send({"a": "move", "x": x_norm, "y": y_norm}):
+        return None
+    u32 = ctypes.windll.user32
+    w = u32.GetSystemMetrics(0)
+    h = u32.GetSystemMetrics(1)
+    if w <= 1 or h <= 1:
+        return None
+    px = max(0, min(w - 1, int(float(x_norm) * w)))
+    py = max(0, min(h - 1, int(float(y_norm) * h)))
+    u32.SetCursorPos(px, py)
+    return px, py
+
+
+def _mouse_button_event(x_norm, y_norm, button, down=True):
+    """Clic via mouse_event nativo (sin pyautogui: no dispara menú ni FAILSAFE)."""
+    if _inject_helper_send({"a": "btn", "x": x_norm, "y": y_norm, "button": button, "down": bool(down)}):
+        return
+    _attach_input_desktop()
+    u32 = ctypes.windll.user32
+    if x_norm is not None and y_norm is not None:
+        _mouse_move_norm(x_norm, y_norm)
+    btn = (button or "left").lower()
+    if down:
+        flags = {"left": 0x0002, "right": 0x0008, "middle": 0x0020}.get(btn, 0x0002)
+    else:
+        flags = {"left": 0x0004, "right": 0x0010, "middle": 0x0040}.get(btn, 0x0004)
+    u32.mouse_event(flags, 0, 0, 0, 0)
+
+
+def _apply_inject_cmd(cmd: dict):
+    """Ejecuta una accion recibida en el helper SYSTEM (inyeccion directa).
+    Se engancha al Input Desktop actual en el MISMO hilo que inyecta, para seguir
+    los cambios de escritorio (p.ej. cuando aparece/desaparece el UAC)."""
+    _attach_input_desktop()
+    a = cmd.get("a")
+    if a == "move":
+        _mouse_move_norm(cmd.get("x"), cmd.get("y"))
+    elif a == "btn":
+        _mouse_button_event(cmd.get("x"), cmd.get("y"), cmd.get("button", "left"), down=bool(cmd.get("down")))
+    elif a == "key":
+        _send_key(int(cmd.get("vk")), up=bool(cmd.get("up")))
+    elif a == "uni":
+        _send_unicode_text(cmd.get("text") or "")
+
+
+def _inject_conn_loop(conn, token):
+    buf = b""
+    try:
+        conn.settimeout(60)
+        while True:
+            chunk = conn.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    cmd = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+                if cmd.get("tk") != token:
+                    continue
+                try:
+                    _apply_inject_cmd(cmd)
+                except Exception as e:
+                    logger.debug("[INJECT] apply error: %s", e)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run_inject_helper():
+    """Helper SYSTEM en la sesion del usuario: recibe input por loopback e inyecta
+    (puede operar el UAC y ventanas elevadas porque SYSTEM no cae bajo UIPI)."""
+    global _IS_INJECT_HELPER
+    _IS_INJECT_HELPER = True
+
+    try:
+        sid = int(get_current_session_id())
+    except Exception:
+        sid = 0
+    mutex_name = f"Global\\ApolloInjectHelper_S{sid}"
+    _k32 = ctypes.windll.kernel32
+    _mutex = _k32.CreateMutexW(None, True, mutex_name)
+    if _k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        logger.info("[INJECT] Helper ya activo en sesion %d (mutex %s) — saliendo", sid, mutex_name)
+        if _mutex:
+            _k32.CloseHandle(_mutex)
+        return
+
+    import secrets
+    token = secrets.token_hex(16)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(8)
+    info_path = _inject_info_path()
+    try:
+        os.makedirs(os.path.dirname(info_path), exist_ok=True)
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({"port": port, "token": token, "pid": os.getpid()}, f)
+    except Exception as e:
+        logger.error("[INJECT] No se pudo escribir %s: %s", info_path, e)
+    logger.info("[INJECT] Helper SYSTEM escuchando en 127.0.0.1:%d (sesion %s)", port, sid)
+
+    while True:
+        try:
+            conn, _addr = srv.accept()
+        except Exception:
+            time.sleep(0.2)
+            continue
+        threading.Thread(target=_inject_conn_loop, args=(conn, token), daemon=True).start()
 
 
 ACTIVE_ASYNC_LOOP = None
@@ -257,177 +521,345 @@ def send_ws_message_threadsafe(msg_dict: dict):
             pass
 
 
+def _clipboard_win32_apis():
+    k32 = ctypes.windll.kernel32
+    u32 = ctypes.windll.user32
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k32.GlobalAlloc.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k32.GlobalUnlock.restype = wintypes.BOOL
+    k32.GlobalFree.argtypes = [ctypes.c_void_p]
+    k32.GlobalFree.restype = ctypes.c_void_p
+    u32.OpenClipboard.argtypes = [wintypes.HWND]
+    u32.OpenClipboard.restype = wintypes.BOOL
+    u32.CloseClipboard.argtypes = []
+    u32.CloseClipboard.restype = wintypes.BOOL
+    u32.EmptyClipboard.argtypes = []
+    u32.EmptyClipboard.restype = wintypes.BOOL
+    u32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    u32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    u32.GetClipboardData.argtypes = [wintypes.UINT]
+    u32.GetClipboardData.restype = ctypes.c_void_p
+    u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    u32.SetClipboardData.restype = ctypes.c_void_p
+    u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    u32.RegisterClipboardFormatW.restype = wintypes.UINT
+    return k32, u32
+
+
 def _get_clipboard_win32() -> str:
     """Lee texto del portapapeles de Windows usando OpenClipboard/GetClipboardData nativo.
     Funciona tanto en Session 0 como en Session 1 (interactivo)."""
-    _k32 = ctypes.windll.kernel32
-    _u32 = ctypes.windll.user32
+    _k32, _u32 = _clipboard_win32_apis()
     CF_UNICODETEXT = 13
     CF_TEXT = 1
-    text = ""
-    for _ in range(3):
-        if _u32.OpenClipboard(None):
-            try:
-                if _u32.IsClipboardFormatAvailable(CF_UNICODETEXT):
-                    h_data = _u32.GetClipboardData(CF_UNICODETEXT)
-                    if h_data:
-                        ptr = _k32.GlobalLock(h_data)
-                        if ptr:
-                            try:
-                                text = ctypes.wstring_at(ptr)
-                            finally:
-                                _k32.GlobalUnlock(h_data)
-                elif _u32.IsClipboardFormatAvailable(CF_TEXT):
-                    h_data = _u32.GetClipboardData(CF_TEXT)
-                    if h_data:
-                        ptr = _k32.GlobalLock(h_data)
-                        if ptr:
-                            try:
-                                raw = ctypes.string_at(ptr)
-                                text = raw.decode("utf-8", errors="ignore")
-                            finally:
-                                _k32.GlobalUnlock(h_data)
-            finally:
-                _u32.CloseClipboard()
-            break
-        time.sleep(0.05)
-    return text
+    text_out = ""
+    with _CLIPBOARD_LOCK:
+        for _ in range(5):
+            if _u32.OpenClipboard(None):
+                try:
+                    if _u32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                        h_data = _u32.GetClipboardData(CF_UNICODETEXT)
+                        if h_data:
+                            ptr = _k32.GlobalLock(h_data)
+                            if ptr:
+                                try:
+                                    text_out = ctypes.wstring_at(ptr)
+                                finally:
+                                    _k32.GlobalUnlock(h_data)
+                    elif _u32.IsClipboardFormatAvailable(CF_TEXT):
+                        h_data = _u32.GetClipboardData(CF_TEXT)
+                        if h_data:
+                            ptr = _k32.GlobalLock(h_data)
+                            if ptr:
+                                try:
+                                    raw = ctypes.string_at(ptr)
+                                    text_out = raw.decode("utf-8", errors="ignore")
+                                finally:
+                                    _k32.GlobalUnlock(h_data)
+                except Exception as e:
+                    logger.debug("[CLIPBOARD] Error leyendo texto: %s", e)
+                finally:
+                    _u32.CloseClipboard()
+                break
+            time.sleep(0.04)
+    return text_out
 
 
 def _set_clipboard_win32(text: str) -> bool:
     """Pone texto en el portapapeles usando OpenClipboard/SetClipboardData nativo."""
-    _k32 = ctypes.windll.kernel32
-    _u32 = ctypes.windll.user32
+    global _CLIPBOARD_OWN_UNTIL
+    try:
+        _attach_input_desktop()
+    except Exception:
+        pass
+    _k32, _u32 = _clipboard_win32_apis()
     CF_UNICODETEXT = 13
     GMEM_MOVEABLE = 0x0002
     text_bytes = (text or "").encode("utf-16-le") + b"\x00\x00"
-    h_mem = _k32.GlobalAlloc(GMEM_MOVEABLE, len(text_bytes))
-    if not h_mem:
+    with _CLIPBOARD_LOCK:
+        h_mem = _k32.GlobalAlloc(GMEM_MOVEABLE, len(text_bytes))
+        if not h_mem:
+            return False
+        ptr = _k32.GlobalLock(h_mem)
+        if not ptr:
+            _k32.GlobalFree(h_mem)
+            return False
+        ctypes.memmove(ptr, text_bytes, len(text_bytes))
+        _k32.GlobalUnlock(h_mem)
+        for _ in range(8):
+            if _u32.OpenClipboard(None):
+                try:
+                    _u32.EmptyClipboard()
+                    if _u32.SetClipboardData(CF_UNICODETEXT, h_mem):
+                        _CLIPBOARD_OWN_UNTIL = 0.0  # texto pisa ownership de archivos
+                        return True
+                finally:
+                    _u32.CloseClipboard()
+                break
+            time.sleep(0.05)
+        try:
+            _k32.GlobalFree(h_mem)
+        except Exception:
+            pass
         return False
-    ptr = _k32.GlobalLock(h_mem)
-    if not ptr:
-        _k32.GlobalFree(h_mem)
-        return False
-    ctypes.memmove(ptr, text_bytes, len(text_bytes))
-    _k32.GlobalUnlock(h_mem)
 
-    for _ in range(5):
-        if _u32.OpenClipboard(None):
-            try:
-                _u32.EmptyClipboard()
-                _u32.SetClipboardData(CF_UNICODETEXT, h_mem)
-                return True
-            finally:
-                _u32.CloseClipboard()
-        time.sleep(0.05)
-    _k32.GlobalFree(h_mem)
-    return False
+
+def _paste_text_win32(text: str) -> bool:
+    """Setea el portapapeles del usuario interactivo y dispara Ctrl+V de forma atomica."""
+    try:
+        _attach_input_desktop()
+    except Exception:
+        pass
+    ok = _set_clipboard_win32(text or "")
+    if not ok:
+        logger.warning("[PASTE_TEXT] No se pudo setear el portapapeles Win32")
+        return False
+    time.sleep(0.12)
+    try:
+        _hotkey(0x11, 0x56)  # Ctrl+V
+        return True
+    except Exception as e:
+        logger.error("[PASTE_TEXT] Ctrl+V fallo: %s", e)
+        try:
+            ku = ctypes.windll.user32
+            ku.keybd_event(0x11, 0, 0, 0)
+            ku.keybd_event(0x56, 0, 0, 0)
+            time.sleep(0.02)
+            ku.keybd_event(0x56, 0, 0x0002, 0)
+            ku.keybd_event(0x11, 0, 0x0002, 0)
+            return True
+        except Exception as e2:
+            logger.error("[PASTE_TEXT] fallback keybd_event fallo: %s", e2)
+            return False
 
 
 def _get_clipboard_files_win32() -> list:
-    """Lee rutas de archivos en el portapapeles si hay CF_HDROP copiado (ej. Ctrl+C en Explorer)."""
-    _k32 = ctypes.windll.kernel32
-    _u32 = ctypes.windll.user32
+    """Lee rutas de archivos en el portapapeles si hay CF_HDROP (Ctrl+C en Explorer)."""
+    _, _u32 = _clipboard_win32_apis()
     CF_HDROP = 15
     files = []
-    for _ in range(3):
-        if _u32.OpenClipboard(None):
-            try:
-                if _u32.IsClipboardFormatAvailable(CF_HDROP):
-                    h_data = _u32.GetClipboardData(CF_HDROP)
-                    if h_data:
-                        _s32 = ctypes.windll.shell32
-                        count = _s32.DragQueryFileW(h_data, 0xFFFFFFFF, None, 0)
-                        buf = ctypes.create_unicode_buffer(512)
-                        for i in range(count):
-                            length = _s32.DragQueryFileW(h_data, i, buf, 512)
-                            if length > 0:
-                                files.append(buf.value)
-            except Exception as e:
-                logger.debug("[CLIPBOARD] Error leyendo CF_HDROP: %s", e)
-            finally:
-                _u32.CloseClipboard()
-            break
-        time.sleep(0.05)
+    with _CLIPBOARD_LOCK:
+        for _ in range(5):
+            if _u32.OpenClipboard(None):
+                try:
+                    if _u32.IsClipboardFormatAvailable(CF_HDROP):
+                        h_data = _u32.GetClipboardData(CF_HDROP)
+                        if h_data:
+                            _s32 = ctypes.windll.shell32
+                            _s32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+                            _s32.DragQueryFileW.restype = wintypes.UINT
+                            count = _s32.DragQueryFileW(h_data, 0xFFFFFFFF, None, 0)
+                            buf = ctypes.create_unicode_buffer(1024)
+                            for i in range(count):
+                                length = _s32.DragQueryFileW(h_data, i, buf, 1024)
+                                if length > 0:
+                                    files.append(buf.value)
+                except Exception as e:
+                    logger.debug("[CLIPBOARD] Error leyendo CF_HDROP: %s", e)
+                finally:
+                    _u32.CloseClipboard()
+                break
+            time.sleep(0.04)
     return files
 
 
 def _set_clipboard_files_win32(file_paths: list) -> bool:
-    """Coloca archivos en el portapapeles de Windows (CF_HDROP) para que puedan
-    pegarse con Ctrl+V en el Explorador de Windows, Total Commander, etc."""
+    """Coloca archivos en el portapapeles (CF_HDROP + Preferred DropEffect=COPY).
+    Sin Preferred DropEffect, Explorer/Total Commander a menudo no pegan.
+    """
     if not file_paths:
         return False
     import struct
-    _k32 = ctypes.windll.kernel32
-    _u32 = ctypes.windll.user32
+    try:
+        _attach_input_desktop()
+    except Exception:
+        pass
+    _k32, _u32 = _clipboard_win32_apis()
     CF_HDROP = 15
     GMEM_MOVEABLE = 0x0002
+    GMEM_ZEROINIT = 0x0040
+    GHND = GMEM_MOVEABLE | GMEM_ZEROINIT
+    DROPEFFECT_COPY = 1
 
-    # Struct DROPFILES: DWORD pFiles (offset 20); POINT pt (0,0); BOOL fNC (0); BOOL fWide (1)
+    paths = []
+    for p in file_paths:
+        if isinstance(p, dict):
+            p = p.get("path") or ""
+        if not p:
+            continue
+        sp = str(p)
+        paths.append(os.path.abspath(sp) if os.path.exists(sp) else sp)
+    if not paths:
+        return False
+
     header = struct.pack("IIIII", 20, 0, 0, 0, 1)
-    file_bytes = b"".join(p.encode("utf-16-le") + b"\x00\x00" for p in file_paths if p) + b"\x00\x00"
+    file_bytes = b"".join(p.encode("utf-16-le") + b"\x00\x00" for p in paths) + b"\x00\x00"
     total_data = header + file_bytes
+    cf_drop_effect = _u32.RegisterClipboardFormatW("Preferred DropEffect")
 
-    h_mem = _k32.GlobalAlloc(GMEM_MOVEABLE, len(total_data))
-    if not h_mem:
-        return False
-    ptr = _k32.GlobalLock(h_mem)
-    if not ptr:
-        _k32.GlobalFree(h_mem)
-        return False
-    ctypes.memmove(ptr, total_data, len(total_data))
-    _k32.GlobalUnlock(h_mem)
+    with _CLIPBOARD_LOCK:
+        h_mem = _k32.GlobalAlloc(GHND, len(total_data))
+        if not h_mem:
+            return False
+        ptr = _k32.GlobalLock(h_mem)
+        if not ptr:
+            _k32.GlobalFree(h_mem)
+            return False
+        ctypes.memmove(ptr, total_data, len(total_data))
+        _k32.GlobalUnlock(h_mem)
 
-    for _ in range(5):
-        if _u32.OpenClipboard(None):
+        h_effect = _k32.GlobalAlloc(GHND, 4)
+        if h_effect:
+            eptr = _k32.GlobalLock(h_effect)
+            if eptr:
+                ctypes.memmove(eptr, struct.pack("I", DROPEFFECT_COPY), 4)
+                _k32.GlobalUnlock(h_effect)
+            else:
+                _k32.GlobalFree(h_effect)
+                h_effect = None
+
+        for attempt in range(12):
+            if _u32.OpenClipboard(None):
+                owned = False
+                try:
+                    _u32.EmptyClipboard()
+                    if not _u32.SetClipboardData(CF_HDROP, h_mem):
+                        time.sleep(0.05)
+                        continue
+                    owned = True
+                    if h_effect and cf_drop_effect:
+                        if _u32.SetClipboardData(cf_drop_effect, h_effect):
+                            h_effect = None
+                    logger.info("[CLIPBOARD] CF_HDROP OK (%d archivos, intento %d)", len(paths), attempt + 1)
+                    _clipboard_claim_own(paths, hold_s=14.0)
+                    return True
+                finally:
+                    _u32.CloseClipboard()
+            time.sleep(0.06)
+
+        try:
+            _k32.GlobalFree(h_mem)
+        except Exception:
+            pass
+        if h_effect:
             try:
-                _u32.EmptyClipboard()
-                _u32.SetClipboardData(CF_HDROP, h_mem)
-                logger.info("[CLIPBOARD] CF_HDROP establecido con %d archivos en portapapeles", len(file_paths))
-                return True
-            finally:
-                _u32.CloseClipboard()
-        time.sleep(0.05)
-    _k32.GlobalFree(h_mem)
-    return False
+                _k32.GlobalFree(h_effect)
+            except Exception:
+                pass
+        logger.warning("[CLIPBOARD] No se pudo establecer CF_HDROP (%d archivos)", len(paths))
+        return False
+
+
+def _ensure_files_on_clipboard(file_paths: list, paste: bool = True) -> bool:
+    """Setea HDROP, verifica que siga ahi, y opcionalmente envia Ctrl+V con reintentos."""
+    if not file_paths:
+        return False
+    ok = _set_clipboard_files_win32(file_paths)
+    if not ok:
+        return False
+    for _ in range(4):
+        time.sleep(0.08)
+        if _get_clipboard_files_win32():
+            break
+        _set_clipboard_files_win32(file_paths)
+    else:
+        logger.warning("[CLIPBOARD] HDROP desaparecio del portapapeles tras setearlo")
+        return False
+
+    if paste:
+        try:
+            _attach_input_desktop()
+        except Exception:
+            pass
+        time.sleep(0.12)
+        try:
+            _hotkey(0x11, 0x56)
+        except Exception as e:
+            logger.warning("[CLIPBOARD] Ctrl+V fallo: %s", e)
+        time.sleep(0.25)
+        if not _get_clipboard_files_win32():
+            _set_clipboard_files_win32(file_paths)
+        _clipboard_claim_own(file_paths, hold_s=10.0)
+    return True
 
 
 def _native_clipboard_monitor():
-    """Hilo de fondo que vigila continuamente cambios en el portapapeles nativo de Windows (texto y archivos)."""
+    """Hilo de fondo que vigila cambios en el portapapeles nativo (texto y archivos).
+    En idle no llama OpenClipboard: esa API es cara y no hace falta sin tecnico."""
     global LAST_LOCAL_CLIPBOARD
     last_file_signature = None
     while True:
+        viewer_on = bool(globals().get("HAS_ACTIVE_VIEWER", False))
+        if not viewer_on:
+            time.sleep(8.0)
+            continue
         try:
-            # 1. Monitoreo de texto nativo
-            current_text = _get_clipboard_win32()
-            if current_text and current_text != LAST_LOCAL_CLIPBOARD:
-                LAST_LOCAL_CLIPBOARD = current_text
-                send_ws_message_threadsafe({
-                    "type": "clipboard_sync",
-                    "text": current_text
-                })
-                logger.debug("[CLIPBOARD] Texto local sincronizado al servidor: %r", current_text[:60])
+            owned = _clipboard_owned_now()
 
-            # 2. Monitoreo de archivos (CF_HDROP)
+            # 1. Texto: no competir mientras somos duenos de archivos
+            if not owned:
+                current_text = _get_clipboard_win32()
+                if current_text and current_text != LAST_LOCAL_CLIPBOARD:
+                    LAST_LOCAL_CLIPBOARD = current_text
+                    send_ws_message_threadsafe({
+                        "type": "clipboard_sync",
+                        "text": current_text
+                    })
+                    logger.debug("[CLIPBOARD] Texto local sincronizado al servidor: %r", current_text[:60])
+
+            # 2. Archivos (CF_HDROP)
             current_files = _get_clipboard_files_win32()
             if current_files:
-                sig = "|".join(current_files)
-                if sig != last_file_signature:
+                sig = tuple(sorted(current_files))
+                if owned and _CLIPBOARD_OWN_SIGNATURE and sig == _CLIPBOARD_OWN_SIGNATURE:
                     last_file_signature = sig
+                elif sig != last_file_signature:
+                    last_file_signature = sig
+                    info = []
+                    for p in current_files:
+                        try:
+                            info.append({
+                                "path": p,
+                                "name": os.path.basename(p),
+                                "size": os.path.getsize(p) if os.path.isfile(p) else -1,
+                                "is_dir": os.path.isdir(p),
+                            })
+                        except Exception:
+                            info.append({"path": p, "name": os.path.basename(p), "size": None, "is_dir": False})
                     send_ws_message_threadsafe({
                         "type": "clipboard_files_sync",
-                        "files": current_files
+                        "files": info
                     })
                     logger.info("[CLIPBOARD] Archivos locales detectados en portapapeles: %d archivos", len(current_files))
             else:
-                last_file_signature = None
+                if not owned:
+                    last_file_signature = None
         except Exception as e:
             logger.debug("[CLIPBOARD] Error en monitor nativo: %s", e)
-        time.sleep(0.8)
-
-# Iniciar hilo de monitoreo continuo de portapapeles nativo
-# (LAST_LOCAL_CLIPBOARD se define mas abajo; el hilo arranca tras el sleep inicial)
-threading.Thread(target=_native_clipboard_monitor, daemon=True, name="NativeClipboardPoller").start()
+        time.sleep(0.9)
 
 # ==========================================
 # CONFIGURACION Y PERSISTENCIA LOCAL
@@ -513,6 +945,50 @@ DEVICE_NAME = LOCAL_CFG.get("device_name", "Desconocido")
 LIC_KEY = LOCAL_CFG.get("license_key", "DEMO-KEY")
 BASE_WS_URL = LOCAL_CFG.get("base_ws_url", "wss://support.ultimate.net.ar/api/ws/centinela")
 
+# --- Update check (companion UI) ---
+_UPDATE_INFO = {"available": False, "version": "", "url": "", "busy": False, "notes": ""}
+
+
+def _parse_version(v_str):
+    parts = []
+    for x in str(v_str or "0").split("."):
+        digits = ""
+        for ch in x:
+            if ch.isdigit():
+                digits += ch
+            elif digits:
+                break
+        if digits:
+            parts.append(int(digits))
+    return parts or [0]
+
+
+def _api_http_base():
+    return BASE_WS_URL.replace("wss://", "https://").replace("ws://", "http://").split("/api/ws")[0]
+
+
+def _preferred_arch():
+    return "x64" if ctypes.sizeof(ctypes.c_void_p) == 8 else "x86"
+
+
+def fetch_remote_update():
+    """Si el servidor tiene una version mayor, devuelve {version, url, notes}. Si no, None."""
+    check_url = f"{_api_http_base()}/api/centinela/update_check"
+    r = requests.get(check_url, timeout=12, headers={"User-Agent": "ApolloCentinela"})
+    r.raise_for_status()
+    data = r.json() if r.content else {}
+    remote = str(data.get("version") or "0.0.0")
+    if _parse_version(remote) <= _parse_version(CLIENT_VERSION):
+        return None
+    downloads = data.get("downloads") or {}
+    dl = downloads.get(_preferred_arch()) or downloads.get("combined") or {}
+    dl_url = (dl.get("url") or data.get("url") or "").strip()
+    if dl_url.startswith("/"):
+        dl_url = _api_http_base() + dl_url
+    if not dl_url:
+        return None
+    return {"version": remote, "url": dl_url, "notes": data.get("notes") or ""}
+
 def get_alt_remote_id():
     import os, re
     # Check RustDesk
@@ -565,7 +1041,7 @@ def get_current_session_id():
     except Exception:
         return 1  # Asumir sesiÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n 1 si no podemos detectarla
 
-ALT_REMOTE_ID = get_alt_remote_id()
+ALT_REMOTE_ID = ""  # se completa en el loop WS (evita scan de RustDesk/AnyDesk al arrancar)
 SERVER_WS_URL = f"{BASE_WS_URL}/{CLIENT_ID}?device_name={DEVICE_NAME}&license_key={LIC_KEY}&alt_id={ALT_REMOTE_ID}&session_id={get_current_session_id()}"
 APP_VERSION = CLIENT_VERSION
 
@@ -573,8 +1049,12 @@ logger.info("Apollo Centinela v%s | Device: %s | ID: %s", APP_VERSION, DEVICE_NA
 
 IS_ENABLED = True # Control de habilitaciÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n del cliente
 LATEST_FRAME   = None
-HAS_ACTIVE_VIEWER   = False  # OptimizaciÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n: Solo capturar y transmitir si hay un tÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnico mirando
-FORCE_NEXT_FRAME    = False  # Fuerza envÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­o del prÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³ximo frame sin comparar hash (al reconectar viewer)
+HAS_ACTIVE_VIEWER   = False  # Solo capturar/transmitir si hay un tecnico mirando
+VIEWER_LAST_ACTIVITY = 0.0   # time.time() del ultimo technician_joined / active_technicians
+VIEWER_IDLE_TIMEOUT  = 30.0  # si no hay senal de viewer, apagar captura (evita CPU pegada)
+FORCE_NEXT_FRAME    = False  # Fuerza envio del proximo frame sin comparar hash (al reconectar viewer)
+_MONITOR_COUNT_CACHE = 1
+_MONITOR_COUNT_CACHE_TIME = 0.0
 
 # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ DIRTY RECTANGLES ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
 # Para revertir al comportamiento anterior: poner USE_DIRTY_RECT = False
@@ -586,6 +1066,20 @@ USE_DIRTY_RECT     = False  # Desactivado: parches sobre canvas vacio = cuadradi
                              # Las mejoras reales son 25 FPS + method=0. Reactivar cuando
                              # el canvas buffer se inicialice correctamente antes del primer delta.
 LATEST_FRAME_PACKET = None  # dict {"frame": b64, "delta": {x,y,w,h,fw,fh} | None}
+LATEST_FRAME_BYTES  = None  # raw bytes (WebP/JPEG) para protocolo binario
+
+# Estado para el self-test que se reporta al backend ([SELFTEST] vía remote_logs).
+# Lo escribe el loop de captura; lo lee selftest_loop. Nada mas.
+SELFTEST_STATE = {
+    "frames_sent": 0,       # frames encodeados y publicados como LATEST_FRAME
+    "last_frame_at": 0.0,   # time.time() del ultimo frame enviado
+    "last_capture_method": "",  # metodo que produjo el ultimo frame ok
+    "last_frame_ms": 0.0,   # duracion total del ultimo frame (captura+encode)
+    "capture_errors": 0,    # iteraciones donde la captura devolvio None / fallo
+    "black_streak": 0,    # racha actual de frames negros (solo con viewer activo)
+    "black_warn_active": False,
+    "last_capture_error": "",  # ultimo mensaje de error de captura
+}
 
 # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ HQ MODE (Alto Rendimiento) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
 # Cuando True: el agente captura con GDI (igual que siempre) y encoda con
@@ -600,14 +1094,129 @@ HQ_FFMPEG_PROC   = None   # subprocess del ffmpeg en curso
 # max_width 0 = resoluciÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n nativa del monitor (mÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡xima calidad por defecto).
 STREAM_OPTS_LOCK = threading.Lock()
 STREAM_OPTS = {
-    "max_width": int(os.environ.get("APOLLO_JSON_STREAM_MAX_WIDTH", "1366")),
-    "webp_still": int(os.environ.get("APOLLO_WEBP_STILL", "82")),
-    "webp_motion": int(os.environ.get("APOLLO_WEBP_MOTION", "58")),
+    "max_width": 1366,
+    "webp_still": 82,
+    "webp_motion": 58,
 }
 # Ruta a ffmpeg.exe bundleado junto al exe del agente
 import sys as _sys
 _AGENT_DIR = os.path.dirname(_sys.executable if getattr(_sys, 'frozen', False) else os.path.abspath(__file__))
 FFMPEG_PATH = os.path.join(_AGENT_DIR, 'ffmpeg.exe')
+
+class _CongestionMonitor:
+    """Tracks WebSocket send latency and congestion level (0-3)."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._send_times = []
+        self._level = 0
+        self._rtt_ms = 0.0
+        self._last_ping_sent = 0.0
+        self._pending_ping = False
+        self._frames_skipped = 0
+        self._frames_sent = 0
+
+    def record_send(self, elapsed_ms: float):
+        with self._lock:
+            self._send_times.append(elapsed_ms)
+            if len(self._send_times) > 20:
+                self._send_times.pop(0)
+            avg = sum(self._send_times) / len(self._send_times)
+            if avg > 120 or elapsed_ms > 200:
+                self._level = 3
+            elif avg > 60 or elapsed_ms > 100:
+                self._level = 2
+            elif avg > 30 or elapsed_ms > 50:
+                self._level = 1
+            else:
+                self._level = 0
+
+    def record_pong(self, rtt_ms: float):
+        with self._lock:
+            self._rtt_ms = rtt_ms
+            self._pending_ping = False
+            if rtt_ms > 300:
+                self._level = max(self._level, 2)
+            elif rtt_ms > 150:
+                self._level = max(self._level, 1)
+
+    def mark_ping_sent(self):
+        with self._lock:
+            self._pending_ping = True
+            self._last_ping_sent = time.monotonic()
+
+    def should_send_ping(self) -> bool:
+        with self._lock:
+            if self._pending_ping:
+                return False
+            return (time.monotonic() - self._last_ping_sent) > 2.0
+
+    @property
+    def level(self) -> int:
+        with self._lock:
+            return self._level
+
+    @property
+    def rtt_ms(self) -> float:
+        with self._lock:
+            return self._rtt_ms
+
+    def record_frame_sent(self):
+        with self._lock:
+            self._frames_sent += 1
+
+    def record_frame_skipped(self):
+        with self._lock:
+            self._frames_skipped += 1
+
+    def should_skip_frame(self) -> bool:
+        with self._lock:
+            if self._level >= 3:
+                return True
+            if self._level >= 2 and self._frames_sent > 0:
+                ratio = self._frames_skipped / max(1, self._frames_sent + self._frames_skipped)
+                if ratio < 0.3:
+                    return True
+            return False
+
+    def adaptive_quality_factor(self) -> float:
+        with self._lock:
+            if self._level == 0:
+                return 1.0
+            elif self._level == 1:
+                return 0.75
+            elif self._level == 2:
+                return 0.55
+            else:
+                return 0.4
+
+    def adaptive_max_width(self, base_width: int) -> int:
+        with self._lock:
+            if self._level <= 1:
+                return base_width
+            elif self._level == 2:
+                return min(base_width, 1024)
+            else:
+                return min(base_width, 800)
+
+    def adaptive_frame_budget(self, base_budget: float) -> float:
+        with self._lock:
+            if self._level == 0:
+                return base_budget
+            elif self._level == 1:
+                return base_budget * 1.3
+            elif self._level == 2:
+                return base_budget * 1.8
+            else:
+                return base_budget * 2.5
+
+CONGESTION = _CongestionMonitor()
+
+INPUT_CMD_TYPES = {
+    "mouse_click", "mouse_down", "mouse_up", "mouse_move", "mouse_scroll",
+    "key_press", "key_down", "key_up", "write_text", "paste_text",
+    "release_input",
+}
+
 # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ FIN HQ MODE ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
 
 # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ SESSION MANAGEMENT ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
@@ -698,6 +1307,22 @@ def get_apollo_serials_cached():
         _APOLLO_SERIALS_CACHE = get_apollo_serials()
         _APOLLO_SERIALS_CACHE_TIME = now
     return _APOLLO_SERIALS_CACHE
+
+
+def get_monitor_count_cached():
+    """Cuenta monitores con cache de 60s. Evita crear un mss() cada 3s de telemetria."""
+    global _MONITOR_COUNT_CACHE, _MONITOR_COUNT_CACHE_TIME
+    now = time.time()
+    if _MONITOR_COUNT_CACHE_TIME and (now - _MONITOR_COUNT_CACHE_TIME) < 60:
+        return _MONITOR_COUNT_CACHE
+    try:
+        import mss as _mss_cnt
+        with _mss_cnt.mss() as _sct:
+            _MONITOR_COUNT_CACHE = max(0, len(_sct.monitors) - 1)
+    except Exception:
+        _MONITOR_COUNT_CACHE = max(1, _MONITOR_COUNT_CACHE or 1)
+    _MONITOR_COUNT_CACHE_TIME = now
+    return _MONITOR_COUNT_CACHE
 
 def find_ultact_dbf():
     import os
@@ -855,20 +1480,26 @@ def _attach_input_desktop():
     return False
 
 
-def _send_key(vk: int, up: bool = False):
+def _send_key(vk: int, up: bool = False, extended=None, scan_code=None):
     """Inyecta una tecla. Preferir keybd_event (más fiable en Server/RDP);
     fallback SendInput con scan code + extended."""
+    if _inject_helper_send({"a": "key", "vk": int(vk), "up": bool(up)}):
+        return
     u32 = ctypes.windll.user32
     KEYEVENTF_KEYUP = 0x0002
     KEYEVENTF_EXTENDEDKEY = 0x0001
-    ext = KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0
+    is_extended = vk in _EXTENDED_VKS if extended is None else extended
+    ext = KEYEVENTF_EXTENDEDKEY if is_extended else 0
     flags = ext | (KEYEVENTF_KEYUP if up else 0)
+    scan = scan_code if scan_code is not None else u32.MapVirtualKeyW(vk, 0)
+    use_scan_code = scan_code is not None
+    if use_scan_code:
+        flags |= _KEYEVENTF_SCANCODE
     try:
-        u32.keybd_event(vk, 0, flags, 0)
+        u32.keybd_event(0 if use_scan_code else vk, scan if use_scan_code else 0, flags, 0)
         return
     except Exception:
         pass
-    scan = u32.MapVirtualKeyW(vk, 0)  # MAPVK_VK_TO_VSC
     si_flags = _KEYEVENTF_SCANCODE | ext
     if up:
         si_flags |= _KEYEVENTF_KEYUP
@@ -885,11 +1516,28 @@ def _send_key(vk: int, up: bool = False):
     u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
 
 
-def _send_unicode_text(text: str):
-    """Escribe texto vía SendInput KEYEVENTF_UNICODE (layout-independiente)."""
+def _send_unicode_text(text: str, restore_modifiers=()):
+    """Escribe texto. Usa helper SYSTEM si está disponible, sino clipboard+Ctrl+V (más confiable en RDP)."""
     if not text:
         return
+    if _inject_helper_send({"a": "uni", "text": text}):
+        return
+    # Fallback: clipboard + Ctrl+V (funciona en RDP/Session isolation donde SendInput UNICODE falla)
+    logger.info("[WRITE_TEXT] Helper no disponible, usando clipboard+paste")
+    if _paste_text_win32(text):
+        for name in restore_modifiers:
+            vk = VK_MAP.get(name)
+            if vk is not None:
+                _send_key(vk)
+        return
+    # Último recurso: SendInput KEYEVENTF_UNICODE (puede fallar en RDP)
+    logger.warning("[WRITE_TEXT] paste fallo, intentando SendInput directo")
     _attach_input_desktop()
+    for vk in (0x10, 0x11, 0x12, 0x5B):
+        try:
+            _send_key(vk, up=True)
+        except Exception:
+            pass
     u32 = ctypes.windll.user32
     KEYEVENTF_UNICODE = 0x0004
     KEYEVENTF_KEYUP = 0x0002
@@ -908,6 +1556,10 @@ def _send_unicode_text(text: str):
                 ))
             )
             u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+    for name in restore_modifiers:
+        vk = VK_MAP.get(name)
+        if vk is not None:
+            _send_key(vk)
 
 
 def _hotkey(*vk_codes):
@@ -1227,8 +1879,229 @@ async def emit_bitacora_log(message: str, level: str = "INFO"):
         pass
 
 
+async def selftest_loop():
+    """Reporta [SELFTEST] con el estado del pipeline de captura/stream cada 60s.
+
+    Se lee del backend con el script fetch_selftest.py para diagnosticar sin
+    pedirle logs manuales al tecnico. Reusa remote_logs: cero cambios de backend.
+    """
+    await asyncio.sleep(15)  # dejar que el WS se estabilice tras conectar
+    while True:
+        try:
+            now = time.time()
+            st = SELFTEST_STATE
+            frames = st["frames_sent"]
+            last_at = st["last_frame_at"]
+            frame_age_ms = int((now - last_at) * 1000) if last_at > 0 else -1
+            # Umbral simple: con viewer activo se esperan frames constantes.
+            if not HAS_ACTIVE_VIEWER:
+                status = "IDLE"          # sin viewer: captura pausada a proposito
+            elif frames == 0:
+                status = "NO_FRAMES"     # viewer pidiendo y nunca capturamos
+            elif frame_age_ms > 5000:
+                status = "STALE"         # frames congelados hace >5s
+            elif st["black_warn_active"]:
+                status = "BLACK_SCREEN"  # capturando negro
+            else:
+                status = "OK"
+            payload = {
+                "v": CLIENT_VERSION,
+                "pid": os.getpid(),
+                "rdp": _is_rdp_session(),
+                "viewer": HAS_ACTIVE_VIEWER,
+                "hq": HQ_MODE_ACTIVE,
+                "status": status,
+                "frames": frames,
+                "frame_age_ms": frame_age_ms,
+                "method": st["last_capture_method"],
+                "frame_ms": st.get("last_frame_ms", 0.0),
+                "black_streak": st["black_streak"],
+                "cap_err": st["capture_errors"],
+            }
+            if st["last_capture_error"]:
+                payload["err"] = st["last_capture_error"][:200]
+            await emit_bitacora_log("[SELFTEST] " + json.dumps(payload), "INFO")
+        except Exception as e:
+            logger.debug("[SELFTEST] error: %s", e)
+        await asyncio.sleep(60)
+
+
+async def _dispatch_input_command(data):
+    """Ejecuta comandos de input en una task independiente para no bloquear el loop principal."""
+    _loop = asyncio.get_event_loop()
+    cmd_type = data.get("type", "")
+
+    try:
+        if cmd_type == "mouse_click":
+            x = data.get("x")
+            y = data.get("y")
+            click_type = data.get("click_type", "left")
+            def _do_click(xx=x, yy=y, ct=click_type):
+                btn = "left" if ct == "double" else (ct or "left")
+                _mouse_button_event(xx, yy, btn, down=True)
+                time.sleep(0.02)
+                _mouse_button_event(xx, yy, btn, down=False)
+                if ct == "double":
+                    time.sleep(0.04)
+                    _mouse_button_event(xx, yy, "left", down=True)
+                    time.sleep(0.02)
+                    _mouse_button_event(xx, yy, "left", down=False)
+            await _loop.run_in_executor(None, _do_click)
+
+        elif cmd_type == "mouse_down":
+            x = data.get("x")
+            y = data.get("y")
+            button = data.get("button", "left")
+            def _do_down(xx=x, yy=y, btn=button):
+                _mouse_button_event(xx, yy, btn, down=True)
+            await _loop.run_in_executor(None, _do_down)
+
+        elif cmd_type == "mouse_up":
+            x = data.get("x")
+            y = data.get("y")
+            button = data.get("button", "left")
+            def _do_up(xx=x, yy=y, btn=button):
+                _mouse_button_event(xx, yy, btn, down=False)
+            await _loop.run_in_executor(None, _do_up)
+
+        elif cmd_type == "mouse_move":
+            x = data.get("x")
+            y = data.get("y")
+            if x is not None and y is not None:
+                def _do_move(xx=x, yy=y):
+                    _attach_input_desktop()
+                    _mouse_move_norm(xx, yy)
+                await _loop.run_in_executor(None, _do_move)
+
+        elif cmd_type == "release_input":
+            await _loop.run_in_executor(None, _panic_release)
+
+        elif cmd_type == "mouse_scroll":
+            x = data.get("x")
+            y = data.get("y")
+            direction = data.get("direction", "down")
+            amount = int(data.get("amount", 3))
+            def _do_scroll(xx=x, yy=y, direction=direction, amount=amount):
+                _attach_input_desktop()
+                if xx is not None and yy is not None:
+                    _mouse_move_norm(xx, yy)
+                clicks_delta = (-amount if direction == "down" else amount) * 120
+                ctypes.windll.user32.mouse_event(0x0800, 0, 0, clicks_delta, 0)
+            await _loop.run_in_executor(None, _do_scroll)
+
+        elif cmd_type == "write_text":
+            text = data.get("text", "")
+            requested_modifiers = data.get("restore_modifiers", [])
+            restore_modifiers = tuple(
+                name for name in requested_modifiers
+                if isinstance(name, str) and name in {"shift", "ctrl", "alt", "win"}
+            ) if isinstance(requested_modifiers, list) else ()
+            if text:
+                logger.info("[WRITE_TEXT] Recibido: %r", text)
+                try:
+                    await _loop.run_in_executor(
+                        None,
+                        lambda t=text, modifiers=restore_modifiers: _send_unicode_text(t, modifiers),
+                    )
+                    logger.info("[WRITE_TEXT] unicode SendInput OK: %r", text)
+                except Exception as we:
+                    logger.error("[WRITE_TEXT] Error: %s", we, exc_info=True)
+                    try:
+                        import pyautogui as _pag
+                        await _loop.run_in_executor(
+                            None, lambda p=text: (_attach_input_desktop(), _pag.write(p, interval=0.02))
+                        )
+                    except Exception as we2:
+                        logger.error("[WRITE_TEXT] fallback pyautogui fallo: %s", we2)
+
+        elif cmd_type == "key_press":
+            key = data.get("key", "")
+            logger.info("[KEY_PRESS] Recibido: %r", key)
+
+            def _press_key(k=key):
+                import ctypes
+                ku = ctypes.windll.user32
+                key_lower = k.lower()
+                if key_lower in ["ctrl+alt+del", "ctrl+alt+sup"]:
+                    send_sas_sequence()
+                    return
+                if key_lower == "ctrl+shift+enter":
+                    ku.mouse_event(0x0001, 1, 1, 0, 0)
+                    ku.mouse_event(0x0001, -1, -1, 0, 0)
+                    _hotkey(0x11, 0x10, 0x0D)
+                    return
+                parts = [p.strip().lower() for p in k.split("+") if p.strip()]
+                vk_codes = [VK_MAP.get(p) for p in parts]
+                if not parts or any(vk is None for vk in vk_codes):
+                    logger.warning("[KEY_PRESS] Tecla no reconocida: %r", k)
+                    return
+                valid = [vk for vk in vk_codes if vk is not None]
+                _hotkey(*valid)
+                logger.info("[KEY_PRESS] OK: %r -> VK %s", k, [hex(v) for v in valid])
+
+            await _loop.run_in_executor(None, _press_key)
+
+        elif cmd_type in ("key_down", "key_up"):
+            key = data.get("key", "")
+            code = data.get("code", "")
+            is_up = cmd_type == "key_up"
+
+            def _edge_key(k=key, c=code, up=is_up):
+                _attach_input_desktop()
+                name = (k or "").strip().lower()
+                code_name = c.strip() if isinstance(c, str) else ""
+                if "+" in name and name not in ("ctrl+alt+del", "ctrl+alt+sup"):
+                    name = name.split("+")[-1].strip()
+                if name in ("ctrl+alt+del", "ctrl+alt+sup"):
+                    if not up:
+                        send_sas_sequence()
+                    return
+                mapped_name = name if name in {"shift", "ctrl", "alt", "win"} else CODE_TO_KEY.get(code_name, name)
+                vk = VK_MAP.get(mapped_name)
+                if vk is None:
+                    logger.warning("[KEY_%s] Tecla no reconocida: key=%r code=%r", "UP" if up else "DOWN", k, code_name)
+                    return
+                try:
+                    _send_key(
+                        vk,
+                        up=up,
+                        extended=True if code_name == "NumpadEnter" else None,
+                        scan_code=CODE_TO_SCANCODE.get(code_name),
+                    )
+                except Exception:
+                    ku = ctypes.windll.user32
+                    flags = 0x0002 if up else 0
+                    if code_name == "NumpadEnter" or vk in _EXTENDED_VKS:
+                        flags |= 0x0001
+                    ku.keybd_event(vk, 0, flags, 0)
+
+            await _loop.run_in_executor(None, _edge_key)
+
+        elif cmd_type == "paste_text":
+            global LAST_LOCAL_CLIPBOARD
+            text = data.get("text", "") or ""
+            LAST_LOCAL_CLIPBOARD = text
+            logger.info("[PASTE_TEXT] Recibido (%d caracteres)", len(text))
+
+            def _do_paste(t=text):
+                return _paste_text_win32(t)
+
+            ok = await _loop.run_in_executor(None, _do_paste)
+            if ROOT_WINDOW and text:
+                ROOT_WINDOW.after(0, lambda t=text: set_clipboard_text(t))
+            if not ok:
+                await _loop.run_in_executor(
+                    None, lambda t=text: _set_clipboard_win32(t)
+                )
+            logger.info("[PASTE_TEXT] Resultado ok=%s", ok)
+
+    except Exception:
+        logger.error("[INPUT_DISPATCH] Error en comando %s", cmd_type, exc_info=True)
+
+
 async def send_telemetry(lbl_status, lbl_detail=None):
-    global LIC_KEY, SERVER_WS_URL, HAS_ACTIVE_VIEWER, HQ_MODE_ACTIVE, HQ_FFMPEG_PROC, HQ_TASK
+    global LIC_KEY, SERVER_WS_URL, HAS_ACTIVE_VIEWER, VIEWER_LAST_ACTIVITY, HQ_MODE_ACTIVE, HQ_FFMPEG_PROC, HQ_TASK
+    global LAST_LOCAL_CLIPBOARD
     reconnect_delay = 5  # Backoff exponencial: empieza en 5s
     attempt_count = 0
 
@@ -1289,38 +2162,40 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                             apollo_serials_list = get_apollo_serials_cached()
                             last_update_data = get_last_erp_update_cached()
 
-                            # Detectar monitores disponibles para multi-monitor
+                            monitor_count = get_monitor_count_cached()
+                            rtc_ok = False
                             try:
-                                import mss
-                                with mss.mss() as _sct:
-                                    monitor_count = max(0, len(_sct.monitors) - 1)  # monitors[0] es el combinado
+                                from webrtc_peer import webrtc_available
+                                rtc_ok = bool(webrtc_available())
                             except Exception:
-                                monitor_count = 1
+                                rtc_ok = False
 
-                            payload = {
-                                "type": "telemetry",
-                                "data": {
-                                    "status": "online",
-                                    "cpu": cpu_usage,
-                                    "ram": ram_usage,
-                                    "os": os_system,
-                                    "hostname": hostname,
-                                    "remote_password": REMOTE_PASSWORD,
-                                    "apollo_serials": apollo_serials_list,
-                                    "last_erp_update": last_update_data,
-                                    "monitor_count":   monitor_count,
-                                    "active_monitor":  ACTIVE_MONITOR,
-                                    "agent_version":   CLIENT_VERSION,
-                                    "supports_hq":     True,   # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â nuevo: habilita ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ en frontend
-                                    # Info extendida del sistema (cacheada 10 min)
-                                    "system_info": await asyncio.get_event_loop().run_in_executor(None, get_system_info_extended),
-                                }
+                            telem_data = {
+                                "status": "online",
+                                "cpu": cpu_usage,
+                                "ram": ram_usage,
+                                "os": os_system,
+                                "hostname": hostname,
+                                "remote_password": REMOTE_PASSWORD,
+                                "apollo_serials": apollo_serials_list,
+                                "last_erp_update": last_update_data,
+                                "monitor_count":   monitor_count,
+                                "active_monitor":  ACTIVE_MONITOR,
+                                "agent_version":   CLIENT_VERSION,
+                                "supports_hq":     True,
+                                "supports_webrtc": rtc_ok,
                             }
+                            # system_info es pesado (discos/red); en idle no lo recalculamos
+                            if HAS_ACTIVE_VIEWER:
+                                telem_data["system_info"] = await asyncio.get_event_loop().run_in_executor(
+                                    None, get_system_info_extended
+                                )
+                            payload = {"type": "telemetry", "data": telem_data}
                             await websocket.send(json.dumps(payload))
                         except Exception as e:
                             print(f"[TELEMETRIA] Error en loop: {e}")
                             break
-                        await asyncio.sleep(3.0)
+                        await asyncio.sleep(3.0 if HAS_ACTIVE_VIEWER else 20.0)
 
                 def _hq_ffmpeg_running() -> bool:
                     p = HQ_FFMPEG_PROC
@@ -1333,13 +2208,21 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                     nonlocal frames_sent_count, logged_no_frame
                     last_sent_frame_hash = None
                     still_frames = 0
+                    hq_fallback_ticks = 0
                     logger.info("[VIDEO] Loop de video iniciado")
                     while True:
                         try:
                             global LATEST_FRAME, LATEST_FRAME_PACKET
-                            # Seguir enviando WebP aunque HD este activo (evita pantalla negra si ffmpeg/H.264 falla)
-                            if HQ_MODE_ACTIVE:
-                                await asyncio.sleep(0.02)
+                            if not HAS_ACTIVE_VIEWER and not HQ_MODE_ACTIVE:
+                                await asyncio.sleep(2.0)
+                                continue
+                            # Con HQ estable no saturar WebP: un fallback cada ~2 s por si H.264 se corta
+                            if HQ_MODE_ACTIVE and _hq_ffmpeg_running():
+                                hq_fallback_ticks += 1
+                                if hq_fallback_ticks < 50:
+                                    await asyncio.sleep(0.04)
+                                    continue
+                                hq_fallback_ticks = 0
                             # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ DIRTY_RECT_START ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
                             # Si USE_DIRTY_RECT estÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ activo, usa LATEST_FRAME_PACKET
                             # que puede incluir delta {x,y,w,h,fw,fh}.
@@ -1352,18 +2235,22 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                 current_hash = packet["id"] if packet and "id" in packet else frame_to_check[:64]
                                 if current_hash != last_sent_frame_hash or still_frames > 60:
                                     # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ DIRTY_RECT_START ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
-                                    if USE_DIRTY_RECT and packet:
-                                        frame_payload = {
-                                            "type": "video_frame",
-                                            "data": packet["frame"],
-                                        }
-                                        if packet["delta"]:
-                                            frame_payload["delta"] = packet["delta"]
-                                    else:
-                                        # ROLLBACK: comportamiento original
-                                        frame_payload = {"type": "video_frame", "data": LATEST_FRAME}
+                                    raw_bytes = LATEST_FRAME_BYTES
+                                    if raw_bytes:
+                                        if CONGESTION.should_skip_frame():
+                                            CONGESTION.record_frame_skipped()
+                                        else:
+                                            if USE_DIRTY_RECT and packet and packet.get("delta"):
+                                                delta_json = json.dumps(packet["delta"]).encode("utf-8")
+                                                binary_packet = b"" + struct.pack(">I", len(delta_json)) + delta_json + raw_bytes
+                                            else:
+                                                binary_packet = b"" + raw_bytes
+                                            _send_t0 = time.monotonic()
+                                            await websocket.send(binary_packet)
+                                            _send_ms = (time.monotonic() - _send_t0) * 1000
+                                            CONGESTION.record_send(_send_ms)
+                                            CONGESTION.record_frame_sent()
                                     # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ DIRTY_RECT_END ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
-                                    await websocket.send(json.dumps(frame_payload))
                                     last_sent_frame_hash = current_hash
                                     still_frames = 0
                                     frames_sent_count += 1
@@ -1380,24 +2267,29 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                         except Exception as e:
                             logger.error("[VIDEO] Error enviando frame: %s", e)
                             await asyncio.sleep(0.5)
-                        if HQ_MODE_ACTIVE:
-                            await asyncio.sleep(0.016)
-                        else:
-                            await asyncio.sleep(0.025 if still_frames < 12 else 0.08)
+                        _base_sleep = 0.016 if HQ_MODE_ACTIVE else (0.025 if still_frames < 12 else 0.08)
+                        _cong_mult = 1.0 + (CONGESTION.level * 0.5)
+                        await asyncio.sleep(_base_sleep * _cong_mult)
 
 
 
                 # Lanzar loops en segundo plano de manera concurrente
                 telemetry_task = asyncio.create_task(send_telemetry_loop())
                 video_task = asyncio.create_task(send_video_loop())
+                selftest_task = asyncio.create_task(selftest_loop())
 
                 try:
                     while True:
                         # Escuchar comandos entrantes de forma continua e instantÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡nea sin esperas
                         message = await websocket.recv()
                         data = json.loads(message)
-                        
-                        if data.get("type") == "welcome":
+
+                        _cmd_type = data.get("type", "")
+                        if _cmd_type in INPUT_CMD_TYPES:
+                            asyncio.ensure_future(_dispatch_input_command(data))
+                            continue
+
+                        if _cmd_type == "welcome":
                             global REAL_DEVICE_ID
                             REAL_DEVICE_ID = data.get("device_id")
                             cur_sid = get_current_session_id()
@@ -1428,9 +2320,24 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                         # Responder pong automÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ticamente al ping del servidor para el heartbeat
                         if data.get("type") == "ping":
                             try:
-                                await websocket.send(json.dumps({"type": "pong"}))
+                                _pong_payload = json.dumps({"type": "pong", "t": time.monotonic()})
+                                await websocket.send(_pong_payload)
                             except Exception:
                                 pass
+                            continue
+                        # Ping periodico del agente para medir RTT
+                        if CONGESTION.should_send_ping():
+                            try:
+                                _ping_payload = json.dumps({"type": "ping", "t": time.monotonic()})
+                                await websocket.send(_ping_payload)
+                                CONGESTION.mark_ping_sent()
+                            except Exception:
+                                pass
+                        # Pong del servidor en respuesta a nuestro ping -> medir RTT
+                        if data.get("type") == "pong" and "t" in data:
+                            _rtt = (time.monotonic() - data["t"]) * 1000
+                            if 0 < _rtt < 10000:
+                                CONGESTION.record_pong(_rtt)
                             continue
 
                         # Safe command execution wrapper
@@ -1503,18 +2410,15 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                 y = data.get("y")
                                 click_type = data.get("click_type", "left")
                                 def _do_click(xx=x, yy=y, ct=click_type):
-                                    _attach_input_desktop()
-                                    import pyautogui
-                                    width, height = pyautogui.size()
-                                    px = int(xx * width)
-                                    py = int(yy * height)
-                                    pyautogui.moveTo(px, py)
-                                    if ct == "left":
-                                        pyautogui.click()
-                                    elif ct == "right":
-                                        pyautogui.click(button="right")
-                                    elif ct == "double":
-                                        pyautogui.doubleClick()
+                                    btn = "left" if ct == "double" else (ct or "left")
+                                    _mouse_button_event(xx, yy, btn, down=True)
+                                    time.sleep(0.02)
+                                    _mouse_button_event(xx, yy, btn, down=False)
+                                    if ct == "double":
+                                        time.sleep(0.04)
+                                        _mouse_button_event(xx, yy, "left", down=True)
+                                        time.sleep(0.02)
+                                        _mouse_button_event(xx, yy, "left", down=False)
                                 await asyncio.get_event_loop().run_in_executor(None, _do_click)
 
                             elif data.get("type") == "mouse_down":
@@ -1522,13 +2426,7 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                 y = data.get("y")
                                 button = data.get("button", "left")
                                 def _do_down(xx=x, yy=y, btn=button):
-                                    _attach_input_desktop()
-                                    import pyautogui
-                                    width, height = pyautogui.size()
-                                    px = int(xx * width)
-                                    py = int(yy * height)
-                                    pyautogui.moveTo(px, py)
-                                    pyautogui.mouseDown(button=btn)
+                                    _mouse_button_event(xx, yy, btn, down=True)
                                 await asyncio.get_event_loop().run_in_executor(None, _do_down)
 
                             elif data.get("type") == "mouse_up":
@@ -1536,28 +2434,20 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                 y = data.get("y")
                                 button = data.get("button", "left")
                                 def _do_up(xx=x, yy=y, btn=button):
-                                    _attach_input_desktop()
-                                    import pyautogui
-                                    width, height = pyautogui.size()
-                                    px = int(xx * width)
-                                    py = int(yy * height)
-                                    pyautogui.moveTo(px, py)
-                                    pyautogui.mouseUp(button=btn)
+                                    _mouse_button_event(xx, yy, btn, down=False)
                                 await asyncio.get_event_loop().run_in_executor(None, _do_up)
 
                             elif data.get("type") == "mouse_move":
-                                # Movimiento puro del mouse (hover, tooltips, menus desplegables)
                                 x = data.get("x")
                                 y = data.get("y")
                                 if x is not None and y is not None:
                                     def _do_move(xx=x, yy=y):
                                         _attach_input_desktop()
-                                        import pyautogui
-                                        width, height = pyautogui.size()
-                                        px = int(xx * width)
-                                        py = int(yy * height)
-                                        pyautogui.moveTo(px, py, duration=0)
+                                        _mouse_move_norm(xx, yy)
                                     await asyncio.get_event_loop().run_in_executor(None, _do_move)
+
+                            elif data.get("type") == "release_input":
+                                await asyncio.get_event_loop().run_in_executor(None, _panic_release)
 
                             elif data.get("type") == "mouse_scroll":
                                 x = data.get("x")
@@ -1566,26 +2456,25 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                 amount = int(data.get("amount", 3))  # Cantidad de pasos
                                 def _do_scroll(xx=x, yy=y, direction=direction, amount=amount):
                                     _attach_input_desktop()
-                                    import pyautogui
                                     if xx is not None and yy is not None:
-                                        width, height = pyautogui.size()
-                                        px = int(xx * width)
-                                        py = int(yy * height)
-                                        pyautogui.moveTo(px, py, duration=0)
+                                        _mouse_move_norm(xx, yy)
                                     clicks_delta = (-amount if direction == "down" else amount) * 120
-                                    try:
-                                        ctypes.windll.user32.mouse_event(0x0800, 0, 0, clicks_delta, 0)
-                                    except Exception:
-                                        pyautogui.scroll(clicks_delta)
+                                    ctypes.windll.user32.mouse_event(0x0800, 0, 0, clicks_delta, 0)
                                 await asyncio.get_event_loop().run_in_executor(None, _do_scroll)
                                     
                             elif data.get("type") == "write_text":
                                 text = data.get("text", "")
+                                requested_modifiers = data.get("restore_modifiers", [])
+                                restore_modifiers = tuple(
+                                    name for name in requested_modifiers
+                                    if isinstance(name, str) and name in {"shift", "ctrl", "alt", "win"}
+                                ) if isinstance(requested_modifiers, list) else ()
                                 if text:
                                     logger.info("[WRITE_TEXT] Recibido: %r", text)
                                     try:
                                         await asyncio.get_event_loop().run_in_executor(
-                                            None, lambda t=text: _send_unicode_text(t)
+                                            None,
+                                            lambda t=text, modifiers=restore_modifiers: _send_unicode_text(t, modifiers),
                                         )
                                         logger.info("[WRITE_TEXT] unicode SendInput OK: %r", text)
                                     except Exception as we:
@@ -1621,30 +2510,13 @@ async def send_telemetry(lbl_status, lbl_detail=None):
 
                                     parts = [p.strip().lower() for p in k.split("+") if p.strip()]
                                     vk_codes = [VK_MAP.get(p) for p in parts]
-                                    valid = [v for v in vk_codes if v is not None]
 
-                                    if not valid:
+                                    if not parts or any(vk is None for vk in vk_codes):
                                         logger.warning("[KEY_PRESS] Tecla no reconocida: %r", k)
                                         return
 
-                                    _attach_input_desktop()
-                                    KEYEVENTF_KEYUP = 0x0002
-                                    KEYEVENTF_EXTENDEDKEY = 0x0001
-                                    EXTENDED = {
-                                        0x25, 0x26, 0x27, 0x28,
-                                        0x21, 0x22, 0x23, 0x24,
-                                        0x2D, 0x2E, 0x2C,
-                                        0x5B, 0x5C, 0x5D,
-                                        0x6F, 0x90, 0xA3, 0xA5,
-                                    }
-                                    for vk in valid:
-                                        ext = KEYEVENTF_EXTENDEDKEY if vk in EXTENDED else 0
-                                        ku.keybd_event(vk, 0, ext, 0)
-                                    import time
-                                    time.sleep(0.02)
-                                    for vk in reversed(valid):
-                                        ext = KEYEVENTF_EXTENDEDKEY if vk in EXTENDED else 0
-                                        ku.keybd_event(vk, 0, KEYEVENTF_KEYUP | ext, 0)
+                                    valid = [vk for vk in vk_codes if vk is not None]
+                                    _hotkey(*valid)
 
                                     logger.info("[KEY_PRESS] OK: %r -> VK %s", k, [hex(v) for v in valid])
 
@@ -1653,26 +2525,36 @@ async def send_telemetry(lbl_status, lbl_detail=None):
 
                             elif data.get("type") in ("key_down", "key_up"):
                                 key = data.get("key", "")
+                                code = data.get("code", "")
                                 is_up = data.get("type") == "key_up"
 
-                                def _edge_key(k=key, up=is_up):
+                                def _edge_key(k=key, c=code, up=is_up):
                                     _attach_input_desktop()
                                     name = (k or "").strip().lower()
+                                    code_name = c.strip() if isinstance(c, str) else ""
                                     if "+" in name and name not in ("ctrl+alt+del", "ctrl+alt+sup"):
                                         name = name.split("+")[-1].strip()
                                     if name in ("ctrl+alt+del", "ctrl+alt+sup"):
                                         if not up:
                                             send_sas_sequence()
                                         return
-                                    vk = VK_MAP.get(name)
+                                    mapped_name = name if name in {"shift", "ctrl", "alt", "win"} else CODE_TO_KEY.get(code_name, name)
+                                    vk = VK_MAP.get(mapped_name)
                                     if vk is None:
-                                        logger.warning("[KEY_%s] Tecla no reconocida: %r", "UP" if up else "DOWN", k)
+                                        logger.warning("[KEY_%s] Tecla no reconocida: key=%r code=%r", "UP" if up else "DOWN", k, code_name)
                                         return
                                     try:
-                                        _send_key(vk, up=up)
+                                        _send_key(
+                                            vk,
+                                            up=up,
+                                            extended=True if code_name == "NumpadEnter" else None,
+                                            scan_code=CODE_TO_SCANCODE.get(code_name),
+                                        )
                                     except Exception:
                                         ku = ctypes.windll.user32
                                         flags = 0x0002 if up else 0
+                                        if code_name == "NumpadEnter" or vk in _EXTENDED_VKS:
+                                            flags |= 0x0001
                                         ku.keybd_event(vk, 0, flags, 0)
 
                                 await asyncio.get_event_loop().run_in_executor(None, _edge_key)
@@ -1680,30 +2562,99 @@ async def send_telemetry(lbl_status, lbl_detail=None):
 
                             elif data.get("type") == "clipboard_sync":
                                 text = data.get("text", "")
-                                global LAST_LOCAL_CLIPBOARD
                                 LAST_LOCAL_CLIPBOARD = text
-                                _set_clipboard_win32(text)
-                                if ROOT_WINDOW:
-                                    ROOT_WINDOW.after(0, lambda: set_clipboard_text(text))
-                                logger.info("[CLIPBOARD] Texto sincronizado desde el servidor (%d caracteres)", len(text))
-                                
-                            elif data.get("type") in ("clipboard_files", "clipboard_files_sync"):
+
+                                async def _sync_clipboard(t=text):
+                                    ok = await asyncio.get_event_loop().run_in_executor(
+                                        None, lambda: _set_clipboard_win32(t)
+                                    )
+                                    if ROOT_WINDOW:
+                                        ROOT_WINDOW.after(0, lambda: set_clipboard_text(t))
+                                    logger.info(
+                                        "[CLIPBOARD] Texto sincronizado desde el servidor (%d caracteres, ok=%s)",
+                                        len(t or ""), ok,
+                                    )
+
+                                asyncio.create_task(_sync_clipboard())
+
+                            elif data.get("type") == "paste_text":
+                                text = data.get("text", "") or ""
+                                LAST_LOCAL_CLIPBOARD = text
+                                logger.info("[PASTE_TEXT] Recibido (%d caracteres)", len(text))
+
+                                def _do_paste(t=text):
+                                    return _paste_text_win32(t)
+
+                                ok = await asyncio.get_event_loop().run_in_executor(None, _do_paste)
+                                if ROOT_WINDOW and text:
+                                    ROOT_WINDOW.after(0, lambda t=text: set_clipboard_text(t))
+                                if not ok:
+                                    # Fallback: al menos dejar el texto en clipboard remoto
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, lambda t=text: _set_clipboard_win32(t)
+                                    )
+                                logger.info("[PASTE_TEXT] Resultado ok=%s", ok)
+
+                            elif data.get("type") == "clipboard_files":
                                 files = data.get("files", [])
                                 if files:
-                                    _set_clipboard_files_win32(files)
-                                    logger.info("[CLIPBOARD] CF_HDROP sincronizado desde el servidor (%d archivos)", len(files))
-                                
+                                    ok = _ensure_files_on_clipboard(files, paste=False)
+                                    logger.info("[CLIPBOARD] CF_HDROP desde servidor (%d archivos) ok=%s", len(files), ok)
+
                             elif data.get("type") == "upload_to_server":
-                                # El tÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnico pide un archivo de la PC del cliente
                                 target_path = data["path"]
                                 upload_url = data["upload_url"]
                                 try:
                                     with open(target_path, "rb") as f:
                                         files = {'file': (os.path.basename(target_path), f)}
-                                        r = requests.post(upload_url, files=files)
-                                    print(f"[FILES] Archivo {target_path} enviado al servidor: {r.status_code}")
+                                        r = requests.post(upload_url, files=files, timeout=180)
+                                    logger.info("[FILES] Archivo %s enviado al servidor: %s", target_path, r.status_code)
+                                    if r.status_code >= 400:
+                                        logger.error("[FILES] Upload fallo body=%s", (r.text or "")[:200])
                                 except Exception as e:
-                                    print(f"[FILES] Error al subir archivo: {e}")
+                                    logger.error("[FILES] Error al subir archivo %s: %s", target_path, e)
+
+                            elif data.get("type") == "receive_files_for_paste":
+                                items = data.get("files") or []
+                                dest_dir = data.get("dest_dir") or os.path.join(
+                                    os.environ.get("PUBLIC", r"C:\Users\Public"), "ApolloInbox"
+                                )
+                                do_paste = bool(data.get("paste", True))
+
+                                def _recv_and_paste(rows=items, folder=dest_dir, paste=do_paste):
+                                    try:
+                                        os.makedirs(folder, exist_ok=True)
+                                    except Exception as e:
+                                        logger.warning("[FILES] No se pudo crear inbox %s: %s", folder, e)
+                                    saved = []
+                                    for row in rows:
+                                        url = (row or {}).get("url")
+                                        name = os.path.basename((row or {}).get("name") or "archivo")
+                                        if not url:
+                                            continue
+                                        dest = os.path.join(folder, name)
+                                        try:
+                                            r = requests.get(url, timeout=120)
+                                            r.raise_for_status()
+                                            with open(dest, "wb") as fh:
+                                                fh.write(r.content)
+                                            if os.path.getsize(dest) >= 0:
+                                                saved.append(dest)
+                                        except Exception as e:
+                                            logger.error("[FILES] Error bajando %s: %s", name, e)
+                                    ok = _ensure_files_on_clipboard(saved, paste=paste) if saved else False
+                                    logger.info(
+                                        "[FILES] %d archivos listos en %s (clipboard/paste ok=%s)",
+                                        len(saved), folder, ok,
+                                    )
+                                    return saved, ok
+
+                                saved, ok = await asyncio.get_event_loop().run_in_executor(None, _recv_and_paste)
+                                await websocket.send(json.dumps({
+                                    "type": "clipboard_files_set",
+                                    "ok": ok,
+                                    "count": len(saved),
+                                }))
 
                             elif data.get("type") == "download_from_server":
                                 # El tÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnico envÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­a un archivo a la PC del cliente
@@ -1770,18 +2721,20 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                             elif data.get("type") == "technician_joined":
                                 name = data.get("name")
                                 HAS_ACTIVE_VIEWER = True
+                                VIEWER_LAST_ACTIVITY = time.time()
                                 global FORCE_NEXT_FRAME
                                 FORCE_NEXT_FRAME = True  # Forzar frame fresco al conectar/reconectar viewer
                                 _panic_release()  # Liberar cualquier tecla/boton atascado de sesion anterior
-                                logger.info("[SOPORTE] TÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnico %s se uniÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³ ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â forzando frame fresco", name)
+                                logger.info("[SOPORTE] Tecnico %s se unio — forzando frame fresco", name)
 
                             elif data.get("type") == "active_technicians":
                                 techs = data.get("technicians", [])
                                 if not techs:
                                     HAS_ACTIVE_VIEWER = False
-                                    logger.info("[SOPORTE] No quedan tÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnicos mirando. Pausando captura.")
+                                    logger.info("[SOPORTE] No quedan tecnicos mirando. Pausando captura.")
                                 else:
                                     HAS_ACTIVE_VIEWER = True
+                                    VIEWER_LAST_ACTIVITY = time.time()
 
 
                             elif data.get("type") in ("wake_screen", "restore_windows"):
@@ -1795,8 +2748,9 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                     pass
 
                             elif data.get("type") == "refresh_frame":
-                                HAS_ACTIVE_VIEWER = True
                                 FORCE_NEXT_FRAME = True
+                                HAS_ACTIVE_VIEWER = True
+                                VIEWER_LAST_ACTIVITY = time.time()
                                 logger.debug("[VIDEO] refresh_frame recibido ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â forzando frame")
 
                             elif data.get("type") == "set_stream_params":
@@ -1820,13 +2774,14 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                     logger.warning("[STREAM] set_stream_params invÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡lido: %s", e)
 
                             elif data.get("type") == "start_hq":
-                                # Backend pide iniciar modo Alto Rendimiento
                                 if HQ_MODE_ACTIVE and HQ_TASK is not None:
                                     logger.info("[HQ] Reiniciando stream H.264 para forzar cabeceras (moov)")
                                     HQ_MODE_ACTIVE = False
-                                    try: HQ_TASK.cancel()
-                                    except: pass
-                                
+                                    try:
+                                        HQ_TASK.cancel()
+                                    except Exception:
+                                        pass
+
                                 HQ_MODE_ACTIVE = True
                                 logger.info("[HQ] Modo Alto Rendimiento activado")
                                 await emit_bitacora_log(
@@ -1843,6 +2798,26 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                                     except: pass
                                     HQ_TASK = None
                                 logger.info("[HQ] Modo Alto Rendimiento desactivado")
+
+                            elif data.get("type") in ("webrtc_offer", "webrtc_ice", "webrtc_hangup"):
+                                async def _rtc_emit(msg, ws=websocket):
+                                    try:
+                                        await ws.send(json.dumps(msg))
+                                    except Exception as e:
+                                        logger.warning("[WEBRTC] No se pudo emitir %s: %s", msg.get("type"), e)
+
+                                try:
+                                    from webrtc_peer import handle_webrtc_message
+                                    asyncio.create_task(handle_webrtc_message(data, _rtc_emit))
+                                except Exception as e:
+                                    logger.error("[WEBRTC] handler: %s", e)
+                                    try:
+                                        await websocket.send(json.dumps({
+                                            "type": "webrtc_error",
+                                            "message": str(e),
+                                        }))
+                                    except Exception:
+                                        pass
 
                             elif data.get("type") == "get_sessions":
                                 # TÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnico solicita lista de sesiones Windows
@@ -1891,6 +2866,7 @@ async def send_telemetry(lbl_status, lbl_detail=None):
                     HAS_ACTIVE_VIEWER = False
                     telemetry_task.cancel()
                     video_task.cancel()
+                    selftest_task.cancel()
 
         except Exception as e:
             err_str = str(e) or repr(e) or type(e).__name__
@@ -1958,6 +2934,24 @@ async def hq_stream_loop(device_id: int, license_key: str):
         HQ_MODE_ACTIVE = False
         return
 
+    # Pre-flight: el ffmpeg bundleado puede ser de arquitectura incompatible (x64 en Windows 32-bit)
+    try:
+        _hq_ver = subprocess.run(
+            [FFMPEG_PATH, '-version'],
+            capture_output=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        if _hq_ver.returncode != 0:
+            raise RuntimeError('ffmpeg -version retorno %d' % _hq_ver.returncode)
+    except Exception as _hq_e:
+        logger.error("[HQ] ffmpeg no ejecutable (%s): %s", FFMPEG_PATH, _hq_e)
+        try:
+            await emit_bitacora_log("[HQ] ffmpeg no ejecutable en esta PC (%s): modo HQ deshabilitado" % _hq_e, "ERROR")
+        except Exception:
+            pass
+        HQ_MODE_ACTIVE = False
+        return
+
     # Habilitar timer de alta resoluciÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n en Windows
     _set_high_res_timer(True)
     logger.info("[HQ] Iniciando stream H.264 V2 (50 FPS Mode)")
@@ -2006,48 +3000,155 @@ async def hq_stream_loop(device_id: int, license_key: str):
         header_args = ['-bsf:v', 'h264_mp4toannexb']
 
     TARGET_FPS = 24  # 24 FPS estables y reales (cine)
-    KEYFRAME_INTERVAL = TARGET_FPS
+    KEYFRAME_INTERVAL = TARGET_FPS // 2
 
-    ffmpeg_cmd = [
-        FFMPEG_PATH, '-y',
-        '-probesize', '32',
-        '-analyzeduration', '0',
-        '-f', 'rawvideo',
-        '-vcodec', 'rawvideo',
-        '-s', f"{target_w}x{target_h}",
-        '-pix_fmt', 'bgr24',
-        '-framerate', str(TARGET_FPS),
-        '-i', '-',
-        '-vf', 'format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2', # Forzar pixel format y dimensiones pares
-    ] + encoder_args + [
+    def _ffmpeg_has_input(name: str) -> bool:
+        try:
+            test = subprocess.run(
+                [FFMPEG_PATH, '-hide_banner', '-formats'],
+                capture_output=True, timeout=8,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            blob = (test.stdout or b'') + (test.stderr or b'')
+            return name.encode('ascii') in blob
+        except Exception:
+            return False
+
+    vf_args = ['-vf', 'format=yuv420p,scale=trunc(iw/2)*2:trunc(ih/2)*2']
+    tail_args = encoder_args + [
         '-g', str(KEYFRAME_INTERVAL),
         '-keyint_min', str(KEYFRAME_INTERVAL),
     ] + header_args + [
-        '-f', 'h264',
+        '-f', 'mp4',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
         'pipe:1'
     ]
+
+    def _rawvideo_cmd():
+        return [
+            FFMPEG_PATH, '-y',
+            '-probesize', '32',
+            '-analyzeduration', '0',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f"{target_w}x{target_h}",
+            '-pix_fmt', 'bgr24',
+            '-framerate', str(TARGET_FPS),
+            '-i', '-',
+        ] + vf_args + tail_args
+
+    dda_cmd = [
+        FFMPEG_PATH, '-y',
+        '-f', 'ddagrab',
+        '-framerate', str(TARGET_FPS),
+        '-draw_mouse', '0',
+        '-i', 'desktop',
+    ] + vf_args + tail_args
 
     log_path = os.path.join(os.path.dirname(_LOG_FILE), 'ffmpeg_hq.log')
     try: hq_log_file = open(log_path, 'wb')
     except: hq_log_file = subprocess.DEVNULL
 
-    try:
-        creation_flags = 0x08000000 if os.name == 'nt' else 0 # CREATE_NO_WINDOW
-        proc = subprocess.Popen(
-            ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=hq_log_file,
-            bufsize=512 * 1024, creationflags=creation_flags,
-        )
-        HQ_FFMPEG_PROC = proc
-    except Exception as e:
-        logger.error("[HQ] No se pudo iniciar ffmpeg: %s", e)
-        return
+    creation_flags = 0x08000000 if os.name == 'nt' else 0  # CREATE_NO_WINDOW
+    capture_mode = 'gdi'
+    proc = None
 
+    def _start_ffmpeg(cmd, use_stdin: bool):
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=hq_log_file,
+            bufsize=512 * 1024,
+            creationflags=creation_flags,
+        )
+
+    if _ffmpeg_has_input('ddagrab') and not _is_rdp_session():
+        try:
+            proc = _start_ffmpeg(dda_cmd, use_stdin=False)
+            await asyncio.sleep(0.7)
+            if proc.poll() is None:
+                capture_mode = 'ddagrab'
+                logger.info("[HQ] Captura ddagrab (DXGI dentro de ffmpeg)")
+            else:
+                logger.warning("[HQ] ddagrab no arranco (code=%s), fallback DXGI/GDI", proc.returncode)
+                proc = None
+        except Exception as e:
+            logger.warning("[HQ] ddagrab error: %s", e)
+            proc = None
+    elif _is_rdp_session():
+        logger.info("[HQ] Sesion RDP: ddagrab omitido (captura la consola negra); se usa GDI")
+
+    if proc is None:
+        try:
+            proc = _start_ffmpeg(_rawvideo_cmd(), use_stdin=True)
+            capture_mode = 'pipe'
+        except Exception as e:
+            logger.error("[HQ] No se pudo iniciar ffmpeg: %s", e)
+            try:
+                await emit_bitacora_log("[HQ] No se pudo iniciar ffmpeg: %s" % e, "ERROR")
+            except Exception:
+                pass
+            HQ_MODE_ACTIVE = False
+            return
+
+    HQ_FFMPEG_PROC = proc
     FRAME_TIME = 1.0 / TARGET_FPS
 
     async def capture_and_feed():
         global HQ_MODE_ACTIVE
+        if capture_mode == 'ddagrab':
+            return
+
+        dxgi = None
+        if not _is_rdp_session():
+            try:
+                from dxgi_capture import DxgiCapturer
+                cand = DxgiCapturer()
+                if cand.start():
+                    dxgi = cand
+                    logger.warning("[HQ] Usando motor DXGI a %s FPS, %sx%s", TARGET_FPS, target_w, target_h)
+                else:
+                    cand.release()
+            except Exception as e:
+                logger.debug("[HQ] DXGI no disponible: %s", e)
+        else:
+            logger.info("[HQ] Sesion RDP: DXGI omitido, captura GDI del escritorio de la sesion")
+
+        if dxgi is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                while HQ_MODE_ACTIVE and proc.poll() is None:
+                    t0 = time.perf_counter()
+
+                    def _dxgi_write():
+                        data = dxgi.grab_bgr24(target_w, target_h)
+                        if not data:
+                            return
+                        proc.stdin.write(data)
+                        proc.stdin.flush()
+
+                    try:
+                        await loop.run_in_executor(None, _dxgi_write)
+                    except Exception as pipe_err:
+                        err_no = getattr(pipe_err, "errno", None)
+                        if err_no == errno.ENOSPC or "no space left" in str(pipe_err).lower():
+                            logger.error("[HQ] Disco lleno o tuberia saturada (%s); desactivando modo HQ", pipe_err)
+                            HQ_MODE_ACTIVE = False
+                        else:
+                            logger.debug("[HQ] Tuberia cerrada: %s", pipe_err)
+                        break
+                    elapsed = time.perf_counter() - t0
+                    await asyncio.sleep(max(0.001, FRAME_TIME - elapsed))
+            finally:
+                try:
+                    dxgi.release()
+                except Exception:
+                    pass
+            return
+
         try:
-            logger.warning(f"[HQ] Usando motor GDI a {TARGET_FPS} FPS, {target_w}x{target_h}")
+            logger.warning("[HQ] Usando motor GDI a %s FPS, %sx%s", TARGET_FPS, target_w, target_h)
             gdi32 = ctypes.windll.gdi32
             hdc_screen = gdi32.CreateDCA(b'DISPLAY', None, None, None)
             hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
@@ -2056,50 +3157,45 @@ async def hq_stream_loop(device_id: int, license_key: str):
             row_pitch = (target_w * 3 + 3) & ~3
             actual_frame_size = row_pitch * target_h
             bmi = struct.pack('<IiiHHIIiiII', 40, target_w, -target_h, 1, 24, 0, actual_frame_size, 0, 0, 0, 0)
-
-            last_frame_hash_quick = 0
             buf = (ctypes.c_char * actual_frame_size)()
-            
+
             try:
                 loop = asyncio.get_event_loop()
                 while HQ_MODE_ACTIVE and proc.poll() is None:
                     t0 = time.perf_counter()
-                    
+
                     def _capture_and_write():
                         gdi32.BitBlt(hdc_mem, 0, 0, target_w, target_h, hdc_screen, 0, 0, 0x00CC0020)
                         gdi32.GetDIBits(hdc_mem, hbm, 0, target_h, buf, bmi, 0)
-                        
                         if row_pitch == target_w * 3:
                             proc.stdin.write(buf.raw)
                         else:
                             raw = buf.raw
-                            bgr = b"".join(raw[i*row_pitch : i*row_pitch + target_w*3] for i in range(target_h))
+                            bgr = b"".join(raw[i * row_pitch: i * row_pitch + target_w * 3] for i in range(target_h))
                             proc.stdin.write(bgr)
-                        
                         proc.stdin.flush()
-                        
+
                     try:
                         await loop.run_in_executor(None, _capture_and_write)
                     except Exception as pipe_err:
                         err_no = getattr(pipe_err, "errno", None)
                         if err_no == errno.ENOSPC or "no space left" in str(pipe_err).lower():
-                            logger.error(
-                                "[HQ] Disco lleno o tuberia saturada (%s); desactivando modo HQ",
-                                pipe_err,
-                            )
+                            logger.error("[HQ] Disco lleno o tuberia saturada (%s); desactivando modo HQ", pipe_err)
                             HQ_MODE_ACTIVE = False
                         else:
                             logger.debug("[HQ] Tuberia cerrada: %s", pipe_err)
                         break
-                    
                     elapsed = time.perf_counter() - t0
                     await asyncio.sleep(max(0.001, FRAME_TIME - elapsed))
             finally:
-                gdi32.DeleteDC(hdc_mem); gdi32.DeleteDC(hdc_screen); gdi32.DeleteObject(hbm)
+                gdi32.DeleteDC(hdc_mem)
+                gdi32.DeleteDC(hdc_screen)
+                gdi32.DeleteObject(hbm)
         except Exception as e:
             logger.error("[HQ] Error en hilo de captura: %s", e)
 
-    asyncio.create_task(capture_and_feed())
+    if capture_mode != 'ddagrab':
+        asyncio.create_task(capture_and_feed())
 
     async def run_with_hq_ws():
         loop = asyncio.get_event_loop()
@@ -2458,25 +3554,210 @@ def _capture_gdi():
         logger.warning("[CAPTURA] GDI error: %s", _ge)
         return None
 
+
+def _is_rdp_session():
+    """True en sesion RDP: DXGI captura la GPU fisica (consola), no este escritorio."""
+    try:
+        return bool(ctypes.windll.user32.GetSystemMetrics(0x1000))  # SM_REMOTESESSION
+    except Exception:
+        return False
+
+
+def _capture_visible_windows_composite():
+    """
+    Compone ventanas visibles con PrintWindow(PW_RENDERFULLCONTENT).
+    En RDP/Server, BitBlt/mss del desktop suelen devolver negro aunque el
+    escritorio se vea bien; PrintWindow por HWND si funciona.
+    """
+    try:
+        from PIL import Image as _Image
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+            ]
+
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        user32.IsIconic.argtypes = [ctypes.c_void_p]
+        user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+        user32.PrintWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        user32.PrintWindow.restype = ctypes.c_int
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+        gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+        gdi32.BitBlt.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+        ]
+        gdi32.BitBlt.restype = ctypes.c_int
+        gdi32.PatBlt.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32,
+        ]
+        gdi32.CreateSolidBrush.argtypes = [ctypes.c_uint32]
+        gdi32.CreateSolidBrush.restype = ctypes.c_void_p
+        gdi32.GetDIBits.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+
+        sw = user32.GetSystemMetrics(0)
+        sh = user32.GetSystemMetrics(1)
+        if sw <= 0 or sh <= 0:
+            return None
+
+        # EnumWindows: frente→atrás; reverse = fondo→frente para pintar
+        hwnds_ordered = []
+
+        def _enum(hwnd, _lp):
+            try:
+                hwnd_p = ctypes.c_void_p(hwnd)
+                if not user32.IsWindowVisible(hwnd_p) or user32.IsIconic(hwnd_p):
+                    return True
+                rc = RECT()
+                if not user32.GetWindowRect(hwnd_p, ctypes.byref(rc)):
+                    return True
+                ww = int(rc.right - rc.left)
+                hh = int(rc.bottom - rc.top)
+                if ww < 8 or hh < 8:
+                    return True
+                if rc.right <= 0 or rc.bottom <= 0 or rc.left >= sw or rc.top >= sh:
+                    return True
+                hwnds_ordered.append((int(hwnd) if not isinstance(hwnd, int) else hwnd, rc))
+            except Exception:
+                pass
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        user32.EnumWindows(WNDENUMPROC(_enum), 0)
+        hwnds_ordered.reverse()
+        if len(hwnds_ordered) > 25:
+            hwnds_ordered = hwnds_ordered[-25:]
+
+        hdc_screen = user32.GetDC(None)
+        if not hdc_screen:
+            return None
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, sw, sh)
+        if not hdc_mem or not hbmp:
+            if hbmp:
+                gdi32.DeleteObject(hbmp)
+            if hdc_mem:
+                gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(None, hdc_screen)
+            return None
+        gdi32.SelectObject(hdc_mem, hbmp)
+        brush = gdi32.CreateSolidBrush(0)
+        old_br = gdi32.SelectObject(hdc_mem, brush)
+        gdi32.PatBlt(hdc_mem, 0, 0, sw, sh, 0x000F0001)  # PATCOPY
+        gdi32.SelectObject(hdc_mem, old_br)
+        gdi32.DeleteObject(brush)
+
+        PW_RENDERFULLCONTENT = 0x00000002
+        painted = 0
+        for hwnd_i, rc in hwnds_ordered:
+            try:
+                ww = int(rc.right - rc.left)
+                hh = int(rc.bottom - rc.top)
+                hdc_win = gdi32.CreateCompatibleDC(hdc_screen)
+                hbmp_win = gdi32.CreateCompatibleBitmap(hdc_screen, ww, hh)
+                if not hdc_win or not hbmp_win:
+                    if hbmp_win:
+                        gdi32.DeleteObject(hbmp_win)
+                    if hdc_win:
+                        gdi32.DeleteDC(hdc_win)
+                    continue
+                gdi32.SelectObject(hdc_win, hbmp_win)
+                ok = user32.PrintWindow(ctypes.c_void_p(hwnd_i), hdc_win, PW_RENDERFULLCONTENT)
+                if not ok:
+                    ok = user32.PrintWindow(ctypes.c_void_p(hwnd_i), hdc_win, 0)
+                if ok:
+                    gdi32.BitBlt(
+                        hdc_mem, int(rc.left), int(rc.top), ww, hh,
+                        hdc_win, 0, 0, 0x00CC0020,
+                    )
+                    painted += 1
+                gdi32.DeleteObject(hbmp_win)
+                gdi32.DeleteDC(hdc_win)
+            except Exception:
+                pass
+
+        class _BIH(ctypes.Structure):
+            _fields_ = [
+                ("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32), ("biXPPM", ctypes.c_int32),
+                ("biYPPM", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32),
+            ]
+        bmi = _BIH(
+            biSize=ctypes.sizeof(_BIH), biWidth=sw, biHeight=-sh,
+            biPlanes=1, biBitCount=32, biCompression=0,
+        )
+        buf = (ctypes.c_byte * (sw * sh * 4))()
+        gdi32.GetDIBits(hdc_mem, hbmp, 0, sh, buf, ctypes.byref(bmi), 0)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(None, hdc_screen)
+
+        if painted <= 0:
+            return None
+        img = _Image.frombuffer("RGBX", (sw, sh), bytes(buf), "raw", "BGRX", 0, 1)
+        return img.convert("RGB")
+    except Exception as e:
+        logger.debug("[CAPTURA] composite ventanas: %s", e)
+        return None
+
+
+def _capture_dxgi():
+    """Desktop Duplication (DXGI). None si el GPU/sesion no lo permite."""
+    if _is_rdp_session():
+        return None
+    try:
+        from dxgi_capture import grab_rgb
+        mon = max(0, int(ACTIVE_MONITOR) - 1)
+        return grab_rgb(mon)
+    except Exception as _de:
+        logger.debug("[CAPTURA] DXGI: %s", _de)
+        return None
+
 def capture_screenshot_thread_func():
     import time
     import hashlib
     import io as _io
     import mss as _mss
     from PIL import Image, ImageGrab
-    global LATEST_FRAME, LATEST_FRAME_PACKET, FORCE_NEXT_FRAME, ACTIVE_MONITOR, HQ_MODE_ACTIVE
+    global LATEST_FRAME, LATEST_FRAME_PACKET, LATEST_FRAME_BYTES, FORCE_NEXT_FRAME, ACTIVE_MONITOR, HQ_MODE_ACTIVE
+    global HAS_ACTIVE_VIEWER, VIEWER_LAST_ACTIVITY
     last_pixel_hash = None
     motion_frames = 0
     frames_captured = 0
     gdi_failures = 0
-    prev_screenshot_dr = None  # DIRTY_RECT: frame anterior para comparaciÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n
+    dxgi_failures = 0
+    use_dxgi = not _is_rdp_session()
+    woke_once = False
+    boot_at = time.time()
+    prev_screenshot_dr = None  # DIRTY_RECT: frame anterior para comparación
     _FRAME_BUDGET = 0.045  # ~22 FPS en captura estandar
+    # En RDP, GDI/BitBlt del desktop suele devolver negro; mss/ImageGrab van primero.
+    use_gdi = not _is_rdp_session()
 
-    logger.info("[CAPTURA] Thread de captura de pantalla iniciado")
+    logger.info("[CAPTURA] Thread de captura de pantalla iniciado (dxgi=%s rdp=%s gdi=%s)", use_dxgi, _is_rdp_session(), use_gdi)
 
     # Inicializar mss UNA sola vez fuera del loop.
     sct = None
-    use_gdi = True
     use_imagegrab = False  # se activa solo si mss falla; evita UnboundLocalError si GDI cae despues
     try:
         sct = _mss.mss()
@@ -2497,6 +3778,79 @@ def capture_screenshot_thread_func():
             return avg < 5  # Casi negro
         except Exception:
             return False
+
+    # Cache de fuente de captura: la ultima que dio un frame valido. Evita
+    # recorrer toda la cascada (~250 ms) en cada frame; composite (~155 ms)
+    # queda como ultimo recurso.
+    _cached_cap_src = {"name": None}
+
+    def _capture_single(name):
+        if name == "mss":
+            if sct is None:
+                return None
+            try:
+                monitor_idx = ACTIVE_MONITOR
+                if monitor_idx >= len(sct.monitors):
+                    monitor_idx = 1
+                monitor = sct.monitors[monitor_idx]
+                sct_img = sct.grab(monitor)
+                return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+            except Exception as e:
+                logger.debug("[CAPTURA] mss grab: %s", e)
+            return None
+        if name == "imagegrab":
+            try:
+                return ImageGrab.grab()
+            except Exception as e:
+                logger.debug("[CAPTURA] ImageGrab: %s", e)
+            return None
+        if name == "gdi":
+            try:
+                return _capture_gdi()
+            except Exception as e:
+                logger.debug("[CAPTURA] gdi: %s", e)
+            return None
+        if name == "printwindow":
+            try:
+                return _capture_printwindow_fallback()
+            except Exception as e:
+                logger.debug("[CAPTURA] printwindow: %s", e)
+            return None
+        if name == "composite":
+            try:
+                return _capture_visible_windows_composite()
+            except Exception as e:
+                logger.debug("[CAPTURA] composite: %s", e)
+            return None
+        return None
+
+    _CAP_ORDER = ("mss", "imagegrab", "gdi", "printwindow", "composite")
+
+    def _try_non_black_capture():
+        """Cascada perezosa con cache: prueba primero la ultima fuente que anduvo;
+        si da negro o falla, recorre el resto una por una y re-cachea la ganadora."""
+        order = list(_CAP_ORDER)
+        cached = _cached_cap_src["name"]
+        if cached in order:
+            order.remove(cached)
+            order.insert(0, cached)
+        first_img = first_name = None
+        for name in order:
+            try:
+                img = _capture_single(name)
+            except Exception as e:
+                logger.debug("[CAPTURA] %s: %s", name, e)
+                img = None
+            if img is None:
+                continue
+            if first_img is None:
+                first_img, first_name = img, name + "-black"
+            if not _is_black_frame(img):
+                _cached_cap_src["name"] = name
+                return name, img
+        if first_img is not None:
+            return first_name, first_img
+        return None, None
 
     def _capture_printwindow_fallback() -> 'Image | None':
         """Captura usando PrintWindow + BitBlt cuando MSS devuelve pantalla negra.
@@ -2574,11 +3928,21 @@ def capture_screenshot_thread_func():
             return None
 
     _last_desk_attach = 0.0
+    black_streak = 0
+    last_black_warn_at = 0.0
+    black_warn_active = False
     while True:
         # OPTIMIZACIÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“N EXTREMA: Si no hay tÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnicos activos ni modo HQ, pausar la captura
         # de pantalla local para ahorrar 100% de CPU y RAM.
-        if not HAS_ACTIVE_VIEWER and not HQ_MODE_ACTIVE:
-            time.sleep(0.4)
+        idle_for = (time.time() - VIEWER_LAST_ACTIVITY) if VIEWER_LAST_ACTIVITY else 999.0
+        if HAS_ACTIVE_VIEWER and idle_for > VIEWER_IDLE_TIMEOUT:
+            HAS_ACTIVE_VIEWER = False
+            logger.info("[CAPTURA] Timeout de viewer (%.0fs). Pausando captura.", VIEWER_IDLE_TIMEOUT)
+        if HQ_MODE_ACTIVE and not HAS_ACTIVE_VIEWER and idle_for > VIEWER_IDLE_TIMEOUT:
+            HQ_MODE_ACTIVE = False
+            logger.info("[HQ] Timeout sin viewer (%.0fs). Apagando stream HQ.", VIEWER_IDLE_TIMEOUT)
+        if not HAS_ACTIVE_VIEWER and not HQ_MODE_ACTIVE and (time.time() - boot_at) > 25:
+            time.sleep(3.0)
             continue
 
         # Seguir el Input Desktop activo (lock screen <-> Winlogon credenciales <-> default).
@@ -2592,19 +3956,54 @@ def capture_screenshot_thread_func():
 
             try:
                 screenshot = None
-                if use_gdi:
+                capture_src = None
+                if use_dxgi:
+                    screenshot = _capture_dxgi()
+                    if screenshot is None:
+                        dxgi_failures += 1
+                        if dxgi_failures >= 3:
+                            use_dxgi = False
+                            logger.warning("[CAPTURA] DXGI no disponible, usando GDI/mss")
+                    elif _is_black_frame(screenshot):
+                        use_dxgi = False
+                        screenshot = None
+                        try:
+                            from dxgi_capture import reset_capturer
+                            reset_capturer()
+                        except Exception:
+                            pass
+                        logger.warning("[CAPTURA] DXGI negro/consola ajena — fallback inmediato")
+
+                # RDP o sin DXGI: cascada mss/ImageGrab/GDI/PrintWindow (evita negro eterno)
+                if screenshot is None or _is_black_frame(screenshot):
+                    if not woke_once and (screenshot is None or _is_black_frame(screenshot)):
+                        woke_once = True
+                        try:
+                            _wake_screen_and_restore_windows()
+                            _attach_input_desktop()
+                        except Exception:
+                            pass
+                    src, img = _try_non_black_capture()
+                    if img is not None:
+                        if screenshot is None or _is_black_frame(screenshot) or (
+                            src and not str(src).endswith("-black")
+                        ):
+                            screenshot = img
+                            capture_src = src
+                            if src and str(src).endswith("-black") and frames_captured % 60 == 1:
+                                logger.warning("[CAPTURA] Todas las fuentes devolvieron negro (%s)", src)
+                            elif src and frames_captured < 5:
+                                logger.info("[CAPTURA] Fuente OK: %s", src)
+
+                if screenshot is None and use_gdi:
                     screenshot = _capture_gdi()
                     if screenshot is None:
                         gdi_failures += 1
                         if gdi_failures % 30 == 1:
                             logger.warning("[CAPTURA] GDI no disponible en esta sesion, usando mss/ImageGrab")
                         use_gdi = False
-                    elif _is_black_frame(screenshot):
-                        alt = _capture_printwindow_fallback()
-                        if alt and not _is_black_frame(alt):
-                            screenshot = alt
 
-                if not use_gdi:
+                if screenshot is None and not use_gdi:
                     if use_imagegrab or sct is None:
                         screenshot = ImageGrab.grab()
                     else:
@@ -2614,14 +4013,57 @@ def capture_screenshot_thread_func():
                         monitor = sct.monitors[monitor_idx]
                         sct_img = sct.grab(monitor)
                         screenshot = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                        # Fallback si la captura es negra (ventana minimizada / RDP inactivo)
-                        if _is_black_frame(screenshot):
-                            alt = _capture_printwindow_fallback()
-                            if alt and not _is_black_frame(alt):
-                                screenshot = alt
+
+                # No publicar frame negro si habia uno bueno antes
+                fresh_black = bool(screenshot is not None and _is_black_frame(screenshot))
+                if fresh_black and prev_screenshot_dr is not None:
+                    if not _is_black_frame(prev_screenshot_dr):
+                        screenshot = prev_screenshot_dr
+                        if frames_captured % 90 == 1:
+                            logger.warning("[CAPTURA] Frame negro descartado — reusando ultimo frame valido")
+
+                # Aviso al tecnico: en RDP, ventana de Escritorio remoto minimizada → captura negra
+                if HAS_ACTIVE_VIEWER and fresh_black:
+                    black_streak += 1
+                    SELFTEST_STATE["black_streak"] = black_streak
+                    if black_streak >= 25 and (time.time() - last_black_warn_at) > 20.0:
+                        last_black_warn_at = time.time()
+                        black_warn_active = True
+                        SELFTEST_STATE["black_warn_active"] = True
+                        msg = (
+                            "Pantalla en negro: si entrás por Escritorio remoto (RDP), "
+                            "restaurá o maximizá esa ventana en tu PC (no la dejes minimizada). "
+                            "Windows deja de dibujar el escritorio y Centinela captura negro."
+                            if _is_rdp_session()
+                            else
+                            "Captura en negro. Probá el botón «Despertar pantalla» o revisá "
+                            "si la sesión está bloqueada / pantalla apagada."
+                        )
+                        send_ws_message_threadsafe({
+                            "type": "capture_warning",
+                            "reason": "rdp_minimized_or_blank" if _is_rdp_session() else "blank_screen",
+                            "rdp": _is_rdp_session(),
+                            "message": msg,
+                        })
+                        logger.warning("[CAPTURA] Aviso al viewer: %s", msg)
+                elif HAS_ACTIVE_VIEWER and screenshot is not None and not fresh_black:
+                    if black_warn_active:
+                        black_warn_active = False
+                        SELFTEST_STATE["black_warn_active"] = False
+                        send_ws_message_threadsafe({
+                            "type": "capture_ok",
+                            "message": "Captura de pantalla recuperada.",
+                        })
+                    black_streak = 0
+                elif not HAS_ACTIVE_VIEWER:
+                    black_streak = 0
+                    black_warn_active = False
+                    SELFTEST_STATE["black_warn_active"] = False
+
+                SELFTEST_STATE["black_streak"] = black_streak
 
                 with STREAM_OPTS_LOCK:
-                    mw_cap = STREAM_OPTS["max_width"]
+                    mw_cap = CONGESTION.adaptive_max_width(STREAM_OPTS["max_width"])
                     w_still = STREAM_OPTS["webp_still"]
                     w_motion = STREAM_OPTS["webp_motion"]
                 if mw_cap and screenshot is not None:
@@ -2655,7 +4097,7 @@ def capture_screenshot_thread_func():
                 # 3. Si cubre ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¥ 65% (o es el primer frame): encodear frame completo.
                 # 4. LATEST_FRAME siempre = frame completo (HTTP polling sin cambios).
                 # 5. LATEST_FRAME_PACKET = {"frame": ..., "delta": {...} | None}
-                webp_quality = w_motion if motion_frames > 4 else w_still
+                webp_quality = int((w_motion if motion_frames > 4 else w_still) * CONGESTION.adaptive_quality_factor())
                 delta_meta   = None
                 encode_img   = screenshot  # por defecto: frame completo
 
@@ -2679,23 +4121,32 @@ def capture_screenshot_thread_func():
                 FORCE_NEXT_FRAME = False
 
                 img_byte_arr = _io.BytesIO()
+                # JPEG subsampling=2: ~1.6 ms vs ~21 ms del WEBP method=0, mismo tamano
+                # en KB con calidad equivalente (jpeg_q = webp_q - 27).
+                # Rollback: jpeg_quality = int(webp_quality) y save WEBP method=0.
+                jpeg_quality = max(35, min(92, int(webp_quality) - 27))
                 try:
-                    # method=0: encode ~5ms (vs method=4: ~50ms). Ligero aumento de tamaÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±o
-                    # pero la ganancia de latencia es enorme. Para revertir: method=4.
-                    encode_img.save(img_byte_arr, format='WEBP', quality=webp_quality, method=0)
+                    encode_img.save(img_byte_arr, format='JPEG', quality=jpeg_quality, subsampling=2)
                 except Exception:
+                    # JPEG no acepta RGBA/P: convertir y reintentar
                     img_byte_arr = _io.BytesIO()
-                    jq = w_motion if motion_frames > 4 else w_still
-                    jpeg_quality = max(35, min(92, int(jq * 0.58)))
-                    encode_img.save(img_byte_arr, format='JPEG', quality=jpeg_quality, optimize=True)
+                    encode_img.convert("RGB").save(img_byte_arr, format='JPEG', quality=jpeg_quality)
 
                 encoded_b64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+                LATEST_FRAME_BYTES = img_byte_arr.getvalue()
 
                 if delta_meta:
                     LATEST_FRAME_PACKET = {"frame": encoded_b64, "delta": delta_meta, "id": time.perf_counter()}
                 else:
                     LATEST_FRAME = encoded_b64
                     LATEST_FRAME_PACKET = {"frame": encoded_b64, "delta": None, "id": time.perf_counter()}
+
+                SELFTEST_STATE["frames_sent"] += 1
+                SELFTEST_STATE["last_frame_at"] = time.time()
+                SELFTEST_STATE["last_capture_method"] = capture_src or (
+                    "gdi" if use_gdi else ("imagegrab" if use_imagegrab else "primary")
+                )
+                SELFTEST_STATE["last_frame_ms"] = round((time.perf_counter() - _t0) * 1000.0, 1)
 
                 # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ DIRTY_RECT_END ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
 
@@ -2721,6 +4172,8 @@ def capture_screenshot_thread_func():
 
             except Exception as e:
                 logger.error("[CAPTURA] Error: %s", e)
+                SELFTEST_STATE["capture_errors"] += 1
+                SELFTEST_STATE["last_capture_error"] = str(e)[:300]
                 if not use_imagegrab and not use_gdi:
                     logger.warning("[CAPTURA] Cambiando a PIL.ImageGrab como fallback")
                     use_imagegrab = True
@@ -2735,35 +4188,72 @@ def capture_screenshot_thread_func():
             last_pixel_hash = None
 
         # Sleep dinÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡mico: mantiene ~30 FPS (HQ Turbo) o ~12 FPS (EstÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ndar) descontando el tiempo de encode
-        _current_budget = 0.033 if HQ_MODE_ACTIVE else _FRAME_BUDGET
+        _base_budget = 0.033 if HQ_MODE_ACTIVE else _FRAME_BUDGET
+        _current_budget = CONGESTION.adaptive_frame_budget(_base_budget)
         _elapsed = time.perf_counter() - _t0
         time.sleep(max(0.002, _current_budget - _elapsed))
 
 
+def _companion_image_names():
+    return frozenset({
+        "apollocentinela.exe",
+        "apollo_centinela.exe",
+        "apollegescombeta.exe",
+        "apollegescom.exe",
+        "apollosoporte.exe",
+        "apollosupport.exe",
+    })
+
+
+def _kill_sibling_companions(session_id):
+    """Cierra otros ApolloCentinela de la misma sesion (p.ej. headless sin ventana).
+    El cliente no debe hacer taskkill a mano: la UI toma el control sola."""
+    my_pid = os.getpid()
+    names = _companion_image_names()
+    killed = 0
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                if name not in names:
+                    continue
+                pid = int(proc.info["pid"] or 0)
+                if not pid or pid == my_pid:
+                    continue
+                sid = ctypes.c_ulong(0)
+                if not ctypes.windll.kernel32.ProcessIdToSessionId(
+                    ctypes.c_ulong(pid), ctypes.byref(sid)
+                ):
+                    continue
+                if int(sid.value) != int(session_id):
+                    continue
+                proc.kill()
+                killed += 1
+                logger.info("[UI] Companion sin ventana cerrado (pid=%s sesion=%s)", pid, session_id)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception as e:
+        logger.debug("[UI] _kill_sibling_companions: %s", e)
+    return killed
+
+
+def _bring_apollo_window_front():
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, "ApolloSoporte")
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
     import sys
-    
-    # Asegurar el motor embebido de RustDesk (DESHABILITADO POR COMPLETO)
-    # try:
-    #     ensure_and_start_embedded_rustdesk()
-    # except Exception as e:
-    #     logger.error("[EMBEDDED-RD] Fallo critico en modulo embebido: %s", e)
 
-    # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ Instancia ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Âºnica: solo puede correr UN companion por sesiÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n de usuario ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
-    # Si ya hay uno corriendo, este nuevo proceso sale silenciosamente.
-    # Esto evita duplicados cuando tanto el service wrapper como el instalador
-    # intentan lanzar el companion al mismo tiempo.
-    _sid = int(get_current_session_id())
-    _mutex_name = f"Global\\ApolloCentinelaCompanion_S{_sid}"
-    _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _mutex_name)
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        logger.info("Companion ya activo en sesion %d (mutex %s), saliendo", _sid, _mutex_name)
-        # Ya hay una instancia corriendo en esta sesion ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â salir sin hacer nada
-        ctypes.windll.kernel32.CloseHandle(_mutex)
-        sys.exit(0)
-
-    # --- CLI: soporte para instalaciÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n/gestiÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n del servicio desde lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­nea de comandos ---
-    # Uso: ApolloCentinela.exe --install | --uninstall | --start | --stop
+    # CLI: ApolloCentinela.exe --install | --uninstall | --start | --stop
     args = sys.argv[1:]
     if args:
         action_map = {
@@ -2774,9 +4264,7 @@ def main():
         }
         action = action_map.get(args[0].lower())
         if action:
-            # Para instalar/desinstalar se requieren permisos de administrador
             if not is_admin():
-                # Re-lanzar con UAC elevation
                 script = sys.executable if getattr(sys, 'frozen', False) else __file__
                 ctypes.windll.shell32.ShellExecuteW(None, 'runas', script, ' '.join(sys.argv[1:]), None, 1)
                 sys.exit(0)
@@ -2784,22 +4272,13 @@ def main():
             print(f"[SERVICE] {action}: ok={ok} {msg}")
             sys.exit(0 if ok else 1)
 
-    # NOTA: El companion NO se auto-eleva a admin.
-    # El servicio lo lanza con CreateProcessAsUserW (token del usuario, sin elevar).
-    # Ejecutar como admin elevado causaba ghost tray icons y posibles problemas
-    # de input injection entre procesos de distinta integridad.
-
-
-
-    # Intentar habilitar la polÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­tica de SAS en el registro de Windows
     enable_sas_policy()
 
+    # Headless/winlogon ANTES del mutex de UI: no debe bloquear la ventana con ID.
     if "--headless" in sys.argv or "--winlogon" in sys.argv:
         if is_running_as_service():
             sys.exit(0)
         logger.info("[CENTINELA] Modo headless/winlogon — captura + WS (pantalla de login)")
-        # Sin UI (pantalla de login / Winlogon): arrancar el hilo de captura para que
-        # el tecnico VEA la pantalla de inicio de sesion y pueda operar (SAS + credenciales).
         capture_thread = threading.Thread(target=capture_screenshot_thread_func, daemon=True)
         capture_thread.start()
         loop = asyncio.new_event_loop()
@@ -2810,18 +4289,62 @@ def main():
             pass
         return
 
-    # --- MODO SERVICIO / HEADLESS: si estamos en Session 0, no mostrar UI ---
-    # ApolloCentinelaService.exe (el service wrapper) no llega aquÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­ ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
-    # este bloque solo protege si por alguna razÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â³n este EXE se carga en Session 0.
     if get_current_session_id() == 0:
         print("[CENTINELA] Detectado Session 0. El companion no debe correr aqui. Saliendo.")
-        return  # El service wrapper maneja la conexion en Session 0
+        return
+
+    # Una sola UI por sesion. Si hay un headless viejo (online sin ventana),
+    # lo reemplazamos solos — sin pedir taskkill al cliente.
+    _sid = int(get_current_session_id())
+    _mutex_name = f"Global\\ApolloCentinelaUI_S{_sid}"
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _mutex_name)
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        logger.info("UI ya activa en sesion %d — intentando traer ventana", _sid)
+        if _bring_apollo_window_front():
+            ctypes.windll.kernel32.CloseHandle(_mutex)
+            sys.exit(0)
+        # Mutex ocupado pero sin ventana = companion headless / zombie
+        logger.warning("[UI] Sin ventana ApolloSoporte — tomando control automatico")
+        _kill_sibling_companions(_sid)
+        time.sleep(0.5)
+        ctypes.windll.kernel32.CloseHandle(_mutex)
+        _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _mutex_name)
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            if _bring_apollo_window_front():
+                ctypes.windll.kernel32.CloseHandle(_mutex)
+                sys.exit(0)
+            # Ultimo intento: matar otra vez y seguir (mutex se libera al morir)
+            _kill_sibling_companions(_sid)
+            time.sleep(0.8)
+            ctypes.windll.kernel32.CloseHandle(_mutex)
+            _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _mutex_name)
+            if ctypes.windll.kernel32.GetLastError() == 183 and _bring_apollo_window_front():
+                ctypes.windll.kernel32.CloseHandle(_mutex)
+                sys.exit(0)
+
+    # Por si el servicio dejo un headless sin tomar el mutex UI nuevo
+    _kill_sibling_companions(_sid)
+
+    threading.Thread(target=_native_clipboard_monitor, daemon=True, name="NativeClipboardPoller").start()
 
     # ------------- UI ESTILO TEAMVIEWER (TKinter) -------------
     try:
         root = tk.Tk()
     except Exception as ui_error:
-        print(f"[CENTINELA] No se pudo inicializar Tkinter: {ui_error}. Iniciando en modo Headless...")
+        logger.error("[CENTINELA] Tkinter fallo: %s", ui_error)
+        try:
+            cid = LOCAL_CFG.get("client_id") or CLIENT_ID or "?"
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                f"No se pudo abrir la ventana de Apollo Centinela.\n"
+                f"ID de soporte: {cid}\n\n"
+                f"Error: {ui_error}\n\n"
+                f"El agente seguirá conectado en segundo plano.",
+                "Apollo Centinela",
+                0x10,
+            )
+        except Exception:
+            pass
         capture_thread = threading.Thread(target=capture_screenshot_thread_func, daemon=True)
         capture_thread.start()
         loop = asyncio.new_event_loop()
@@ -2833,7 +4356,7 @@ def main():
         return
 
     root.title("ApolloSoporte")
-    root.geometry("360x420")
+    root.geometry("360x480")
     root.resizable(False, False)
     root.configure(bg="#0f172a")
 
@@ -2893,9 +4416,142 @@ def main():
     lbl_build = tk.Label(footer_frame, text=f"v{CLIENT_VERSION} | build {BUILD_DATE}", font=("Segoe UI", 8), bg="#0f172a", fg="#475569")
     lbl_build.pack(pady=(5, 0))
 
+    lbl_update = tk.Label(footer_frame, text="", font=("Segoe UI", 8), bg="#0f172a", fg="#f59e0b", wraplength=330, justify="center")
+    lbl_update.pack(pady=(4, 0))
+
+    btn_update = tk.Button(
+        footer_frame,
+        text="Actualizar ahora",
+        font=("Segoe UI", 9, "bold"),
+        bg="#f59e0b",
+        fg="#0f172a",
+        activebackground="#d97706",
+        activeforeground="#0f172a",
+        relief="flat",
+        padx=14,
+        pady=5,
+        cursor="hand2",
+    )
+    btn_check = tk.Label(
+        footer_frame,
+        text="Buscar actualizaciones",
+        font=("Segoe UI", 8, "underline"),
+        bg="#0f172a",
+        fg="#64748b",
+        cursor="hand2",
+    )
+    btn_check.pack(pady=(2, 0))
+
+    def ui_set_update(available, text="", enable_btn=True, checking=False):
+        def _apply():
+            lbl_update.config(text=text, fg="#fbbf24" if checking else "#f59e0b")
+            if available:
+                if not btn_update.winfo_ismapped():
+                    btn_update.pack(pady=(6, 0))
+                btn_update.config(state=tk.NORMAL if enable_btn else tk.DISABLED)
+                if btn_check.winfo_ismapped():
+                    btn_check.pack_forget()
+            else:
+                if btn_update.winfo_ismapped():
+                    btn_update.pack_forget()
+                if not btn_check.winfo_ismapped():
+                    btn_check.pack(pady=(2, 0))
+                btn_check.config(text="Buscando..." if checking else "Buscar actualizaciones")
+        if ROOT_WINDOW:
+            ROOT_WINDOW.after(0, _apply)
+
+    def apply_update_info(info):
+        global _UPDATE_INFO
+        if info:
+            _UPDATE_INFO.update(info)
+            _UPDATE_INFO["available"] = True
+            ui_set_update(True, f"Hay una versión nueva: v{info['version']}")
+            logger.info("[OTA] Companion detectó v%s (local %s)", info["version"], CLIENT_VERSION)
+            if _UPDATE_INFO.get("prompted_version") != info["version"]:
+                _UPDATE_INFO["prompted_version"] = info["version"]
+
+                def _prompt_update():
+                    if messagebox.askyesno(
+                        "Actualización disponible",
+                        f"Hay una nueva versión de Apollo Centinela: v{info['version']}.\n\n¿Actualizar ahora?",
+                        parent=ROOT_WINDOW,
+                    ):
+                        threading.Thread(target=do_client_update, daemon=True).start()
+
+                if ROOT_WINDOW:
+                    ROOT_WINDOW.after(0, _prompt_update)
+            try:
+                if UPDATE_TRAY_MENU_CALLBACK:
+                    UPDATE_TRAY_MENU_CALLBACK([])
+            except Exception:
+                pass
+        else:
+            _UPDATE_INFO["available"] = False
+            _UPDATE_INFO["url"] = ""
+            ui_set_update(False, "")
+
+    def check_updates_once(show_idle=False):
+        if _UPDATE_INFO.get("busy"):
+            return
+        try:
+            if show_idle:
+                ui_set_update(False, "", checking=True)
+            info = fetch_remote_update()
+            apply_update_info(info)
+            if show_idle and not info:
+                ui_set_update(False, "Está en la última versión")
+                if ROOT_WINDOW:
+                    ROOT_WINDOW.after(4000, lambda: ui_set_update(False, ""))
+        except Exception as e:
+            logger.debug("[OTA] Chequeo UI fallido: %s", e)
+            if show_idle:
+                ui_set_update(False, "No se pudo consultar el servidor")
+
+    def check_for_updates_loop():
+        first = True
+        while True:
+            time.sleep(15 if first else 30 * 60)
+            first = False
+            check_updates_once(show_idle=False)
+
+    def do_client_update():
+        if _UPDATE_INFO.get("busy"):
+            return
+        info = dict(_UPDATE_INFO)
+        version = (info.get("version") or "").strip()
+        if not version:
+            try:
+                fresh = fetch_remote_update() or {}
+                apply_update_info(fresh)
+                version = (fresh.get("version") or "").strip()
+            except Exception as e:
+                logger.error("[OTA] Recheck falló: %s", e)
+        if not version:
+            ui_set_update(True, "No se pudo consultar la actualización", True)
+            return
+
+        _UPDATE_INFO["busy"] = True
+        try:
+            signal_dir = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "ApolloSupport")
+            os.makedirs(signal_dir, exist_ok=True)
+            signal_path = os.path.join(signal_dir, "force_ota.txt")
+            with open(signal_path, "w", encoding="utf-8") as signal_file:
+                json.dump({"version": version, "requested_at": time.time()}, signal_file)
+            logger.info("[OTA] Actualización v%s solicitada al servicio", version)
+            ui_set_update(True, "Actualización enviada al servicio. Se instalará en unos segundos.", False)
+        except Exception as e:
+            logger.error("[OTA] No se pudo solicitar la actualización: %s", e)
+            ui_set_update(True, "No se pudo solicitar la actualización. Reintentar.", True)
+        finally:
+            _UPDATE_INFO["busy"] = False
+
+    btn_update.config(command=lambda: threading.Thread(target=do_client_update, daemon=True).start())
+    btn_check.bind("<Button-1>", lambda _e: threading.Thread(target=lambda: check_updates_once(True), daemon=True).start())
+
     # Arrancar el Socket sin frizar la pantallita
     t = threading.Thread(target=run_background_worker, args=(lbl_status, lbl_status_detail), daemon=True)
     t.start()
+    threading.Thread(target=check_for_updates_loop, daemon=True, name="UpdateCheckerUI").start()
 
     # --- TRAY ICON LOGIC ---
     def set_enabled(icon, item):
@@ -2903,23 +4559,41 @@ def main():
         IS_ENABLED = not IS_ENABLED
         lbl_status.config(text=f"Estado: {'Habilitado' if IS_ENABLED else 'Deshabilitado por usuario'}")
 
-    def on_quit(icon, item):
-        icon.stop()
-        root.destroy()
+    def on_quit(icon=None, item=None):
+        try:
+            if tray_icon is not None:
+                tray_icon.stop()
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
 
     def show_window(icon=None, item=None):
-        root.deiconify()
-        root.state('normal')
-        root.lift()
+        try:
+            root.deiconify()
+            root.state('normal')
+            root.lift()
+            root.attributes('-topmost', True)
+            root.after(400, lambda: root.attributes('-topmost', False))
+            root.focus_force()
+        except Exception:
+            pass
 
     def minimize_to_tray():
+        # Si no hay tray, no ocultar: el usuario perdería la ventana
+        if not getattr(minimize_to_tray, '_tray_ok', False):
+            root.iconify()
+            return
         root.withdraw()
 
     # Interceptar el botón de cerrar (X) para que se minimice al tray
     root.protocol('WM_DELETE_WINDOW', minimize_to_tray)
 
-    # Interceptar la minimización estándar de Windows (-)
-    root.bind("<Configure>", lambda event: root.withdraw() if root.state() == 'iconic' else None)
+    # NO usar <Configure>+withdraw: en Server/RDP a veces dispara al arrancar
+    # y la ventana desaparece sin icono de bandeja visible.
 
     # Cargar el icono de tray PNG
     try:
@@ -2938,15 +4612,23 @@ def main():
     def update_tray_menu(techs):
         global IS_ENABLED
         try:
+            if not getattr(minimize_to_tray, '_tray_ok', False):
+                return
             menu_items = [
                 item('Abrir Soporte', show_window, default=True),
                 item('Soporte Habilitado', set_enabled, checked=lambda item: IS_ENABLED),
                 item('Chat con Técnico', lambda: open_chat_menu())
             ]
+            if _UPDATE_INFO.get("available") and not _UPDATE_INFO.get("busy"):
+                ver = _UPDATE_INFO.get("version") or ""
+                menu_items.append(item(
+                    f'Actualizar a v{ver}' if ver else 'Actualizar',
+                    lambda: threading.Thread(target=do_client_update, daemon=True).start(),
+                ))
             if techs:
                 menu_items.append(item('--- Técnicos Conectados ---', lambda: None, enabled=False))
                 for tech in techs:
-                    menu_items.append(item(f'  ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â {tech}', lambda: None, enabled=False))
+                    menu_items.append(item(f'  • {tech}', lambda: None, enabled=False))
             menu_items.append(item('Salir', on_quit))
             
             tray_icon.menu = pystray.Menu(*menu_items)
@@ -2961,21 +4643,37 @@ def main():
         global FLOATING_PANEL
         if not is_floating_panel_alive():
             if SHOW_FLOATING_PANEL_CALLBACK:
-                root.after(0, lambda: SHOW_FLOATING_PANEL_CALLBACK("TÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©cnico"))
+                root.after(0, lambda: SHOW_FLOATING_PANEL_CALLBACK("Técnico"))
         else:
             root.after(0, lambda: (FLOATING_PANEL.deiconify(), FLOATING_PANEL.lift()))
 
-    tray_icon = pystray.Icon("ApolloSupport", icon_img, "ApolloSupport: Asistencia Activa", menu=pystray.Menu(
-        item('Abrir Soporte', show_window, default=True),
-        item('Soporte Habilitado', set_enabled, checked=lambda item: IS_ENABLED),
-        item('Chat con Técnico', lambda: open_chat_menu()),
-        item('Salir', on_quit)
-    ), action=lambda icon: show_window(icon, None))
+    tray_icon = None
+    minimize_to_tray._tray_ok = False
+    try:
+        tray_icon = pystray.Icon(
+            "ApolloSupport",
+            icon_img,
+            "ApolloSupport: Asistencia Activa",
+            menu=pystray.Menu(
+                item('Abrir Soporte', show_window, default=True),
+                item('Soporte Habilitado', set_enabled, checked=lambda item: IS_ENABLED),
+                item('Chat con Técnico', lambda: open_chat_menu()),
+                item('Buscar actualizaciones', lambda: threading.Thread(target=lambda: check_updates_once(True), daemon=True).start()),
+                item('Salir', on_quit)
+            ),
+            action=lambda icon: show_window(icon, None),
+        )
+        threading.Thread(target=tray_icon.run, daemon=True, name="TrayIcon").start()
+        minimize_to_tray._tray_ok = True
+    except Exception as tray_err:
+        logger.warning("[TRAY] No se pudo crear icono de bandeja: %s — se deja la ventana visible", tray_err)
+        minimize_to_tray._tray_ok = False
     
     global UPDATE_TRAY_MENU_CALLBACK
     UPDATE_TRAY_MENU_CALLBACK = update_tray_menu
-    
-    threading.Thread(target=tray_icon.run, daemon=True).start()
+
+    # Asegurar ventana visible al arrancar (Server a veces la manda atrás)
+    root.after(200, show_window)
 
     # --- POPUP FLOTANTE CONTROLADO CON CHAT INTEGRADO ---
 
@@ -3104,12 +4802,11 @@ def main():
 
     def monitor_clipboard_changes():
         global LAST_LOCAL_CLIPBOARD
-        if IS_ENABLED:
+        if IS_ENABLED and HAS_ACTIVE_VIEWER:
             try:
                 current_clipboard = root.clipboard_get()
                 if current_clipboard and current_clipboard != LAST_LOCAL_CLIPBOARD:
                     LAST_LOCAL_CLIPBOARD = current_clipboard
-                    # Enviar el portapapeles local al servidor de forma asÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­ncrona y segura
                     send_ws_message_threadsafe({
                         "type": "clipboard_sync",
                         "text": current_clipboard
@@ -3117,7 +4814,7 @@ def main():
                     print("[CLIPBOARD] Portapapeles local del cliente sincronizado al servidor.")
             except Exception:
                 pass
-        root.after(1000, monitor_clipboard_changes)
+        root.after(1000 if HAS_ACTIVE_VIEWER else 8000, monitor_clipboard_changes)
 
     monitor_clipboard_changes()
 
@@ -3125,6 +4822,16 @@ def main():
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--inject-helper":
+        # Helper SYSTEM en la sesion del usuario (inyeccion para UAC / ventanas elevadas).
+        try:
+            run_inject_helper()
+        except Exception as _ihe:
+            try:
+                logger.error("[INJECT] Helper termino con error: %s", _ihe)
+            except Exception:
+                pass
+        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "--type-credentials":
         import os
         import json

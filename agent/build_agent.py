@@ -26,7 +26,8 @@ PyInstaller.__main__.run([
     f'--icon={os.path.join(base_dir, "apollo_logo.ico")}',  # Icono del archivo .exe
     f'--add-data={os.path.join(base_dir, "apollo_logo.ico")};.',  # Incluir icono dentro del exe
     f'--add-data={os.path.join(base_dir, "apollo_logo.png")};.',  # Incluir imagen PNG dentro del exe
-    f'--add-data={os.path.join(base_dir, "ffmpeg.exe")};.',     # Incluir motor de video FFmpeg
+    '--hidden-import=dxgi_capture',
+    '--noupx',
 ])
 
 print(f"[+] Compilación completada con éxito. El ejecutable se encuentra en: {output_dir}")

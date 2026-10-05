@@ -1,0 +1,18 @@
+ACTUALIZAR SERVIDOR — Centinela 3.3.11 (fix ventana / headless)
+==============================================================
+Copia desde Y:\ApolloSupport\backend\updates\ hacia
+C:\ApolloSupport\backend\updates\ :
+
+  - version.json
+  - ApolloSetup.exe
+  - ApolloSetup_x64.exe
+
+Luego:
+  nssm restart ApolloBackend
+
+Verificar:
+  https://support.ultimate.net.ar/api/centinela/update_check
+  debe devolver "version": "3.3.11"
+
+Cliente: bajar/actualizar desde la pagina, UAC Si, y debe abrir
+sola la ventana ApolloSoporte con el ID (sin taskkill).

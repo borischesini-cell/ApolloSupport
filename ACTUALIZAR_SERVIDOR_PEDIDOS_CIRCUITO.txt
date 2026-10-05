@@ -1,0 +1,115 @@
+ApolloSupport — Instrucciones para agente Cursor (SERVIDOR DE PRODUCCIÓN)
+Asunto: Circuito de pedidos (resuelto → entregado → histórico) + botón Cerrar visible
+Fecha: 2026-09-20
+Build portal: 3.2.6 / 2026-09-20-ae
+Máquina: servidor Support (Apache + ApolloBackend + PostgreSQL 192.168.11.223)
+
+================================================================================
+CONTEXTO
+================================================================================
+Puente de archivos (origen):
+  \\192.168.11.20\Puente\ApolloSupport
+  (o Y:\ApolloSupport si está mapeado)
+
+Destino en ESTE servidor:
+  Backend:   C:\ApolloSupport\backend\
+  Frontend:  C:\Apache24\htdocs\apollosupport\
+  Servicio:  ApolloBackend  (uvicorn puerto 127.0.0.1:8001, proxy Apache /api)
+  OTA agente: C:\ApolloSupport\backend\updates\   (opcional en este deploy)
+
+Qué incluye este paquete:
+  1) Pedidos / tickets
+     - Fix 422 al grabar intervención (ticket_id opcional en body)
+     - PATCH /api/tickets/{id}/status  (nuevo|en_curso|resuelto|bloqueado|entregado)
+     - Al marcar RESUELTO desde Programación: vuelve a Atención al Cliente
+     - Al marcar ENTREGADO: sale de bandeja activa → histórico
+     - GET /api/tickets/?vista=activa|historico|todas
+  2) Portal
+     - Botón "Cerrar" bien visible (arriba) + "Cerrar ventana" (abajo)
+     - Cerrar con Esc o clic en el fondo oscuro
+     - Botones "Marcar resuelto" / "Dar por entregado"
+     - Toggle Activos / Histórico en la bandeja
+  3) Centinela OTA (si también copiás updates/)
+     - version.json = 3.3.7
+     - ApolloSetup.exe / ApolloSetup_x64.exe con fix OTA (UAC + paro de servicio)
+
+NO requiere migración de base de datos (usa columna estado existente + valor nuevo "entregado").
+
+================================================================================
+TAREA PARA EL AGENTE CURSOR — EJECUTAR EN ORDEN
+================================================================================
+
+1) COPIAR DESDE EL PUENTE
+
+   $puente = "\\192.168.11.20\Puente\ApolloSupport"
+   if (-not (Test-Path $puente)) { $puente = "Y:\ApolloSupport" }
+   if (-not (Test-Path $puente)) { throw "No se encuentra el puente ApolloSupport" }
+
+   # Backend
+   Copy-Item "$puente\backend\main.py"    "C:\ApolloSupport\backend\main.py" -Force
+   Copy-Item "$puente\backend\schemas.py" "C:\ApolloSupport\backend\schemas.py" -Force
+
+   # Frontend compilado (MIR = espejo completo del dist)
+   robocopy "$puente\frontend\dist" "C:\Apache24\htdocs\apollosupport" /MIR /R:2 /W:3
+   # robocopy exit 0-7 = OK
+
+   # Opcional — OTA Centinela 3.3.7 (solo si querés publicar el instalador nuevo)
+   New-Item -ItemType Directory -Force -Path "C:\ApolloSupport\backend\updates" | Out-Null
+   Copy-Item "$puente\backend\updates\version.json"      "C:\ApolloSupport\backend\updates\version.json" -Force
+   Copy-Item "$puente\backend\updates\ApolloSetup.exe"   "C:\ApolloSupport\backend\updates\ApolloSetup.exe" -Force
+   Copy-Item "$puente\backend\updates\ApolloSetup_x64.exe" "C:\ApolloSupport\backend\updates\ApolloSetup_x64.exe" -Force
+
+2) REINICIAR BACKEND
+
+   nssm restart ApolloBackend
+   # Si nssm no está en PATH:
+   #   C:\ApolloSupport\backend\venv\Scripts\nssm.exe restart ApolloBackend
+   # Alternativa:
+   #   Restart-Service ApolloBackend -Force
+   #   sc stop ApolloBackend && timeout /t 3 && sc start ApolloBackend
+
+3) VERIFICAR
+
+   sc query ApolloBackend
+   # STATE debe ser RUNNING
+
+   curl.exe -s http://127.0.0.1:8001/docs -o NUL -w "backend_http=%{http_code}`n"
+   # Esperado: 200
+
+   type C:\Apache24\htdocs\apollosupport\version.txt
+   # Debe mostrar:
+   #   version=3.2.6
+   #   build=2026-09-20-ae
+   #   sw=/sw-v3.2.6.js
+
+   # Opcional OTA:
+   curl.exe -s http://127.0.0.1:8001/api/centinela/update_check
+   # Si copiaste updates/: version "3.3.7"
+
+4) NO TOCAR EN ESTE SERVIDOR (salvo pedido explícito)
+
+   - No modificar .env ni credenciales DB
+   - No hacer commit git
+   - No reinstalar Centinela en este servidor (eso es en PCs cliente)
+
+================================================================================
+PRUEBA POST-DEPLOY (manual en navegador)
+================================================================================
+  https://support.ultimate.net.ar  → Ctrl+F5 (importante por Service Worker)
+
+  Pedidos:
+  [ ] Abrir un pedido → se ve botón rojo "Cerrar" arriba a la derecha
+  [ ] Esc o clic fuera del modal también cierra
+  [ ] "Marcar resuelto" → estado resuelto (y vuelve a Atención si estaba en Programación)
+  [ ] "Dar por entregado" → desaparece de Activos
+  [ ] Toggle "Histórico" → aparece el pedido entregado
+  [ ] Grabar intervención con comentario → NO debe dar 422
+
+================================================================================
+CHECKLIST
+================================================================================
+[ ] main.py + schemas.py copiados
+[ ] frontend/dist espejado a htdocs (version.txt = 2026-09-20-ae)
+[ ] ApolloBackend reiniciado y RUNNING
+[ ] Portal Ctrl+F5 — botón Cerrar visible
+[ ] (Opcional) OTA 3.3.7 publicado en /api/centinela/update_check

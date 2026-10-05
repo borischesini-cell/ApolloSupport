@@ -1,0 +1,34 @@
+ApolloSupport / Centinela v3.2.8
+Fecha: 2026-09-15
+Paquete puente: Y:\ApolloSupport
+
+ESTA ENTREGA ES DEL AGENTE CENTINELA.
+Hay que instalar el setup nuevo (o dejar que OTA lo tome desde updates).
+
+
+QUE HAY DE NUEVO
+================
+
+CPU idle: cuando no hay tecnico mirando, el agente pausa captura de
+pantalla, clipboard nativo/Tk y HQ. Evita el consumo alto de CPU
+con el companion desconectado o sin sesion activa.
+
+- HAS_ACTIVE_VIEWER / VIEWER_IDLE_TIMEOUT (30s)
+- refresh_frame ya no deja la captura continua encendida
+- Telemetria y clipboard duermen si no hay viewer
+
+
+ARCHIVOS EN EL PUENTE
+=====================
+
+- agent\dist\                    companion + service x86/x64
+- agent\installer_output\        ApolloSetup_v3.2.8*.exe
+- backend\updates\               ApolloSetup.exe / _x64 / _x86 + version.json
+
+
+EN PRODUCCION
+=============
+
+1. Copiar backend\updates\ al servidor (version.json + los 3 setup)
+2. Reiniciar ApolloBackend para que sirva 3.2.8 por OTA
+3. PCs cliente: instalar ApolloSetup (o esperar OTA)

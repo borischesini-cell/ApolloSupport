@@ -4,7 +4,8 @@ title Apollo Centinela Builder (x86 and x64)
 
 :: ============================================================
 :: Apollo Centinela - Build dual + instaladores Inno Setup
-:: ffmpeg.exe NO se embebe (193 MB); el instalador lo copia a {app}
+:: ffmpeg.exe NO se embebe; el instalador lo copia a {app} (essentials, no full)
+:: El instalador unificado es solo x64. x86: ApolloSetup_x86.iss
 :: ============================================================
 
 set "AGENT_DIR=%~dp0"
@@ -57,6 +58,11 @@ echo ============================================================
 if %ERRORLEVEL% NEQ 0 goto :pip_fail
 "%PYTHON_64%" -m pip install -q pyinstaller websockets pyautogui "psutil<6.0.0" pillow pystray requests mss
 if %ERRORLEVEL% NEQ 0 goto :pip_fail
+echo WebRTC (solo x64, aiortc 1.9 para Python 3.8)...
+"%PYTHON_64%" -m pip install -q -r "%AGENT_DIR%requirements-webrtc.txt"
+if %ERRORLEVEL% NEQ 0 (
+    echo [WARN] aiortc no se instalo. El companion x64 compilara sin Canal rapido.
+)
 
 echo.
 echo ============================================================

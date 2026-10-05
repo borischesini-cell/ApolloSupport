@@ -1,9 +1,8 @@
 """
 Mantiene CLIGESCO.DBF de GesActi en alta, modificación y baja lógica.
 
-La tabla viva está en M:\programa\ (junto a MODULOS, CLIESERI, etc.).
-Otras copias (bases, Util_Activacion) no se tocan salvo que se listen en
-CLIGESCO_DBF_EXTRA.
+La tabla viva está en \\192.168.10.24\X\programa\ (M: en PCs con la unidad mapeada).
+Producción entra por UNC/IP, sin mapear M:.
 """
 from __future__ import annotations
 
@@ -13,10 +12,16 @@ from typing import Any
 
 import dbf
 
+# M: == \\192.168.10.24\X
+LIVE_CLIGESCO_UNC = os.getenv(
+    "CLIGESCO_DBF_UNC",
+    r"\\192.168.10.24\X\programa\CLIGESCO.DBF",
+).strip()
 LIVE_CLIGESCO = r"m:\programa\CLIGESCO.DBF"
 
 DEFAULT_PATHS = [
     os.getenv("CLIGESCO_DBF", "").strip(),
+    LIVE_CLIGESCO_UNC,
     LIVE_CLIGESCO,
 ]
 
@@ -39,10 +44,14 @@ def cligesco_paths() -> list[str]:
 
 
 def primary_cligesco_path() -> str | None:
-    """Tabla en uso real: M:\\programa\\CLIGESCO.DBF."""
-    live = os.path.abspath(os.getenv("CLIGESCO_DBF", "").strip() or LIVE_CLIGESCO)
-    if os.path.isfile(live):
-        return live
+    """Tabla viva: UNC \\192.168.10.24\\X\\programa o M:\\programa si está mapeada."""
+    env = os.getenv("CLIGESCO_DBF", "").strip()
+    for raw in (env, LIVE_CLIGESCO_UNC, LIVE_CLIGESCO):
+        if not raw:
+            continue
+        path = os.path.abspath(raw)
+        if os.path.isfile(path):
+            return path
     paths = cligesco_paths()
     return paths[0] if paths else None
 
@@ -113,8 +122,8 @@ def upsert_client(payload: dict, *, create: bool = False) -> dict:
     paths = cligesco_paths()
     if not paths:
         raise FileNotFoundError(
-            "No se encontró CLIGESCO.DBF en M:\\programa\\. "
-            "Definí CLIGESCO_DBF si está en otra ruta."
+            "No se encontró CLIGESCO.DBF en \\\\192.168.10.24\\X\\programa\\ "
+            "(ni en M:\\programa). Definí CLIGESCO_DBF o CLIGESCO_DBF_UNC."
         )
 
     razon = _clip(payload.get("razon_social"), 50)
@@ -241,6 +250,74 @@ def set_activo(codigo: str, activo: bool) -> dict:
     if not written:
         raise OSError("No se pudo actualizar CACTI en CLIGESCO.DBF (" + "; ".join(errors) + ")")
     return {"codigo": codigo, "activo": bool(activo), "written": written, "errors": errors}
+
+
+def _rec_str(rec, field: str) -> str:
+    try:
+        return str(getattr(rec, field, None) or "").replace("\x00", "").strip()
+    except Exception:
+        return ""
+
+
+def search_clients(query: str, limit: int = 80) -> list[dict]:
+    """Busca en CLIGESCO.DBF por código, CCLIFAC o razón social."""
+    raw = (query or "").strip()
+    if len(raw) < 2:
+        return []
+    term = raw.lower()
+    digits = "".join(ch for ch in raw if ch.isdigit()).lstrip("0") or ""
+    hits: list[dict] = []
+    seen: set[str] = set()
+    path = primary_cligesco_path()
+    if not path:
+        return []
+    table = None
+    try:
+        table = dbf.Table(path, codepage="cp1252")
+        table.open(mode=dbf.READ_ONLY)
+        for rec in table:
+            if len(hits) >= limit:
+                break
+            if dbf.is_deleted(rec):
+                continue
+            codigo = _rec_str(rec, "CCOD").upper()
+            if not codigo or codigo in seen:
+                continue
+            razon = _rec_str(rec, "CRASO") or _rec_str(rec, "CDES")
+            fantasia = _rec_str(rec, "CDES")
+            cclifac = _rec_str(rec, "CCLIFAC")
+            hay = f"{codigo} {razon} {fantasia} {cclifac}".lower()
+            cod_d = "".join(ch for ch in codigo if ch.isdigit()).lstrip("0")
+            fac_d = "".join(ch for ch in cclifac if ch.isdigit()).lstrip("0")
+            matched = term in hay
+            if digits and (digits == cod_d or digits == fac_d or fac_d.endswith(digits) or cod_d.endswith(digits)):
+                matched = True
+            if not matched:
+                continue
+            seen.add(codigo)
+            cacti = True
+            try:
+                val = rec.CACTI
+                if val is not None:
+                    cacti = bool(val)
+            except Exception:
+                cacti = True
+            hits.append({
+                "codigo": codigo,
+                "razon_social": razon or f"Cliente {codigo}",
+                "nombre_fantasia": fantasia or None,
+                "cclifac": cclifac or None,
+                "activo": cacti,
+            })
+    except Exception:
+        return hits
+    finally:
+        if table is not None:
+            try:
+                table.close()
+            except Exception:
+                pass
+    return hits
 
 
 def code_exists(codigo: str) -> bool:

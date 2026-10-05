@@ -258,12 +258,27 @@ export class H264WebCodecsPlayer {
         },
       });
 
-      this.decoder.configure({
-        codec,
-        description,
-        optimizeForLatency: true,
-        hardwareAcceleration: 'prefer-hardware',
-      });
+      const configs: VideoDecoderConfig[] = [
+        { codec, description, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' },
+        { codec, description, optimizeForLatency: true, hardwareAcceleration: 'no-preference' },
+        { codec, description, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' },
+        { codec, description },
+      ];
+
+      let lastErr: unknown = null;
+      let ok = false;
+      for (const cfg of configs) {
+        try {
+          this.decoder.configure(cfg);
+          ok = true;
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (!ok) {
+        throw lastErr || new Error('VideoDecoder.configure failed');
+      }
       this.configured = true;
       this.gotKeyframe = false;
       this.timestampUs = 0;

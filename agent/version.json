@@ -1,0 +1,4 @@
+{
+    "version": "3.3.22",
+    "notes": "Helper SYSTEM de inyección para UAC y ventanas elevadas, con monitor de servicio y reemplazo confiable de binarios."
+}

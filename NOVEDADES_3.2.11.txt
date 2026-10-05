@@ -1,0 +1,31 @@
+ApolloSupport — Portal 3.2.11 + Centinela 3.3.17
+Fecha: 21/09/2026
+
+PANEL VISOR
+===========
+- Se eliminó la barra flotante de íconos sueltos.
+- Herramientas, consola y «Enviar archivos» quedan dentro del panel derecho.
+- Aviso de último acceso más compacto (izquierda).
+
+COPIAR / PEGAR ARCHIVOS (prioridad)
+===================================
+Causa típica del fallo: el monitor del portapapeles competía con el pegado
+y faltaba «Preferred DropEffect» (Explorer/TC no pegan solo con CF_HDROP).
+
+En Centinela 3.3.17:
+- CF_HDROP + Preferred DropEffect = COPY
+- Lock global OpenClipboard (sin carreras)
+- Hold ~14s: el monitor no pisa ni re-sube ApolloInbox
+- Reintentos + verificación antes/después de Ctrl+V
+
+En portal/backend:
+- Ctrl+C remoto reintenta bajar archivos hasta 7s
+- Upload clipboard más tolerante a timeouts
+- Botón «Enviar archivos al cliente» + drag & drop a la pantalla
+
+DESPLIEGUE
+==========
+1) Portal: copiar frontend\dist → htdocs (version.txt = 3.2.11)
+2) Backend: main.py + reiniciar ApolloBackend
+3) Centinela: OTA 3.3.17 (ApolloSetup + version.json en backend\updates)
+   Sin actualizar el agente, el pegado de archivos sigue inestable.

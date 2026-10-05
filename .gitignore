@@ -1,5 +1,6 @@
 # Binaries and large files
 ffmpeg.exe
+ffmpeg_full.bak.exe
 *.zip
 *.exe
 *.spec

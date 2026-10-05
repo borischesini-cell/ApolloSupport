@@ -1,0 +1,28 @@
+ApolloSupport / Centinela v3.2.9
+Fecha: 2026-09-16
+Paquete puente: Y:\ApolloSupport
+
+ESTA ENTREGA ES DEL AGENTE CENTINELA.
+Instalar el setup nuevo o usar el boton Actualizar del companion
+(en PCs que ya tengan 3.2.9+). Quienes siguen en 3.2.6/3.2.8
+actualizan por OTA del servicio o instalando el setup.
+
+
+QUE HAY DE NUEVO
+================
+
+1) Companion: detecta version nueva en el servidor y muestra
+   "Hay una version nueva" + boton Actualizar ahora.
+   Tambien: enlace Buscar actualizaciones y item en el tray.
+
+2) CPU idle (3.2.8): pausa captura, clipboard y HQ si no hay
+   tecnico mirando.
+
+
+ARCHIVOS
+========
+
+- agent\dist\                    companion + service x86/x64
+- agent\installer_output\        ApolloSetup_v3.2.9*.exe
+- backend\updates\               ApolloSetup.exe / _x64 / _x86 + version.json
+- C:\ApolloSupport\backend\updates\   produccion OTA

@@ -31,7 +31,8 @@ def run_migration():
                 areas = [
                     ("Atención al Cliente", "Soporte primario y contacto con el usuario."),
                     ("Desarrollo", "Programación, corrección de bugs y nuevas features."),
-                    ("Finanzas", "Cobros, facturación y validación de pagos.")
+                    ("Finanzas", "Cobros, facturación y validación de pagos."),
+                    ("Caja", "Caja y tesorería.")
                 ]
                 for nombre, desc in areas:
                     cur.execute("SELECT id FROM areas WHERE nombre = %s", (nombre,))

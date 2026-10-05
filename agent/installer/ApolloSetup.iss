@@ -26,7 +26,7 @@
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.2.6"
+#define MyAppVersion   "3.3.36"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"
@@ -43,7 +43,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={commonpf32}\Apollo Centinela
+DefaultDirName={commonpf}\Apollo Centinela
 DefaultGroupName=Apollo Centinela
 DisableProgramGroupPage=yes
 OutputDir=..\installer_output
@@ -52,13 +52,13 @@ SetupIconFile=..\apollo_logo.ico
 WizardImageFile=wizard_banner.bmp
 WizardSmallImageFile=wizard_icon.bmp
 WizardStyle=modern
-Compression=lzma2/ultra64
-SolidCompression=yes
+Compression=lzma2/max
+SolidCompression=no
 PrivilegesRequired=admin
 MinVersion=6.1
 CloseApplications=force
 CloseApplicationsFilter=ApolloCentinela.exe,ApolloCentinelaService.exe,Apollo_Centinela.exe,ApolloGesComBeta.exe,ApolloGesCom.exe,ApolloSoporte.exe
-ArchitecturesAllowed=x86compatible x64compatible
+ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 UninstallDisplayIcon={app}\{#ServiceExe}
 UninstallDisplayName={#MyAppName} v{#MyAppVersion}
@@ -81,13 +81,9 @@ english.StartingSvc=Starting Windows service...
 english.Done=Installation complete. The agent is online.
 
 [Files]
-; Servicio (Session 0 - siempre activo)
-Source: "..\dist\ApolloCentinelaService_x64.exe"; DestDir: "{app}"; DestName: "{#ServiceExe}"; Check: Is64BitInstallMode; Flags: ignoreversion
-Source: "..\dist\ApolloCentinelaService_x86.exe"; DestDir: "{app}"; DestName: "{#ServiceExe}"; Check: not Is64BitInstallMode; Flags: ignoreversion
-
-; Companion UI (lanzado por el servicio en sesion del usuario)
-Source: "..\dist\ApolloCentinela_x64.exe"; DestDir: "{app}"; DestName: "{#CompanionExe}"; Check: Is64BitInstallMode; Flags: ignoreversion
-Source: "..\dist\ApolloCentinela_x86.exe"; DestDir: "{app}"; DestName: "{#CompanionExe}"; Check: not Is64BitInstallMode; Flags: ignoreversion
+; Servicio + companion x64 (el instalador unificado ya no embebe x86; usar ApolloSetup_*_x86.iss)
+Source: "..\dist\ApolloCentinelaService_x64.exe"; DestDir: "{app}"; DestName: "{#ServiceExe}"; Flags: ignoreversion
+Source: "..\dist\ApolloCentinela_x64.exe"; DestDir: "{app}"; DestName: "{#CompanionExe}"; Flags: ignoreversion
 
 ; Iconos y recursos
 Source: "..\apollo_logo.ico";      DestDir: "{app}"; Flags: ignoreversion
@@ -96,10 +92,10 @@ Source: "..\apollo_logo.png";      DestDir: "{app}"; Flags: ignoreversion
 ; DLLs de Visual C++ Runtime ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â incluidas directamente para compatibilidad
 
 ; Visual C++ 2015-2022 Redistributable ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â instala Universal CRT
-Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Check: Is64BitInstallMode; Flags: ignoreversion deleteafterinstall
+Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 
 ; ffmpeg.exe ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â necesario para el modo Alto Rendimiento (H.264 MSE).
-Source: "..\ffmpeg.exe";           DestDir: "{app}"; Flags: ignoreversion
+Source: "..\ffmpeg.exe";           DestDir: "{app}"; Flags: ignoreversion nocompression
 
 [Dirs]
 Name: "{commonappdata}\ApolloSupport"; Permissions: everyone-modify
@@ -126,18 +122,14 @@ Filename: "{sys}\sc.exe"; Parameters: "config ""{#ServiceName}"" start= auto"; F
 Filename: "{sys}\sc.exe"; Parameters: "failure ""{#ServiceName}"" reset= 86400 actions= restart/5000/restart/10000/restart/30000"; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "description ""{#ServiceName}"" ""Agente Apollo Centinela - Master IS. Mantiene la conexion con el servidor de soporte 24/7."""; Flags: runhidden waituntilterminated
 
-; 2. Iniciar el servicio (lanza companion en consola / sesion del usuario)
-Filename: "{sys}\sc.exe"; Parameters: "start ""{#ServiceName}"""; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StartingSvc}"
-
-; 3. Esperar al monitor del servicio + lanzar UI visible (mutex evita duplicado)
-Filename: "{sys}\cmd.exe"; Parameters: "/c timeout /t 8 /nobreak"; Flags: runhidden waituntilterminated; StatusMsg: "Iniciando agente..."
-Filename: "{app}\{#CompanionExe}"; Description: "Iniciar Apollo Centinela"; Flags: nowait postinstall skipifsilent runascurrentuser; StatusMsg: "Iniciando agente..."
+; 2. Servicio sin esperar + companion visible (upgrade web/OTA automatico)
+Filename: "{sys}\cmd.exe"; Parameters: "/c sc start ""{#ServiceName}"" >nul 2>&1 & for /L %I in (1,1,15) do @(sc query ""{#ServiceName}"" | findstr /I ""RUNNING"" >nul && exit /b 0 & timeout /t 1 /nobreak >nul) & exit /b 0"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StartingSvc}"
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM ""{#CompanionExe}""";  Flags: runhidden waituntilterminated; RunOnceId: "KillCompanion"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM ""{#ServiceExe}""";    Flags: runhidden waituntilterminated; RunOnceId: "KillService"
 Filename: "{sys}\sc.exe";       Parameters: "stop ""{#ServiceName}""";     Flags: runhidden waituntilterminated; RunOnceId: "StopSvc"
-Filename: "{sys}\cmd.exe";      Parameters: "/c timeout /t 3 /nobreak";    Flags: runhidden waituntilterminated; RunOnceId: "Wait"
+Filename: "{sys}\cmd.exe";      Parameters: "/c timeout /t 1 /nobreak";    Flags: runhidden waituntilterminated; RunOnceId: "Wait"
 Filename: "{sys}\sc.exe";       Parameters: "delete ""{#ServiceName}""";   Flags: runhidden waituntilterminated; RunOnceId: "DeleteSvc"
 
 
@@ -153,15 +145,13 @@ function VCRedistNeedsInstall(): Boolean;
 var
   sVersion: String;
 begin
-  // Verificar si VC++ 2015-2022 Redist x64 ya estÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ instalado (v14.x)
   if RegQueryStringValue(HKLM,
     'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
     'Version', sVersion) then
-  begin
-    // Ya instalado ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â saltar
-    Result := False;
-  end else begin
-    Result := True;  // No instalado ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â instalar
-  end;
+    Result := False
+  else if FileExists(ExpandConstant('{sys}\vcruntime140.dll')) then
+    Result := False
+  else
+    Result := True;
 end;
 

@@ -1,29 +1,27 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Ticket, Users, Settings, Bell, Search, Moon, Sun, Monitor, MessageSquare, X, LogOut, ArrowUpRight, Sparkles, FileText, Clipboard, Plus, Folder, Trash2, Menu, DollarSign, CheckCircle2, AlertCircle, Activity, UserPlus, Shield, Phone, MapPin, Mail, Lock, Key, Camera, Edit2, Maximize2, Minimize, Terminal, Smartphone, Power, Clock, CalendarDays, Unlock, RefreshCw, Video } from 'lucide-react';
+import { Ticket, Users, Settings, Bell, Search, Moon, Sun, Monitor, MessageSquare, X, LogOut, ArrowUpRight, Sparkles, FileText, Clipboard, Plus, Folder, Trash2, Menu, DollarSign, CheckCircle2, AlertCircle, Activity, UserPlus, Shield, Phone, MapPin, Mail, Lock, Key, Camera, Edit2, Maximize2, Minimize, Terminal, Smartphone, Power, Clock, CalendarDays, Unlock, RefreshCw, Video, CreditCard, Paperclip } from 'lucide-react';
 import {
-  API_URL, getTickets, getClients, createTicket, createClient, updateClient,
+  API_URL, getTickets, getClients, createTicket, updateTicket, assignTicket, updateTicketStatus, createClient, updateClient,
   toggleClientStatus, getActiveCentinelas, forceCentinelaUpdate, releaseCentinelaSession, forceCentinelaRefresh,
   fetchAiAnalysis, getCentinelaFrame, fetchWindowsSessions,
   getCentinelaAlerts, runCentinelaCommand, sendCentinelaControl, getAreas,
-  addIntervention, uploadFile, deleteCentinelaDevice, getCentinelaClipboard,
-  syncClientsFromDbf, updateCentinelaDeviceNotes, getPendingCentinelas, assignCentinelaLicense,
+  addIntervention, uploadFile, deleteCentinelaDevice, getCentinelaClipboard, pasteFilesToCentinela, getWebRtcIceServers,
+  syncSaldosFromErp, updateCentinelaDeviceNotes, importTeamviewerCsv, getPendingCentinelas, assignCentinelaLicense,
   getUsers, createUser, updateUser, toggleUserStatus, updateUserStatus, logoutUser,
-  getClientBalance, getClientExtracto, viewVoucherPdf, getClientLicFacturadas,
+  getClientBalance, getClientExtracto, viewVoucherPdf, getClientLicFacturadas, getClientCbus,
   getActivationRequests, resolveActivationRequest, getPendingExtensions, approveExtension,
   getEstadosCuentaCorriente, createEstadoCuentaCorriente, updateEstadoCuentaCorriente,
   deleteEstadoCuentaCorriente, syncEstadosCuentaCorrienteFromErp,
   useViewerWebSocket, type ConnectionQuality, useHqViewerWebSocket,
   REMOTE_STREAM_WORKABLE_FPS, REMOTE_STREAM_COMFORTABLE_FPS, connectionQualityFromFps,
   getCentinelaLogs, clearCentinelaLogs, toggleAndroidDevice,
+  getResellers, createReseller, updateReseller, deleteReseller,
 } from './api';
 import Login from './Login';
+import CentinelaPublicPage from './CentinelaPublicPage';
 import AgendaPanel from './AgendaPanel';
-// @ts-ignore
-import JMuxer from 'jmuxer';
-import { H264WebCodecsPlayer, isWebCodecsH264Supported } from './h264WebCodecs';
+import ClientSearchSelect from './ClientSearchSelect';
 import { APP_VERSION, APP_BUILD, APP_VERSION_TAG, APP_VERSION_LABEL } from './version';
-
-const WEBCODECS_H264 = isWebCodecsH264Supported();
 
 const triggerPushNotification = (title: string, body: string, url: string = '/') => {
   if ('Notification' in window && Notification.permission === 'granted') {
@@ -68,6 +66,64 @@ const stripRtf = (rtf: string): string => {
   // Strip any remaining curly braces
   text = text.replace(/{|}/g, "");
   return text.trim();
+};
+
+const ACTIVIDADES = [
+  { key: 'Atención al Cliente', label: 'Atención al Cliente' },
+  { key: 'Desarrollo', label: 'Desarrollo' },
+  { key: 'Finanzas', label: 'Finanzas' },
+  { key: 'Caja', label: 'Caja' },
+] as const;
+
+const userActivities = (u: any): string[] => {
+  if (u?.departamento) {
+    const names: string[] = [];
+    for (const part of String(u.departamento).replace(/,/g, '/').split('/')) {
+      const name = part.trim();
+      if (name && !names.includes(name)) names.push(name);
+    }
+    if (names.length) return names;
+  }
+  const fromAreas: string[] = [];
+  for (const area of u?.areas || []) {
+    if (area?.nombre && !fromAreas.includes(area.nombre)) fromAreas.push(area.nombre);
+  }
+  return fromAreas;
+};
+
+const userInActivity = (u: any, name: string) =>
+  userActivities(u).some((n) => n.toLowerCase() === name.toLowerCase());
+
+const userInDesarrollo = (u: any) =>
+  userInActivity(u, 'Desarrollo')
+  || /desarroll|program/i.test(`${u?.rol || ''} ${userActivities(u).join(' ')} ${u?.departamento || ''}`);
+
+const attachmentHref = (url?: string | null) => {
+  if (!url) return '#';
+  if (/^https?:\/\//i.test(url)) return url;
+  const origin = API_URL.replace(/\/api\/?$/, '');
+  return url.startsWith('/') ? `${origin}${url}` : `${origin}/api/temp/uploads/${url}`;
+};
+
+const attachmentDisplayName = (url?: string | null, fallback?: string) => {
+  if (fallback) return fallback;
+  if (!url) return 'archivo';
+  const raw = decodeURIComponent(url.split('/').pop() || 'archivo');
+  return raw.replace(/^\d+(\.\d+)?_/, '');
+};
+
+const adjuntoTipoFromFile = (file: File) => {
+  if (file.type.startsWith('image/')) return 'imagen';
+  if (file.type.startsWith('audio/')) return 'audio';
+  if (file.type.startsWith('video/')) return 'video';
+  return 'documento';
+};
+
+const activityBadgeClass = (name: string) => {
+  if (/desarroll|program/i.test(name)) return 'border-violet-500/30 text-violet-400 bg-violet-500/5';
+  if (/atenci/i.test(name)) return 'border-sky-500/30 text-sky-400 bg-sky-500/5';
+  if (/caja/i.test(name)) return 'border-emerald-500/30 text-emerald-400 bg-emerald-500/5';
+  return 'border-teal-500/30 text-teal-400 bg-teal-500/5';
 };
 
 const formatFechaLocal = (raw?: string | null) => {
@@ -314,6 +370,18 @@ function androidDeviceIdentityLines(dev: any): { label: string; value: string; m
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('token'));
+  const [showCentinelaPublic, setShowCentinelaPublic] = useState(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      return (
+        params.get('centinela') === '1' ||
+        params.get('page') === 'centinela' ||
+        window.location.hash.replace(/^#/, '') === 'centinela'
+      );
+    } catch {
+      return false;
+    }
+  });
   const [userProfile, setUserProfile] = useState<any>(null);
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -354,12 +422,12 @@ export default function App() {
   const [pendingDevices, setPendingDevices] = useState<any[]>([]);
   const [assignModal, setAssignModal] = useState<any | null>(null);
   const [assignClientId, setAssignClientId] = useState<string>("");
-  const [assignSearchText, setAssignSearchText] = useState<string>("");
-  const [showAssignDropdown, setShowAssignDropdown] = useState<boolean>(false);
 
   const [tickets, setTickets] = useState<any[]>([]);
   const [clients, setClients] = useState<any[]>([]);
   const [centinelas, setCentinelas] = useState<any>({});
+  const centinelasRef = useRef(centinelas);
+  centinelasRef.current = centinelas;
   const [loading, setLoading] = useState(true);
 
   // Estados Modal Crear
@@ -367,8 +435,18 @@ export default function App() {
   const [newClientId, setNewClientId] = useState("");
   const [newSubject, setNewSubject] = useState("");
   const [newDesc, setNewDesc] = useState("");
-  const [newPriority] = useState("media");
+  const [newPriority, setNewPriority] = useState("media");
+  const [newOrigen, setNewOrigen] = useState<"cliente" | "interno">("cliente");
+  const [newAssigneeId, setNewAssigneeId] = useState("");
+  const [newPedidoFiles, setNewPedidoFiles] = useState<File[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isEditingTicket, setIsEditingTicket] = useState(false);
+  const [editSubject, setEditSubject] = useState("");
+  const [editDesc, setEditDesc] = useState("");
+  const [editPriority, setEditPriority] = useState("media");
+  const [editOrigen, setEditOrigen] = useState<"cliente" | "interno">("cliente");
+  const [editClientId, setEditClientId] = useState("");
+  const [isSavingTicketEdit, setIsSavingTicketEdit] = useState(false);
 
   // Estados Clientes
   const [isClientModalOpen, setIsClientModalOpen] = useState(false);
@@ -513,6 +591,13 @@ export default function App() {
     loading: boolean;
   }>({ isOpen: false, client: null, items: [], loading: false });
 
+  const [cbuModal, setCbuModal] = useState<{
+    isOpen: boolean;
+    client: any;
+    items: any[];
+    loading: boolean;
+  }>({ isOpen: false, client: null, items: [], loading: false });
+
   // Activaciones pendientes / Extensiones OnLine
   const [actiRequests, setActiRequests] = useState<any[]>([]);
   const [actiRequestsLoading, setActiRequestsLoading] = useState(false);
@@ -579,6 +664,21 @@ export default function App() {
       showToast(e.message || 'No se pudo cambiar el estado del dispositivo.', 'error', 8000);
     } finally {
       setAndroidToggleBusy(false);
+    }
+  };
+
+  const handleOpenCbus = async (client: any) => {
+    if (!client?.cclifac && !client?.codigo) {
+      showToast('Este cliente no tiene código ERP para buscar CBU.', 'warning');
+      return;
+    }
+    setCbuModal({ isOpen: true, client, items: [], loading: true });
+    try {
+      const res = await getClientCbus(client.id);
+      setCbuModal(prev => ({ ...prev, items: res.items || [], loading: false }));
+    } catch (e: any) {
+      setCbuModal(prev => ({ ...prev, loading: false }));
+      alert(e.message || 'Error al consultar CBU');
     }
   };
 
@@ -1281,6 +1381,7 @@ export default function App() {
     cclifac: '',
     fecha_ultimo_pago: '',
     activo: true,
+    reseller_id: null as number | null,
   });
 
   useEffect(() => {
@@ -1324,6 +1425,8 @@ export default function App() {
   const [sessionChats, setSessionChats] = useState<Record<string, any[]>>({});
   const [chatVisibility, setChatVisibility] = useState<Record<string, boolean>>({});
   const [remoteClipboard, setRemoteClipboard] = useState<string>("");
+  const lastRemoteClipFilesRef = useRef('');
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [isControlEnabled, setIsControlEnabled] = useState<boolean>(true);
   const [isCapsLockActive, setIsCapsLockActive] = useState<boolean>(false);
   const [focusedSessionId, setFocusedSessionId] = useState<number | null>(null);
@@ -1442,11 +1545,17 @@ export default function App() {
   const rafIdRef         = useRef<number | null>(null);
   const hqStreamOnCanvasRef = useRef(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const jmuxerRef = useRef<any>(null);
-  const webCodecsPlayerRef = useRef<H264WebCodecsPlayer | null>(null);
+  const webrtcVideoRef = useRef<HTMLVideoElement | null>(null);
+  const webrtcPcRef = useRef<RTCPeerConnection | null>(null);
+  const webrtcPendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+  const [webrtcState, setWebrtcState] = useState<'off' | 'connecting' | 'open' | 'failed'>('off');
   const hqBufferRef = useRef<Uint8Array>(new Uint8Array(0));
   const hqPendingChunksRef = useRef<ArrayBuffer[]>([]);
   const hqPendingWarnedRef = useRef(false);
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const mseReadyRef = useRef(false);
+  const mseAppendQueueRef = useRef<ArrayBuffer[]>([]);
   const logFrontendRef = useRef<(msg: string, level?: string) => void>(() => {});
   const feedHqChunkImplRef = useRef<(chunk: ArrayBuffer) => void>(() => {});
   const sendViewerCommandRef = useRef<(cmd: Record<string, unknown>) => void>(() => {});
@@ -1456,7 +1565,7 @@ export default function App() {
     liveCanvasRef.current = el;
   };
 
-  const frameQueueRef = useRef<{base64: string, delta?: import('./api').DeltaMeta}[]>([]);
+  const frameQueueRef = useRef<{src: string, delta?: import('./api').DeltaMeta}[]>([]);
   const isProcessingQueueRef = useRef(false);
   const remoteCanvasBaseReadyRef = useRef(false);
 
@@ -1471,7 +1580,7 @@ export default function App() {
     }
 
     const img = new window.Image();
-    img.src = `data:image/webp;base64,${frame.base64}`;
+    img.src = frame.src;
     img.decode().then(() => {
       requestAnimationFrame(() => {
         const canvas = liveCanvasRef.current;
@@ -1479,14 +1588,18 @@ export default function App() {
           const ctx = canvas.getContext('2d', { alpha: false });
           if (ctx) {
             if (frame.delta) {
+              if (!remoteCanvasBaseReadyRef.current) {
+                isProcessingQueueRef.current = false;
+                processFrameQueue();
+                return;
+              }
               const { x, y, w, h, fw, fh } = frame.delta;
               const fullW = fw || img.width;
               const fullH = fh || img.height;
-              if (!remoteCanvasBaseReadyRef.current || canvas.width !== fullW || canvas.height !== fullH) {
-                canvas.width = fullW;
-                canvas.height = fullH;
-                ctx.fillStyle = '#000';
-                ctx.fillRect(0, 0, fullW, fullH);
+              if (canvas.width !== fullW || canvas.height !== fullH) {
+                isProcessingQueueRef.current = false;
+                processFrameQueue();
+                return;
               }
               ctx.drawImage(img, x, y, w, h);
             } else {
@@ -1507,13 +1620,13 @@ export default function App() {
     });
   };
 
-  const applyFrame = (base64: string, delta?: import('./api').DeltaMeta) => {
+  const applyFrame = (src: string, delta?: import('./api').DeltaMeta) => {
     const devId = standaloneDeviceId ?? focusedSessionId ?? activeSessions[0]?.id;
     if (!devId) return;
     if (hqStreamOnCanvasRef.current) return;
 
     // Guardar siempre para que re-renders de React tengan el frame correcto
-    latestLiveFrameRef.current = base64;
+    latestLiveFrameRef.current = src;
 
     // Telemetría HTTP puede marcar offline durante switch de sesión; si hay frames, está online
     setActiveSessions(prev =>
@@ -1521,11 +1634,15 @@ export default function App() {
     );
 
     if (liveCanvasRef.current) {
-      frameQueueRef.current.push({ base64, delta });
+      if (frameQueueRef.current.length >= 2) {
+        frameQueueRef.current = [{ src, delta }];
+      } else {
+        frameQueueRef.current.push({ src, delta });
+      }
       processFrameQueue();
     } else {
       // ── FALLBACK: img no montada aún (primera conexión) ─────────────────
-      setSessionFrames(prev => ({ ...prev, [devId]: base64 }));
+      setSessionFrames(prev => ({ ...prev, [devId]: src }));
     }
   };
 
@@ -1534,10 +1651,9 @@ export default function App() {
     setSessionSwitchError('');
     setSessionSwitching(true);
     setSessionSwitchingDeviceId(deviceId);
-    // No vaciar latestLiveFrameRef: el canvas sigue mostrando la última imagen hasta el primer frame nuevo
+    hqStreamOnCanvasRef.current = false;
     frameQueueRef.current = [];
     remoteCanvasBaseReadyRef.current = false;
-    setSessionFrames(prev => ({ ...prev, [deviceId]: '' }));
   }, []);
 
   const cancelSessionSwitch = useCallback(() => {
@@ -1618,14 +1734,115 @@ export default function App() {
         setLoginError((msg.error as string) ?? 'Credenciales inválidas');
         setLoginLoading(false);
       }
+    } else if (msg.type === 'webrtc_answer' && webrtcPcRef.current) {
+      const sdp = String(msg.sdp || '');
+      if (sdp) {
+        webrtcPcRef.current.setRemoteDescription({ type: 'answer', sdp }).then(() => {
+          const pending = webrtcPendingIceRef.current;
+          webrtcPendingIceRef.current = [];
+          pending.forEach((c) => {
+            webrtcPcRef.current?.addIceCandidate(c).catch(() => {});
+          });
+        }).catch((err) => {
+          console.error('[WEBRTC] answer', err);
+          setWebrtcState('failed');
+        });
+      }
+    } else if (msg.type === 'webrtc_ice') {
+      const cand = String(msg.candidate || '');
+      if (!cand) return;
+      const init: RTCIceCandidateInit = {
+        candidate: cand,
+        sdpMid: (msg.sdpMid as string) ?? undefined,
+        sdpMLineIndex: msg.sdpMLineIndex == null ? undefined : Number(msg.sdpMLineIndex),
+      };
+      if (webrtcPcRef.current?.remoteDescription) {
+        webrtcPcRef.current.addIceCandidate(init).catch(() => {});
+      } else {
+        webrtcPendingIceRef.current.push(init);
+      }
+    } else if (msg.type === 'webrtc_state') {
+      const st = String(msg.state || '');
+      if (st === 'open' || st === 'connected') {
+        setWebrtcState('open');
+        setShowNotification('Canal rápido conectado (P2P/UDP)');
+        setTimeout(() => setShowNotification(null), 2500);
+      } else if (st === 'failed' || st === 'disconnected') {
+        setWebrtcState('failed');
+      } else if (st === 'closed') {
+        setWebrtcState('off');
+      }
+    } else if (msg.type === 'webrtc_error') {
+      setWebrtcState('failed');
+      setShowNotification(String(msg.message || 'Canal rápido no disponible'));
+      setTimeout(() => setShowNotification(null), 4000);
+    } else if (msg.type === 'hq_unavailable') {
+      setHqEnabled(false);
+      try {
+        const key = (standaloneDeviceId ?? focusedSessionId)
+          ? `hq_mode_${standaloneDeviceId ?? focusedSessionId}`
+          : null;
+        if (key) localStorage.setItem(key, '0');
+      } catch { /* ignore */ }
+      hqStreamOnCanvasRef.current = false;
+      setHqState('off');
+      setShowNotification(String(msg.message || 'HD no disponible en este equipo — calidad estándar'));
+      setTimeout(() => setShowNotification(null), 4500);
+      logFrontendRef.current(
+        `[FRONTEND-HQ] Agente rechazo HD (${msg.reason || 'n/a'})`,
+        'WARN',
+      );
+    } else if (msg.type === 'capture_warning') {
+      const text = String(msg.message || 'Pantalla en negro — revisá si el Escritorio remoto está minimizado.');
+      setCaptureWarning(text);
+      setShowNotification(text);
+      setTimeout(() => setShowNotification(null), 8000);
+      logFrontendRef.current(`[FRONTEND-CAPTURA] ${msg.reason || 'warning'}: ${text}`, 'WARN');
+    } else if (msg.type === 'capture_ok') {
+      setCaptureWarning(null);
+    } else if (msg.type === 'clipboard_sync') {
+      const text = String(msg.text || '');
+      if (text) {
+        setRemoteClipboard(text);
+        navigator.clipboard.writeText(text).catch(() => {});
+      }
+    } else if (msg.type === 'clipboard_files_set') {
+      const count = Number(msg.count || 0);
+      const ok = Boolean(msg.ok);
+      setShowNotification(
+        ok
+          ? `${count} archivo(s) listos. Cerrá el menú y clic derecho → Pegar.`
+          : 'No se pudo preparar el portapapeles del cliente.',
+      );
+      setTimeout(() => setShowNotification(null), 4500);
+    } else if (msg.type === 'clipboard_files_ready') {
+      const files = (msg.files as { name?: string; url: string }[]) || [];
+      if (files.length) {
+        const sig = files.map(f => f.url).join('|');
+        if (sig !== lastRemoteClipFilesRef.current) {
+          lastRemoteClipFilesRef.current = sig;
+          const origin = API_URL.replace(/\/api\/?$/, '');
+          files.forEach((f) => {
+            const href = f.url.startsWith('http') ? f.url : `${origin}${f.url.startsWith('/') ? '' : '/'}${f.url}`;
+            const a = document.createElement('a');
+            a.href = href;
+            a.download = f.name || 'archivo';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          });
+          setShowNotification(`${files.length} archivo(s) copiados del cliente`);
+          setTimeout(() => setShowNotification(null), 3500);
+        }
+      }
     }
   }, [standaloneDeviceId, focusedSessionId]);
 
   const { sendCommand: sendViewerCommand } = useViewerWebSocket({
     deviceId: standaloneDeviceId ?? focusedSessionId ?? (activeSessions.length === 1 ? activeSessions[0].id : null),
     enabled: isAuthenticated && (!!standaloneDeviceId || !!focusedSessionId || activeSessions.length === 1),
-    onFrame: (base64, delta) => {
-      applyFrame(base64, delta);
+    onFrame: (src, delta) => {
+      applyFrame(src, delta);
       setWsViewerConnected(true);
       const now = performance.now();
       frameTimestampsRef.current.push(now);
@@ -1634,7 +1851,7 @@ export default function App() {
       const fps = Math.round(frameTimestampsRef.current.length / 2);
       setConnectionFps(fps);
       setConnectionQuality(connectionQualityFromFps(fps));
-      if (sessionSwitchingRef.current && base64) {
+      if (sessionSwitchingRef.current && src) {
         pendingSwitchWindowsSessionRef.current = null;
         setSessionSwitching(false);
         setSessionSwitchingDeviceId(null);
@@ -1659,12 +1876,266 @@ export default function App() {
   });
   sendViewerCommandRef.current = sendViewerCommand;
 
+  const sendRemoteControl = useCallback((deviceId: number, payload: Record<string, unknown>) => {
+    const useWs = wsViewerConnected && (standaloneDeviceId === deviceId || focusedSessionId === deviceId);
+    if (useWs) {
+      sendViewerCommandRef.current(payload);
+      return Promise.resolve();
+    }
+    return sendCentinelaControl(deviceId, payload);
+  }, [wsViewerConnected, standaloneDeviceId, focusedSessionId]);
+
+  const stopWebRtc = useCallback(() => {
+    webrtcPendingIceRef.current = [];
+    const pc = webrtcPcRef.current;
+    webrtcPcRef.current = null;
+    if (pc) {
+      try { pc.close(); } catch { /* */ }
+    }
+    if (webrtcVideoRef.current) webrtcVideoRef.current.srcObject = null;
+    sendViewerCommandRef.current({ type: 'webrtc_hangup' });
+    setWebrtcState('off');
+  }, []);
+
+  const startWebRtc = useCallback(async () => {
+    if (!wsViewerConnected) {
+      setShowNotification('Sin conexión al visor.');
+      setTimeout(() => setShowNotification(null), 2500);
+      return;
+    }
+    stopWebRtc();
+    setWebrtcState('connecting');
+    setShowNotification('Abriendo canal rápido (P2P)…');
+    try {
+      const iceServers = await getWebRtcIceServers();
+      const pc = new RTCPeerConnection({
+        iceServers: iceServers.length ? iceServers : [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun.cloudflare.com:3478' },
+        ],
+      });
+      webrtcPcRef.current = pc;
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.ontrack = (ev) => {
+        const stream = ev.streams[0];
+        if (webrtcVideoRef.current && stream) {
+          webrtcVideoRef.current.srcObject = stream;
+          webrtcVideoRef.current.play().catch(() => {});
+        }
+        setWebrtcState('open');
+        setConnectionFps(20);
+        setConnectionQuality('excellent');
+        setShowNotification('Canal rápido conectado (P2P/UDP)');
+        setTimeout(() => setShowNotification(null), 2500);
+        sendViewerCommandRef.current({ type: 'stop_hq' });
+      };
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        sendViewerCommandRef.current({
+          type: 'webrtc_ice',
+          candidate: ev.candidate.candidate,
+          sdpMid: ev.candidate.sdpMid,
+          sdpMLineIndex: ev.candidate.sdpMLineIndex,
+        });
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          // Cerrar peer y volver al stream normal (no dejar pantalla negra).
+          stopWebRtc();
+          setWebrtcState('failed');
+          sendViewerCommandRef.current({ type: 'refresh_frame' });
+          setShowNotification('Canal rápido falló. Volviendo a HD/WebP…');
+          setTimeout(() => setShowNotification(null), 4000);
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sendViewerCommandRef.current({
+        type: 'webrtc_offer',
+        sdp: offer.sdp,
+        ice_servers: iceServers,
+      });
+      window.setTimeout(() => {
+        if (webrtcPcRef.current === pc && webrtcVideoRef.current && !webrtcVideoRef.current.srcObject) {
+          stopWebRtc();
+          setWebrtcState('failed');
+          sendViewerCommandRef.current({ type: 'refresh_frame' });
+          setShowNotification('Canal rápido no contestó. Se sigue con HD/WebP (agente 3.3.4+).');
+          setTimeout(() => setShowNotification(null), 5000);
+        }
+      }, 12000);
+    } catch (err: any) {
+      setWebrtcState('failed');
+      setShowNotification(err?.message || 'No se pudo abrir el canal rápido');
+      setTimeout(() => setShowNotification(null), 3500);
+    }
+  }, [stopWebRtc, wsViewerConnected]);
+
+  const toggleWebRtc = useCallback(() => {
+    if (webrtcState === 'open' || webrtcState === 'connecting') {
+      stopWebRtc();
+      return;
+    }
+    startWebRtc();
+  }, [webrtcState, startWebRtc, stopWebRtc]);
+
+  const agentSupportsPasteText = useCallback((deviceId: number) => {
+    const telem = centinelasRef.current[deviceId] || centinelasRef.current[String(deviceId)];
+    const ver = String(telem?.agent_version || '');
+    return /^3\.2\.(?:[7-9]|\d{2,})/.test(ver) || /^3\.[3-9]/.test(ver) || /^[4-9]\./.test(ver);
+  }, []);
+
+  const pasteTextToRemote = useCallback(async (deviceId: number, text: string) => {
+    if (!text) return;
+    if (agentSupportsPasteText(deviceId)) {
+      await sendRemoteControl(deviceId, { type: 'paste_text', text });
+    } else {
+      const token = localStorage.getItem('token');
+      await fetch(`${API_URL}/centinelas/devices/${deviceId}/clipboard`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ text }),
+      });
+      await new Promise(r => setTimeout(r, 250));
+      await sendRemoteControl(deviceId, { type: 'key_press', key: 'ctrl+v' });
+    }
+    setShowNotification('Texto pegado en el cliente.');
+    setTimeout(() => setShowNotification(null), 2000);
+  }, [agentSupportsPasteText, sendRemoteControl]);
+
+  const pasteFilesToRemote = useCallback(async (deviceId: number, fileList: File[] | FileList) => {
+    const files = Array.from(fileList).filter(f => f && f.size >= 0).slice(0, 8);
+    if (!files.length) return;
+    const tooBig = files.find(f => f.size > 25 * 1024 * 1024);
+    if (tooBig) {
+      setShowNotification(`${tooBig.name} supera 25 MB`);
+      setTimeout(() => setShowNotification(null), 3500);
+      return;
+    }
+    setShowNotification(`Enviando ${files.length} archivo(s) al cliente...`);
+    try {
+      await pasteFilesToCentinela(deviceId, files);
+      setShowNotification(`Preparando ${files.length} archivo(s) en el cliente...`);
+    } catch (err: any) {
+      setShowNotification(err?.message || 'No se pudieron enviar los archivos');
+    }
+    setTimeout(() => setShowNotification(null), 4500);
+  }, []);
+
+  const pullRemoteClipboardToLocal = useCallback(async (deviceId: number) => {
+    try {
+      const clip = await getCentinelaClipboard(deviceId);
+      if (clip.files?.length) {
+        const sig = clip.files.map(f => f.url).join('|');
+        if (sig !== lastRemoteClipFilesRef.current) {
+          lastRemoteClipFilesRef.current = sig;
+          const origin = API_URL.replace(/\/api\/?$/, '');
+          clip.files.forEach((f) => {
+            const href = f.url.startsWith('http') ? f.url : `${origin}${f.url.startsWith('/') ? '' : '/'}${f.url}`;
+            const a = document.createElement('a');
+            a.href = href;
+            a.download = f.name || 'archivo';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          });
+          setShowNotification(`${clip.files.length} archivo(s) copiados del cliente`);
+          setTimeout(() => setShowNotification(null), 3500);
+        }
+        return; // archivos tienen prioridad sobre texto residual
+      }
+      if (clip.text) {
+        setRemoteClipboard(clip.text);
+        try { await navigator.clipboard.writeText(clip.text); } catch { /* permiso clipboard */ }
+      }
+    } catch (err) {
+      console.error('Error leyendo portapapeles remoto', err);
+    }
+  }, []);
+
+  const lastMouseMoveAtRef = useRef(0);
+  const mouseButtonsDownRef = useRef(0);
+
   const connectionFpsRef = useRef(0);
   useEffect(() => {
     connectionFpsRef.current = connectionFps;
   }, [connectionFps]);
 
   const viewerStreamDeviceId = standaloneDeviceId ?? focusedSessionId ?? (activeSessions.length === 1 ? activeSessions[0]?.id : null);
+  const clipBridgeSeenRef = useRef(false);
+  useEffect(() => {
+    if (!viewerStreamDeviceId) {
+      setClipBridgeOn(false);
+      return;
+    }
+    let stopped = false;
+    let lastSeq = -1;
+    let busy = false;
+    let failCount = 0;
+    const MAX_FAILS = 3;
+    const tick = async () => {
+      if (stopped || busy) return;
+      if (failCount >= MAX_FAILS) return;
+      try {
+        const res = await fetch('http://127.0.0.1:47915/clipboard', { cache: 'no-store' });
+        if (!res.ok) {
+          if (!stopped) setClipBridgeOn(false);
+          failCount++;
+          return;
+        }
+        failCount = 0;
+        const data = await res.json();
+        if (stopped) return;
+        setClipBridgeOn(true);
+        if (!clipBridgeSeenRef.current) {
+          clipBridgeSeenRef.current = true;
+          setShowNotification('Portapapeles de tu PC conectado. Ctrl+C en un archivo lo manda al cliente.');
+          setTimeout(() => setShowNotification(null), 4000);
+        }
+        const seq = Number(data.seq || 0);
+        const changedAt = Number(data.changed_at || 0) * 1000;
+        const items = Array.isArray(data.files) ? data.files : [];
+        const fresh = changedAt > 0 && Date.now() - changedAt < 20000;
+        if (lastSeq < 0) {
+          lastSeq = seq;
+          if (!(fresh && items.length)) return;
+        } else if (!items.length || seq === lastSeq) {
+          lastSeq = seq;
+          return;
+        }
+        lastSeq = seq;
+        busy = true;
+        const files: File[] = [];
+        for (const item of items.slice(0, 8)) {
+          const fr = await fetch(`http://127.0.0.1:47915/file?i=${item.index}`, { cache: 'no-store' });
+          if (!fr.ok) continue;
+          const blob = await fr.blob();
+          files.push(new File([blob], item.name || 'archivo'));
+        }
+        if (!stopped && files.length) await pasteFilesToRemote(viewerStreamDeviceId, files);
+      } catch {
+        if (!stopped) setClipBridgeOn(false);
+        failCount++;
+      } finally {
+        busy = false;
+      }
+    };
+    const id = window.setInterval(tick, 1000);
+    tick();
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [viewerStreamDeviceId, pasteFilesToRemote]);
+  useEffect(() => {
+    return () => {
+      const pc = webrtcPcRef.current;
+      webrtcPcRef.current = null;
+      if (pc) {
+        try { pc.close(); } catch { /* */ }
+      }
+    };
+  }, [viewerStreamDeviceId]);
   const streamPresetStorageKey = viewerStreamDeviceId != null ? `apollo_stream_preset_${viewerStreamDeviceId}` : null;
   const [streamPreset, setStreamPreset] = useState<StreamPreset>('auto');
 
@@ -1685,45 +2156,157 @@ export default function App() {
     return 'off';
   });
   const [hqReconnectAttempt, setHqReconnectAttempt] = useState(0);
+  const [captureWarning, setCaptureWarning] = useState<string | null>(null);
+  const [viewerToolsOpen, setViewerToolsOpen] = useState(false);
+  const [clipBridgeOn, setClipBridgeOn] = useState(false);
 
   const destroyHqDecoders = useCallback(() => {
-    if (webCodecsPlayerRef.current) {
-      webCodecsPlayerRef.current.destroy();
-      webCodecsPlayerRef.current = null;
+    if (mediaSourceRef.current && mediaSourceRef.current.readyState === 'open') {
+      try { mediaSourceRef.current.endOfStream(); } catch { /* */ }
     }
-    if (jmuxerRef.current) {
-      try { jmuxerRef.current.destroy(); } catch { /* */ }
-      jmuxerRef.current = null;
-    }
+    mediaSourceRef.current = null;
+    sourceBufferRef.current = null;
+    mseReadyRef.current = false;
+    mseAppendQueueRef.current = [];
     hqBufferRef.current = new Uint8Array(0);
     hqPendingChunksRef.current = [];
     hqPendingWarnedRef.current = false;
   }, []);
 
-  const feedJmuxerHqChunk = useCallback((chunk: ArrayBuffer) => {
-    if (!jmuxerRef.current) return;
-    const newData = new Uint8Array(chunk);
-    if (hqBufferRef.current.length === 0) {
-      hqBufferRef.current = newData;
-    } else {
-      const combined = new Uint8Array(hqBufferRef.current.length + newData.length);
-      combined.set(hqBufferRef.current);
-      combined.set(newData, hqBufferRef.current.length);
-      hqBufferRef.current = combined;
+  const MSE_CODEC_CANDIDATES = [
+    'video/mp4; codecs="avc1.42E01E"',
+    'video/mp4; codecs="avc1.42E00D"',
+    'video/mp4; codecs="avc1.4D401E"',
+    'video/mp4; codecs="avc1.64001E"',
+    'video/mp4',
+  ];
+
+  const initMSE = useCallback(() => {
+    if (!videoRef.current) {
+      console.warn('[MSE] videoRef no disponible');
+      return false;
+    }
+    if (!('MediaSource' in window)) {
+      console.error('[MSE] MediaSource no soportado');
+      logFrontendRef.current('[FRONTEND-MSE] MediaSource Extensions no soportado en este navegador', 'ERROR');
+      return false;
     }
 
-    let lastStartCodeIdx = -1;
-    for (let i = hqBufferRef.current.length - 4; i >= 0; i--) {
-      if (hqBufferRef.current[i] === 0 && hqBufferRef.current[i + 1] === 0 && hqBufferRef.current[i + 2] === 0 && hqBufferRef.current[i + 3] === 1) {
-        lastStartCodeIdx = i;
-        break;
+    let supportedCodec: string | null = null;
+    for (const codec of MSE_CODEC_CANDIDATES) {
+      try {
+        if (MediaSource.isTypeSupported(codec)) {
+          supportedCodec = codec;
+          console.log(`[MSE] Codec soportado: ${codec}`);
+          logFrontendRef.current(`[FRONTEND-MSE] Codec soportado: ${codec}`, 'INFO');
+          break;
+        }
+      } catch (e) {
+        console.warn(`[MSE] Error verificando codec ${codec}:`, e);
       }
     }
 
-    if (lastStartCodeIdx > 0) {
-      const completeNalus = hqBufferRef.current.slice(0, lastStartCodeIdx);
-      hqBufferRef.current = hqBufferRef.current.slice(lastStartCodeIdx);
-      jmuxerRef.current.feed({ video: completeNalus });
+    if (!supportedCodec) {
+      supportedCodec = MSE_CODEC_CANDIDATES[0];
+      console.warn(`[MSE] Ningún codec verificado, usando: ${supportedCodec}`);
+      logFrontendRef.current(`[FRONTEND-MSE] Ningún codec verificado, usando: ${supportedCodec}`, 'WARNING');
+    }
+
+    try {
+      const ms = new MediaSource();
+      videoRef.current.src = URL.createObjectURL(ms);
+      mediaSourceRef.current = ms;
+
+      ms.addEventListener('sourceopen', () => {
+        console.log('[MSE] MediaSource abierto');
+        logFrontendRef.current('[FRONTEND-MSE] MediaSource abierto', 'INFO');
+        try {
+          const sb = ms.addSourceBuffer(supportedCodec!);
+          sb.mode = 'segments';
+          sourceBufferRef.current = sb;
+          mseReadyRef.current = true;
+          console.log(`[MSE] SourceBuffer creado con: ${supportedCodec}`);
+          logFrontendRef.current(`[FRONTEND-MSE] SourceBuffer creado con: ${supportedCodec}`, 'INFO');
+
+          sb.addEventListener('updateend', () => {
+            if (mseAppendQueueRef.current.length > 0 && !sb.updating) {
+              try {
+                sb.appendBuffer(mseAppendQueueRef.current.shift()!);
+              } catch (e) {
+                console.error('[MSE] Error en appendBuffer:', e);
+                logFrontendRef.current(`[FRONTEND-MSE] Error en appendBuffer: ${e}`, 'ERROR');
+              }
+            }
+          });
+
+          sb.addEventListener('error', (e) => {
+            console.error('[MSE] SourceBuffer error:', e);
+            logFrontendRef.current('[FRONTEND-MSE] SourceBuffer error', 'ERROR');
+          });
+
+          sb.addEventListener('abort', () => {
+            console.warn('[MSE] SourceBuffer abort');
+            logFrontendRef.current('[FRONTEND-MSE] SourceBuffer abort', 'WARNING');
+          });
+        } catch (e) {
+          console.error('[MSE] Error creando SourceBuffer:', e);
+          logFrontendRef.current(`[FRONTEND-MSE] Error creando SourceBuffer: ${e}`, 'ERROR');
+          mseReadyRef.current = false;
+        }
+      });
+
+      ms.addEventListener('error', (e) => {
+        console.error('[MSE] MediaSource error:', e);
+        logFrontendRef.current('[FRONTEND-MSE] MediaSource error', 'ERROR');
+        mseReadyRef.current = false;
+      });
+
+      ms.addEventListener('sourceclose', () => {
+        console.warn('[MSE] MediaSource cerrado');
+        logFrontendRef.current('[FRONTEND-MSE] MediaSource cerrado', 'WARNING');
+        mseReadyRef.current = false;
+      });
+
+      return true;
+    } catch (e) {
+      console.error('[MSE] Error creando MediaSource:', e);
+      logFrontendRef.current(`[FRONTEND-MSE] Error creando MediaSource: ${e}`, 'ERROR');
+      return false;
+    }
+  }, []);
+
+  const appendMseChunk = useCallback((arrayBuffer: ArrayBuffer) => {
+    if (!sourceBufferRef.current || !mseReadyRef.current) {
+      return;
+    }
+
+    try {
+      if (sourceBufferRef.current.updating || mseAppendQueueRef.current.length > 0) {
+        mseAppendQueueRef.current.push(arrayBuffer);
+        if (mseAppendQueueRef.current.length > 50) {
+          console.warn(`[MSE] Cola creciendo: ${mseAppendQueueRef.current.length}`);
+          mseAppendQueueRef.current.shift();
+        }
+      } else {
+        sourceBufferRef.current.appendBuffer(arrayBuffer);
+      }
+    } catch (e: any) {
+      console.error('[MSE] Error en appendMseChunk:', e);
+      if (e.name === 'QuotaExceededError') {
+        console.warn('[MSE] Buffer lleno, limpiando...');
+        logFrontendRef.current('[FRONTEND-MSE] Buffer lleno, limpiando...', 'WARNING');
+        try {
+          if (sourceBufferRef.current.buffered.length > 0) {
+            const start = sourceBufferRef.current.buffered.start(0);
+            const end = sourceBufferRef.current.buffered.end(sourceBufferRef.current.buffered.length - 1);
+            const removeEnd = start + (end - start) / 2;
+            sourceBufferRef.current.remove(start, removeEnd);
+            console.log(`[MSE] Buffer limpiado: ${start.toFixed(2)}s a ${removeEnd.toFixed(2)}s`);
+          }
+        } catch (e2) {
+          console.error('[MSE] Error limpiando buffer:', e2);
+        }
+      }
     }
   }, []);
 
@@ -1733,32 +2316,27 @@ export default function App() {
     hqPendingChunksRef.current = [];
     hqPendingWarnedRef.current = false;
     for (const chunk of pending) {
-      if (webCodecsPlayerRef.current) webCodecsPlayerRef.current.feed(chunk);
-      else feedJmuxerHqChunk(chunk);
+      appendMseChunk(chunk);
     }
-  }, [feedJmuxerHqChunk]);
+  }, [appendMseChunk]);
 
   feedHqChunkImplRef.current = (chunk: ArrayBuffer) => {
-    if (webCodecsPlayerRef.current) {
-      webCodecsPlayerRef.current.feed(chunk);
-      return;
-    }
-    if (jmuxerRef.current) {
-      feedJmuxerHqChunk(chunk);
+    if (mseReadyRef.current && sourceBufferRef.current) {
+      appendMseChunk(chunk);
       return;
     }
     hqPendingChunksRef.current.push(chunk);
     if (hqPendingChunksRef.current.length > 300) hqPendingChunksRef.current.shift();
     if (!hqPendingWarnedRef.current) {
       hqPendingWarnedRef.current = true;
-      logFrontendRef.current('[FRONTEND-HQ] Chunks H.264 en cola (decodificador no listo aún)', 'WARNING');
+      logFrontendRef.current('[FRONTEND-HQ] Chunks fMP4 en cola (MSE no listo aún)', 'WARNING');
     }
   };
 
   useEffect(() => {
-    const useHqCanvas = WEBCODECS_H264 && hqEnabled && hqState === 'open';
-    hqStreamOnCanvasRef.current = useHqCanvas;
-    if (useHqCanvas) {
+    const useHqVideo = hqEnabled && hqState === 'open' && mseReadyRef.current;
+    hqStreamOnCanvasRef.current = useHqVideo;
+    if (useHqVideo) {
       frameQueueRef.current = [];
       isProcessingQueueRef.current = false;
     }
@@ -1766,7 +2344,7 @@ export default function App() {
 
   // HD activo pero sin chunks: volver a WebP para no dejar pantalla negra
   useEffect(() => {
-    if (!hqEnabled || !wsViewerConnected || hqState === 'open') return;
+    if (!hqEnabled || !wsViewerConnected || hqState === 'open' || webrtcState === 'open') return;
     const timer = window.setTimeout(() => {
       if (!hqEnabled) return;
       if (connectionFpsRef.current > 0) return;
@@ -1783,54 +2361,36 @@ export default function App() {
       sendViewerCommandRef.current({ type: 'refresh_frame' });
     }, 5000);
     return () => window.clearTimeout(timer);
-  }, [hqEnabled, hqState, wsViewerConnected, hqStorageKey, destroyHqDecoders]);
+  }, [hqEnabled, hqState, wsViewerConnected, hqStorageKey, destroyHqDecoders, webrtcState]);
 
   useEffect(() => {
     if (!hqEnabled) {
       destroyHqDecoders();
       return;
     }
-    if (WEBCODECS_H264 && liveCanvasRef.current && !webCodecsPlayerRef.current) {
-      webCodecsPlayerRef.current = new H264WebCodecsPlayer(
-        liveCanvasRef.current,
-        24,
-        (msg) => {
-          console.warn('[WebCodecs H264]', msg);
-          logFrontendRef.current(`[FRONTEND-WEBCODECS] ${msg}`, 'WARNING');
-          if (hqEnabled && hqState === 'open') {
-            setHqState('connecting');
-            hqStreamOnCanvasRef.current = false;
-            sendViewerCommandRef.current({ type: 'refresh_frame' });
-          }
-        },
-      );
-      logFrontendRef.current('[FRONTEND-WEBCODECS] Decodificador H.264 WebCodecs activo', 'INFO');
-      logFrontendRef.current(`[VERSION] Portal ${APP_VERSION_LABEL} build ${APP_BUILD}`, 'INFO');
-      flushHqPendingChunks();
-      return;
+    if (hqState === 'open' && videoRef.current && !mediaSourceRef.current) {
+      if (initMSE()) {
+        logFrontendRef.current('[FRONTEND-MSE] Decodificador fMP4/MSE activo', 'INFO');
+        logFrontendRef.current(`[VERSION] Portal ${APP_VERSION_LABEL} build ${APP_BUILD}`, 'INFO');
+        videoRef.current.play().catch(() => {});
+        flushHqPendingChunks();
+      } else {
+        logFrontendRef.current('[FRONTEND-MSE] Error inicializando MSE, volviendo a modo estándar', 'ERROR');
+        setHqEnabled(false);
+        setHqState('off');
+        if (hqStorageKey) localStorage.setItem(hqStorageKey, 'false');
+        sendViewerCommandRef.current({ type: 'stop_hq' });
+        sendViewerCommandRef.current({ type: 'refresh_frame' });
+        setShowNotification('HD no soportado en este navegador — volviendo a modo normal');
+        setTimeout(() => setShowNotification(null), 4000);
+      }
     }
-    if (!WEBCODECS_H264 && hqState === 'open' && videoRef.current && !jmuxerRef.current) {
-      hqBufferRef.current = new Uint8Array(0);
-      jmuxerRef.current = new JMuxer({
-        node: videoRef.current,
-        mode: 'video',
-        flushingTime: 10,
-        fps: 24,
-        debug: false,
-        onError: (data: any) => {
-          console.error('[JMUXER] Error:', data);
-          logFrontendRef.current(`[FRONTEND-JMUXER] Error: ${JSON.stringify(data)}`, 'ERROR');
-        },
-      });
-      videoRef.current.play().catch(() => {});
-      logFrontendRef.current('[FRONTEND-JMUXER] Decodificador H.264 JMuxer activo (fallback sin WebCodecs)', 'INFO');
-      flushHqPendingChunks();
-    }
-  }, [hqEnabled, hqState, destroyHqDecoders, flushHqPendingChunks]);
+  }, [hqEnabled, hqState, destroyHqDecoders, flushHqPendingChunks, initMSE, hqStorageKey]);
 
-  // Al cambiar de sesión Windows: apagar HQ para evitar crashes MSE/JMuxer (bitácora)
+  // Al cambiar de sesión Windows: apagar HQ y pedir frames WebP (evita canvas negro)
   useEffect(() => {
     if (!sessionSwitching) return;
+    hqStreamOnCanvasRef.current = false;
     destroyHqDecoders();
     if (hqEnabled) {
       sendViewerCommand({ type: 'stop_hq' });
@@ -1838,6 +2398,12 @@ export default function App() {
       setHqState('off');
       if (hqStorageKey) localStorage.setItem(hqStorageKey, 'false');
     }
+    sendViewerCommand({ type: 'refresh_frame' });
+    const tick = window.setInterval(() => {
+      sendViewerCommandRef.current({ type: 'refresh_frame' });
+      sendViewerCommandRef.current({ type: 'get_sessions' });
+    }, 1500);
+    return () => window.clearInterval(tick);
   }, [sessionSwitching, hqEnabled, hqStorageKey, sendViewerCommand]);
   // ────────────────────────────────────────────────────────────────────────────
 
@@ -1908,6 +2474,7 @@ export default function App() {
   useEffect(() => {
     if (!wsViewerConnected) return;
     sendViewerCommand({ type: 'get_sessions' });
+    sendViewerCommand({ type: 'release_input' });
   }, [wsViewerConnected, sendViewerCommand]);
 
   const refreshWindowsSessionsForDevice = useCallback(async (deviceId: number) => {
@@ -2031,7 +2598,7 @@ export default function App() {
     
     // Log de confirmación de versión
     logFrontendToBackend(
-      `[VERSION] Portal ${APP_VERSION_LABEL} build ${APP_BUILD} (${APP_VERSION_TAG}) webcodecs=${WEBCODECS_H264}`,
+      `[VERSION] Portal ${APP_VERSION_LABEL} build ${APP_BUILD} (${APP_VERSION_TAG}) MSE=fMP4`,
       'INFO',
     );
 
@@ -2057,12 +2624,23 @@ export default function App() {
     setHqState(next ? 'connecting' : 'off');
     if (hqStorageKey) localStorage.setItem(hqStorageKey, String(next));
     if (!next) {
+      // Al apagar HD: liberar canvas para WebP (si no, queda negro/barras verdes)
       hqStreamOnCanvasRef.current = false;
       destroyHqDecoders();
+      frameQueueRef.current = [];
+      isProcessingQueueRef.current = false;
+      try {
+        const c = liveCanvasRef.current;
+        if (c) {
+          const ctx = c.getContext('2d');
+          if (ctx) ctx.clearRect(0, 0, c.width || 0, c.height || 0);
+        }
+      } catch { /* ignore */ }
     }
     sendViewerCommand({ type: next ? 'start_hq' : 'stop_hq' });
     if (!next) {
       sendViewerCommand({ type: 'refresh_frame' });
+      window.setTimeout(() => sendViewerCommand({ type: 'refresh_frame' }), 400);
     }
   };
   
@@ -2231,7 +2809,7 @@ export default function App() {
       const session = activeSessions[0];
       if (session && session.device_name && session.device_name !== "Cargando Terminal...") {
         const clientName = session.client_name || session.razon_social || "Cliente";
-        document.title = `🔴 [${clientName}] - ${session.device_name} | ApolloSupport`;
+        document.title = `🔴 ${clientName} — ${session.device_name} | ApolloSupport`;
       }
     }
   }, [standaloneIdInit, activeSessions]);
@@ -2260,7 +2838,9 @@ export default function App() {
   const [isUploading, setIsUploading] = useState(false);
 
   const [areas, setAreas] = useState<any[]>([]);
+  const [resellers, setResellers] = useState<any[]>([]);
   const [selectedArea, setSelectedArea] = useState<number | null>(null);
+  const [ticketsVista, setTicketsVista] = useState<'activa' | 'historico'>('activa');
 
   // Estados de Personal, ABM y Perfil (NUEVO)
   const [users, setUsers] = useState<any[]>([]);
@@ -2283,7 +2863,20 @@ export default function App() {
     rol: 'soporte',
     celular: '',
     departamento: 'Atención al Cliente',
+    actividades: ['Atención al Cliente'] as string[],
     profile_picture: '',
+    activo: true,
+    reseller_id: null as number | null
+  });
+  const [showResellerModal, setShowResellerModal] = useState(false);
+  const [selectedResellerForEdit, setSelectedResellerForEdit] = useState<any>(null);
+  const [resellerForm, setResellerForm] = useState({
+    nombre: '',
+    contacto: '',
+    email: '',
+    telefono: '',
+    comision_pct: 0,
+    notas: '',
     activo: true
   });
 
@@ -2352,22 +2945,24 @@ export default function App() {
       }
       loadData();
     }
-  }, [isAuthenticated, selectedArea]);
+  }, [isAuthenticated, selectedArea, ticketsVista]);
 
   const loadData = () => {
     setLoading(true);
     Promise.all([
-      getTickets(selectedArea || undefined),
+      getTickets(selectedArea || undefined, ticketsVista),
       getClients(),
       getAreas(),
       getPendingCentinelas(),
-      getUsers().catch(() => []) // Silencioso para evitar crash si hay problemas
-    ]).then(([tData, cData, aData, pData, uData]) => {
+      getUsers().catch(() => []),
+      getResellers().catch(() => [])
+    ]).then(([tData, cData, aData, pData, uData, rData]) => {
       setTickets(tData);
       setClients(cData);
       setAreas(aData);
       setPendingDevices(pData || []);
       setUsers(uData || []);
+      setResellers(rData || []);
       setLoading(false);
     }).catch((err) => {
       setLoading(false);
@@ -2453,7 +3048,7 @@ export default function App() {
 
   useEffect(() => {
     let interval: any;
-    if (isAuthenticated && (activeTab === 'monitor' || standaloneId)) {
+    if (isAuthenticated && (activeTab === 'monitor' || activeTab === 'agenda' || standaloneId)) {
       const fetchTelemetry = async () => {
         try {
           const telemetryData = await getActiveCentinelas();
@@ -2470,10 +3065,15 @@ export default function App() {
               matchedDev = pendingData.find((d: any) => d.id === devId);
             }
             if (matchedDev) {
-              setActiveSessions([{ id: devId, device_name: matchedDev.device_name, ...matchedDev }]);
               const client = clientsData.find((c: any) => c.id === matchedDev.client_id);
               const clientName = client ? client.razon_social : "Cliente Pendiente";
-              document.title = `${APP_VERSION_LABEL} · ${matchedDev.device_name} - ${clientName} | ApolloSupport`;
+              setActiveSessions([{
+                id: devId,
+                ...matchedDev,
+                device_name: matchedDev.device_name,
+                client_name: clientName,
+              }]);
+              document.title = `${APP_VERSION_LABEL} · ${clientName} — ${matchedDev.device_name} | ApolloSupport`;
 
               // Leer cantidad de monitores desde la telemetría en vivo del agente
               const liveTelem = telemetryData[String(devId)];
@@ -2520,9 +3120,10 @@ export default function App() {
       const devId = parseInt(standaloneId);
       const pollClipboard = async () => {
         try {
-          const text = await getCentinelaClipboard(devId);
-          if (text !== undefined && text !== remoteClipboard) {
-            setRemoteClipboard(text);
+          const clip = await getCentinelaClipboard(devId);
+          if (clip.text && clip.text !== remoteClipboard) {
+            setRemoteClipboard(clip.text);
+            try { await navigator.clipboard.writeText(clip.text); } catch { /* permiso clipboard */ }
           }
         } catch (err) {
           console.error("Error polling clipboard", err);
@@ -2532,7 +3133,7 @@ export default function App() {
       interval = setInterval(pollClipboard, 3000);
     }
     return () => clearInterval(interval);
-  }, [isAuthenticated, standaloneId, remoteClipboard]);
+  }, [isAuthenticated, standaloneId, remoteClipboard, pullRemoteClipboardToLocal]);
 
   // Polling de frames — FALLBACK para multi-sesión o cuando el WS no está disponible.
   // Con 1 sesión y WS activo, el hook useViewerWebSocket ya entrega los frames por push.
@@ -2627,27 +3228,63 @@ export default function App() {
       'Alt': 'alt',
       'Meta': 'win',
       'CapsLock': 'capslock',
+      'Insert': 'insert',
+      'ContextMenu': 'apps',   // tecla Menú (clic derecho por teclado)
+      'NumLock': 'numlock',
+      'ScrollLock': 'scrolllock',
+      'Pause': 'pause',
+      'PrintScreen': 'printscreen',
+    };
+
+    const codeToVk: Record<string, string> = {
+      Minus: '-', Equal: '=', Comma: ',', Period: '.', Slash: '/',
+      Backslash: '\\', Semicolon: ';', Quote: "'",
+      BracketLeft: '[', BracketRight: ']', Backquote: '`',
+      IntlBackslash: 'oem102', IntlRo: '/', IntlYen: '\\',
+      NumpadDecimal: 'numpaddecimal', NumpadComma: 'numpaddecimal',
+      NumpadAdd: 'numpadadd', NumpadSubtract: 'numpadsubtract',
+      NumpadDivide: 'numpaddivide', NumpadMultiply: 'numpadmultiply',
+      NumpadEnter: 'numpadenter',
+    };
+    const punctToVk: Record<string, string> = {
+      '.': '.', ',': ',', '-': '-', '_': '-',
+      '=': '=', '+': '=',
+      '/': '/', '?': '/',
+      '\\': '\\', '|': '\\',
+      ';': ';', ':': ';',
+      "'": "'", '"': "'",
+      '[': '[', '{': '[',
+      ']': ']', '}': ']',
+      '`': '`', '~': '`',
+      '<': ',', '>': '.',
+      '*': '*',
     };
 
     const mapRemoteKey = (e: KeyboardEvent): string | null => {
       if (e.key in specialKeys) return specialKeys[e.key];
+      if (/^Key[A-Z]$/.test(e.code)) return e.code.slice(3).toLowerCase();
+      if (/^Digit[0-9]$/.test(e.code)) return e.code.slice(5);
+      if (/^Numpad[0-9]$/.test(e.code)) return e.code.slice(6);
+      if (e.code in codeToVk) return codeToVk[e.code];
       if (e.key.length === 1) {
         const ch = e.key.toLowerCase();
         if (/[a-z0-9]/.test(ch)) return ch;
+        if (punctToVk[e.key]) return punctToVk[e.key];
       }
       return null;
     };
 
     const releaseModifiers = () => {
       ['shift', 'ctrl', 'alt', 'win'].forEach((k) => {
-        sendCentinelaControl(targetSessionId, { type: 'key_up', key: k });
+        sendRemoteControl(targetSessionId, { type: 'key_up', key: k });
       });
     };
 
     const handleKeyDown = async (e: KeyboardEvent) => {
       if (!isControlEnabled) return;
+      if (isModalOpen || showLicenseModal || assignModal) return;
       const activeEl = document.activeElement;
-      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || (activeEl as HTMLElement).isContentEditable)) {
         return;
       }
       if (e.repeat) return;
@@ -2657,77 +3294,167 @@ export default function App() {
         setIsCapsLockActive(isCaps);
       }
 
-      const isPaste = (e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V');
-      const isCopy = (e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C');
+      // AltGr (Ctrl+Alt derecho) se reporta como ctrlKey+altKey en el navegador.
+      // En teclado español produce @ \ | # ~ [ ] { } etc. NO es un atajo: es un
+      // caracter imprimible y debe ir por write_text (unicode), no como combo.
+      const isAltGr = !!(e.getModifierState && e.getModifierState('AltGraph'));
 
-      if (isPaste) {
-        e.preventDefault();
-        try {
-          const text = await navigator.clipboard.readText();
-          if (text) {
-            await syncRemoteClipboard(targetSessionId, text);
-          }
-        } catch (err) {
-          console.error("No se pudo leer el portapapeles local", err);
+      // Combos: C/X/V van por el puente de portapapeles (texto y archivos).
+      // El resto (Ctrl+A/Z…) se manda atómico a la PC remota.
+      const mappedForCombo = mapRemoteKey(e);
+      const isModifierKey = e.key === 'Control' || e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta';
+      if (!isModifierKey && mappedForCombo && (e.ctrlKey || e.altKey || e.metaKey) && !isAltGr) {
+        const parts: string[] = [];
+        if (e.ctrlKey || e.metaKey) parts.push('ctrl');
+        if (e.altKey) parts.push('alt');
+        if (e.shiftKey) parts.push('shift');
+        parts.push(mappedForCombo);
+        const combo = parts.join('+');
+        if (combo === 'ctrl+c' || combo === 'ctrl+x') {
+          e.preventDefault();
+          await sendRemoteControl(targetSessionId, { type: 'key_press', key: combo });
+          // El upload del agente puede tardar; reintentar varias veces
+          [400, 1200, 2500, 4500, 7000].forEach((ms) => {
+            window.setTimeout(() => { pullRemoteClipboardToLocal(targetSessionId); }, ms);
+          });
+          return;
         }
-        await sendCentinelaControl(targetSessionId, { type: 'key_press', key: 'ctrl+v' });
-        return;
-      }
-
-      if (isCopy) {
+        if (combo === 'ctrl+v') {
+          // Sin preventDefault: si no, Chrome no dispara paste y no llegan los archivos del Explorador.
+          releaseModifiers();
+          return;
+        }
         e.preventDefault();
-        await sendCentinelaControl(targetSessionId, { type: 'key_press', key: 'ctrl+c' });
-        setTimeout(async () => {
-          try {
-            const text = await getCentinelaClipboard(targetSessionId);
-            if (text) {
-              setRemoteClipboard(text);
-              await navigator.clipboard.writeText(text);
-              setShowNotification("Portapapeles copiado al local.");
-            }
-          } catch (err) {}
-        }, 500);
+        await sendRemoteControl(targetSessionId, { type: 'key_press', key: combo });
         return;
       }
 
       const mapped = mapRemoteKey(e);
-      if (mapped) {
+      const usePhysicalPrintableKey =
+        !isAltGr &&
+        e.key.length === 1 &&
+        ((e.code in codeToVk) || /^Digit[0-9]$/.test(e.code) || /^Numpad/.test(e.code));
+      if (usePhysicalPrintableKey && mapped) {
         e.preventDefault();
-        await sendCentinelaControl(targetSessionId, { type: 'key_down', key: mapped });
+        await sendRemoteControl(targetSessionId, { type: 'key_down', key: mapped, code: e.code });
         return;
       }
 
-      // Caracteres fuera del mapa VK (ñ, símbolos de layout): enviar texto
+      const typedChar =
+        e.key.length === 1 &&
+        !(e.key in specialKeys) &&
+        (isAltGr || (!usePhysicalPrintableKey && !e.ctrlKey && !e.altKey && !e.metaKey))
+          ? e.key
+          : null;
+      const isPrintableSymbol = !!(typedChar && !/[a-zA-Z0-9]/.test(typedChar));
+
+      if (isPrintableSymbol && typedChar) {
+        e.preventDefault();
+        await sendRemoteControl(targetSessionId, {
+          type: 'write_text',
+          text: typedChar,
+          restore_modifiers: e.shiftKey && !isAltGr ? ['shift'] : [],
+        });
+        return;
+      }
+
+      if (mapped) {
+        e.preventDefault();
+        await sendRemoteControl(targetSessionId, { type: 'key_down', key: mapped, code: e.code });
+        return;
+      }
+
       if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
         e.preventDefault();
-        await sendCentinelaControl(targetSessionId, { type: 'write_text', text: e.key });
+        await sendRemoteControl(targetSessionId, {
+          type: 'write_text',
+          text: e.key,
+          restore_modifiers: e.shiftKey ? ['shift'] : [],
+        });
       }
     };
 
     const handleKeyUp = async (e: KeyboardEvent) => {
       if (!isControlEnabled) return;
+      if (isModalOpen || showLicenseModal || assignModal) return;
       const activeEl = document.activeElement;
-      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || (activeEl as HTMLElement).isContentEditable)) {
         return;
       }
+      const isAltGr = !!(e.getModifierState && e.getModifierState('AltGraph'));
       const mapped = mapRemoteKey(e);
+      const usePhysicalPrintableKey =
+        !isAltGr &&
+        e.key.length === 1 &&
+        ((e.code in codeToVk) || /^Digit[0-9]$/.test(e.code) || /^Numpad/.test(e.code));
+      if (usePhysicalPrintableKey && mapped) {
+        e.preventDefault();
+        await sendRemoteControl(targetSessionId, { type: 'key_up', key: mapped, code: e.code });
+        return;
+      }
+      const isPrintableSymbol =
+        e.key.length === 1 &&
+        !usePhysicalPrintableKey &&
+        !/[a-zA-Z0-9]/.test(e.key) &&
+        (isAltGr || (!e.ctrlKey && !e.altKey && !e.metaKey)) &&
+        !(e.key in specialKeys);
+      if (isPrintableSymbol) {
+        e.preventDefault();
+        return;
+      }
       if (!mapped) return;
       e.preventDefault();
-      await sendCentinelaControl(targetSessionId, { type: 'key_up', key: mapped });
+      await sendRemoteControl(targetSessionId, { type: 'key_up', key: mapped, code: e.code });
     };
 
     const handleBlur = () => releaseModifiers();
 
+    const handlePaste = async (e: ClipboardEvent) => {
+      if (!isControlEnabled) return;
+      if (isModalOpen || showLicenseModal || assignModal) return;
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || (activeEl as HTMLElement).isContentEditable)) {
+        return;
+      }
+      const picked: File[] = [];
+      const dt = e.clipboardData;
+      if (dt?.files?.length) {
+        for (const f of Array.from(dt.files)) picked.push(f);
+      }
+      if (!picked.length && dt?.items) {
+        for (const item of Array.from(dt.items)) {
+          if (item.kind !== 'file') continue;
+          const f = item.getAsFile();
+          if (f) picked.push(f);
+        }
+      }
+      const text = dt?.getData('text') || '';
+      if (picked.length > 0) {
+        e.preventDefault();
+        await pasteFilesToRemote(targetSessionId, picked);
+        return;
+      }
+      if (text) {
+        e.preventDefault();
+        await pasteTextToRemote(targetSessionId, text);
+        return;
+      }
+      setShowNotification('El navegador no recibió el archivo. Usá Pegar archivo en la barra, o arrastralo sobre la pantalla.');
+      setTimeout(() => setShowNotification(null), 4500);
+    };
+
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('paste', handlePaste);
     window.addEventListener('blur', handleBlur);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('paste', handlePaste);
       window.removeEventListener('blur', handleBlur);
       releaseModifiers();
     };
-  }, [standaloneId, focusedSessionId, remoteClipboard, isControlEnabled]);
+  }, [standaloneId, focusedSessionId, isControlEnabled, sendRemoteControl, isModalOpen, showLicenseModal, assignModal, pasteTextToRemote, pasteFilesToRemote, pullRemoteClipboardToLocal]);
 
   useEffect(() => {
     let interval: any;
@@ -2735,14 +3462,15 @@ export default function App() {
       const fetchAlerts = async () => {
         try {
           const alerts = await getCentinelaAlerts();
-          setActiveAlerts(alerts);
-
-          Object.entries(alerts).forEach(([id, list]: any) => {
-            if (list.length > 0 && !activeAlerts[id]) {
-              setShowNotification(`¡Alerta Crítica en PC #${id}!`);
-              triggerPushNotification("⚠️ Alerta Crítica de Centinela", `¡Problema detectado en PC #${id}! Detalle: ${list.join(', ')}`, `/?remote_device_id=${id}`);
-              setTimeout(() => setShowNotification(null), 5000);
-            }
+          setActiveAlerts((prev: any) => {
+            Object.entries(alerts).forEach(([id, list]: any) => {
+              if (list.length > 0 && !prev[id]) {
+                setShowNotification(`¡Alerta Crítica en PC #${id}!`);
+                triggerPushNotification("⚠️ Alerta Crítica de Centinela", `¡Problema detectado en PC #${id}! Detalle: ${list.join(', ')}`, `/?remote_device_id=${id}`);
+                setTimeout(() => setShowNotification(null), 5000);
+              }
+            });
+            return alerts;
           });
         } catch (e: any) {
           if (e?.message === 'Sesión Expirada' || e?.message?.includes('401')) {
@@ -2756,7 +3484,7 @@ export default function App() {
       interval = setInterval(fetchAlerts, 5000);
     }
     return () => clearInterval(interval);
-  }, [isAuthenticated, activeAlerts]);
+  }, [isAuthenticated]);
 
 
   const handleLogout = () => {
@@ -2812,6 +3540,12 @@ export default function App() {
       alert("Por favor completa los campos requeridos.");
       return;
     }
+    if (!userAbmForm.actividades.length) {
+      alert("Seleccioná al menos una actividad (Atención, Desarrollo, Finanzas...).");
+      return;
+    }
+    const departamento = userAbmForm.actividades.join(' / ');
+    const area_ids = areas.filter((a: any) => userAbmForm.actividades.includes(a.nombre)).map((a: any) => a.id);
     try {
       if (selectedUserForEdit) {
         // Modificar existente
@@ -2822,7 +3556,9 @@ export default function App() {
           password: userAbmForm.password || undefined,
           rol: userAbmForm.rol,
           celular: userAbmForm.celular,
-          departamento: userAbmForm.departamento,
+          departamento,
+          area_ids,
+          reseller_id: userAbmForm.rol === 'reseller' ? userAbmForm.reseller_id : null,
           profile_picture: userAbmForm.profile_picture || undefined,
           activo: userAbmForm.activo
         });
@@ -2836,7 +3572,9 @@ export default function App() {
           password: userAbmForm.password,
           rol: userAbmForm.rol,
           celular: userAbmForm.celular,
-          departamento: userAbmForm.departamento,
+          departamento,
+          area_ids,
+          reseller_id: userAbmForm.rol === 'reseller' ? userAbmForm.reseller_id : null,
           profile_picture: userAbmForm.profile_picture || undefined,
           activo: userAbmForm.activo
         });
@@ -2852,20 +3590,55 @@ export default function App() {
 
   const handleCreateTicket = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newClientId || !newSubject || !newDesc) return;
+    if (!newSubject.trim() || !newDesc.trim()) return;
+    if (newOrigen === "cliente" && !newClientId) {
+      alert("Seleccioná el cliente del pedido.");
+      return;
+    }
+    const destArea = areas.find(a => /desarroll|programac/i.test(a.nombre || ""));
     setIsSubmitting(true);
-    const created = await createTicket({
-      client_id: parseInt(newClientId),
-      asunto: newSubject,
-      descripcion: newDesc,
-      prioridad: newPriority
-    });
-    setIsSubmitting(false);
-    if (created) {
+    try {
+      const adjuntos: { url: string; filename: string; tipo: string }[] = [];
+      for (const file of newPedidoFiles) {
+        const uploaded = await uploadFile(file);
+        if (!uploaded?.url) throw new Error(`No se pudo subir ${file.name}`);
+        adjuntos.push({
+          url: uploaded.url,
+          filename: uploaded.filename || file.name,
+          tipo: adjuntoTipoFromFile(file),
+        });
+      }
+      await createTicket({
+        client_id: newClientId ? parseInt(newClientId) : null,
+        asunto: newSubject.trim(),
+        descripcion: newDesc.trim(),
+        prioridad: newPriority,
+        origen: newOrigen,
+        assigned_user_id: newAssigneeId ? parseInt(newAssigneeId) : null,
+        initial_area_id: destArea?.id || null,
+        adjuntos,
+      });
       setIsModalOpen(false);
-      setNewSubject(""); setNewDesc("");
+      setNewSubject("");
+      setNewDesc("");
+      setNewClientId("");
+      setNewAssigneeId("");
+      setNewOrigen("cliente");
+      setNewPriority("media");
+      setNewPedidoFiles([]);
+      setShowNotification("Pedido enviado a Programación. Todo el sector puede verlo.");
+      setTimeout(() => setShowNotification(null), 4000);
+      const destId = destArea?.id || null;
+      if (destId) {
+        setActiveTab('tickets');
+        setSelectedArea(destId);
+      }
       loadData();
-    } else alert("Error de comunicación backend.");
+    } catch (err: any) {
+      alert(err?.message || "Error de comunicación backend.");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleConsultarIA = async () => {
@@ -2883,16 +3656,71 @@ export default function App() {
     setTransferAreaId(null);
     setAttachment(null);
     setAttachmentUrl(null);
-    // loadData() ya se llama en otros lugares si es necesario, 
-    // pero aquí refrescamos la lista por si hubo cambios
-    // loadData(); 
+    setIsEditingTicket(false);
+    setEditSubject(t.asunto || "");
+    setEditDesc(t.descripcion || "");
+    setEditPriority(t.prioridad || "media");
+    setEditOrigen((t.origen === "interno" ? "interno" : "cliente") as "cliente" | "interno");
+    setEditClientId(t.client_id ? String(t.client_id) : "");
   }
 
   const closeTicketModal = () => {
     setSelectedTicket(null);
     setInterventions([]);
     setNewMessage("");
+    setIsEditingTicket(false);
+    setIsSavingTicketEdit(false);
   }
+
+  const handleSaveTicketEdit = async () => {
+    if (!selectedTicket) return;
+    if (!editSubject.trim() || !editDesc.trim()) {
+      alert("Completá asunto y descripción.");
+      return;
+    }
+    if (editOrigen === "cliente" && !editClientId) {
+      alert("Seleccioná el cliente del pedido.");
+      return;
+    }
+    setIsSavingTicketEdit(true);
+    try {
+      const payload: any = {
+        asunto: editSubject.trim(),
+        descripcion: editDesc.trim(),
+        prioridad: editPriority,
+        origen: editOrigen,
+      };
+      if (editClientId) {
+        payload.client_id = parseInt(editClientId, 10);
+      } else {
+        payload.clear_client = true;
+      }
+      const updated = await updateTicket(selectedTicket.id, payload);
+      const clientName =
+        updated?.cliente?.razon_social
+        || clients.find((c: any) => c.id === updated?.client_id)?.razon_social
+        || (updated?.origen === "interno" ? "Interno" : selectedTicket.clientName);
+      setSelectedTicket({ ...selectedTicket, ...updated, clientName });
+      setInterventions(updated?.intervenciones || interventions);
+      setIsEditingTicket(false);
+      loadData();
+      setShowNotification("Pedido actualizado.");
+      setTimeout(() => setShowNotification(null), 3000);
+    } catch (err: any) {
+      alert(err?.message || "No se pudo guardar el pedido.");
+    } finally {
+      setIsSavingTicketEdit(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedTicket) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeTicketModal();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectedTicket]);
 
   const toggleRemoteSession = async (centinela: any) => {
     const exists = activeSessions.find(s => s.id === centinela.id);
@@ -3010,6 +3838,14 @@ export default function App() {
       originalHeight = target.videoHeight;
     }
 
+    // Fallback: si el tamaño intrínseco todavía no está disponible (p.ej. el video P2P
+    // recién abierto reporta videoWidth=0 un instante), usar el tamaño renderizado para
+    // NO descartar el click. Con dims = rect no hay letterbox: el mapeo sigue siendo correcto.
+    if (!originalWidth || !originalHeight) {
+      originalWidth = rect.width;
+      originalHeight = rect.height;
+    }
+
     if (!originalWidth || !originalHeight) return null;
 
     const containerWidth = rect.width;
@@ -3074,14 +3910,22 @@ export default function App() {
     e.stopPropagation();
     setFocusedSessionId(deviceId);
     stealRemoteKeyboardFocus(e.currentTarget);
-    // e.button: 0 = Izquierdo, 1 = Central, 2 = Derecho
     const buttonMap: { [key: number]: string } = { 0: 'left', 1: 'middle', 2: 'right' };
     const button = buttonMap[e.button];
     if (!button) return;
+    mouseButtonsDownRef.current |= (1 << e.button);
 
     const coords = getCoordinates(e);
+    const _t = e.currentTarget as HTMLElement;
+    console.log('[MOUSE] down', {
+      button,
+      el: _t?.tagName,
+      videoW: (_t as HTMLVideoElement)?.videoWidth,
+      webrtc: webrtcState,
+      coords,
+    });
     if (coords) {
-      await sendCentinelaControl(deviceId, {
+      await sendRemoteControl(deviceId, {
         type: 'mouse_down',
         x: coords.x,
         y: coords.y,
@@ -3097,16 +3941,50 @@ export default function App() {
     const buttonMap: { [key: number]: string } = { 0: 'left', 1: 'middle', 2: 'right' };
     const button = buttonMap[e.button];
     if (!button) return;
+    mouseButtonsDownRef.current &= ~(1 << e.button);
 
     const coords = getCoordinates(e);
     if (coords) {
-      await sendCentinelaControl(deviceId, {
+      await sendRemoteControl(deviceId, {
         type: 'mouse_up',
         x: coords.x,
         y: coords.y,
         button
       });
     }
+  };
+
+  const handleMouseLeave = (e: React.MouseEvent<HTMLElement>, deviceId: number) => {
+    if (!isControlEnabled) return;
+    const down = mouseButtonsDownRef.current;
+    if (!down) return;
+    const coords = getCoordinates(e);
+    const buttonMap = ['left', 'middle', 'right'] as const;
+    buttonMap.forEach((button, i) => {
+      if (down & (1 << i)) {
+        sendRemoteControl(deviceId, {
+          type: 'mouse_up',
+          x: coords?.x ?? 0.5,
+          y: coords?.y ?? 0.5,
+          button,
+        });
+      }
+    });
+    mouseButtonsDownRef.current = 0;
+  };
+
+  const handleMouseMove = (e: React.MouseEvent<HTMLElement>, deviceId: number) => {
+    if (!isControlEnabled) return;
+    const now = performance.now();
+    if (now - lastMouseMoveAtRef.current < 16) return;
+    lastMouseMoveAtRef.current = now;
+    const coords = getCoordinates(e);
+    if (!coords) return;
+    sendRemoteControl(deviceId, {
+      type: 'mouse_move',
+      x: coords.x,
+      y: coords.y,
+    });
   };
 
   const handleImageWheel = async (e: React.WheelEvent<HTMLElement>, deviceId: number) => {
@@ -3116,7 +3994,7 @@ export default function App() {
     const direction = e.deltaY > 0 ? 'down' : 'up';
     const steps = Math.max(1, Math.min(10, Math.round(Math.abs(e.deltaY) / 40)));
     const coords = getCoordinates(e as unknown as React.MouseEvent<HTMLElement>);
-    await sendCentinelaControl(deviceId, {
+    await sendRemoteControl(deviceId, {
       type: 'mouse_scroll',
       direction,
       amount: steps,
@@ -3157,27 +4035,34 @@ export default function App() {
       adjunto_tipo: attachment ? (attachment.type.startsWith('audio') ? 'audio' : attachment.type.startsWith('image') ? 'imagen' : 'documento') : undefined
     };
 
-    const sent = await addIntervention(selectedTicket.id, data);
-    setIsSubmitting(false);
-
-    if (sent) {
-      setInterventions([...interventions, sent]);
-      setNewMessage("");
-      setTransferAreaId(null);
-      setAttachment(null);
-      setAttachmentUrl(null);
-      loadData();
+    try {
+      const sent = await addIntervention(selectedTicket.id, data);
+      if (sent) {
+        setInterventions([...interventions, sent]);
+        setNewMessage("");
+        setTransferAreaId(null);
+        setAttachment(null);
+        setAttachmentUrl(null);
+        loadData();
+      }
+    } catch (err: any) {
+      alert(err?.message || "No se pudo grabar la intervención");
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
   const handleFileUpload = async (file: File) => {
     setIsUploading(true);
-    const res = await uploadFile(file);
-    setIsUploading(false);
-    if (res) {
+    try {
+      const res = await uploadFile(file);
       setAttachment(file);
       setAttachmentUrl(res.url);
-    } else alert("Error al subir archivo");
+    } catch (err: any) {
+      alert(err?.message || "Error al subir archivo");
+    } finally {
+      setIsUploading(false);
+    }
   }
 
   const handleCreateOrUpdateClient = async (e: React.FormEvent) => {
@@ -3246,6 +4131,7 @@ export default function App() {
         cclifac: '',
         fecha_ultimo_pago: '',
         activo: true,
+        reseller_id: null,
       });
       loadData();
     } else alert("Error al procesar el cliente.");
@@ -3389,6 +4275,88 @@ export default function App() {
       body: JSON.stringify({ text })
     });
     setShowNotification("Portapapeles sincronizado.");
+    setTimeout(() => setShowNotification(null), 2000);
+  };
+
+  /** Captura el frame remoto actual y lo deja en el portapapeles local (Ctrl+V en Word, chat, etc.). */
+  const captureRemoteScreenToClipboard = async (deviceId: number) => {
+    try {
+      let blob: Blob | null = null;
+
+      const canvas = liveCanvasRef.current;
+      if (canvas && canvas.width > 0 && canvas.height > 0) {
+        blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+      }
+
+      if (!blob && videoRef.current && videoRef.current.videoWidth > 0) {
+        const v = videoRef.current;
+        const c = document.createElement('canvas');
+        c.width = v.videoWidth;
+        c.height = v.videoHeight;
+        const ctx = c.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(v, 0, 0);
+          blob = await new Promise<Blob | null>((resolve) => c.toBlob(resolve, 'image/png'));
+        }
+      }
+
+      if (!blob) {
+        const raw =
+          latestLiveFrameRef.current ||
+          sessionFramesRef.current[deviceId] ||
+          sessionFramesRef.current[String(deviceId)] ||
+          '';
+        if (!raw) {
+          setShowNotification('No hay imagen del cliente para capturar.');
+          setTimeout(() => setShowNotification(null), 3000);
+          return;
+        }
+        const dataUrl = raw.startsWith('data:') || raw.startsWith('blob:')
+          ? raw
+          : `data:image/jpeg;base64,${raw}`;
+        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const i = new Image();
+          i.onload = () => resolve(i);
+          i.onerror = reject;
+          i.src = dataUrl;
+        });
+        const c = document.createElement('canvas');
+        c.width = img.naturalWidth || img.width;
+        c.height = img.naturalHeight || img.height;
+        const ctx = c.getContext('2d');
+        if (!ctx || !c.width) {
+          setShowNotification('No se pudo procesar la captura.');
+          setTimeout(() => setShowNotification(null), 3000);
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        blob = await new Promise<Blob | null>((resolve) => c.toBlob(resolve, 'image/png'));
+      }
+
+      if (!blob) {
+        setShowNotification('No se pudo generar la captura.');
+        setTimeout(() => setShowNotification(null), 3000);
+        return;
+      }
+
+      if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        setShowNotification('Captura lista en el portapapeles — Ctrl+V donde quieras.');
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `apollo-captura-${deviceId}-${Date.now()}.png`;
+        a.click();
+        URL.revokeObjectURL(url);
+        setShowNotification('Navegador sin clipboard de imagen: se descargó el PNG.');
+      }
+      setTimeout(() => setShowNotification(null), 3500);
+    } catch (err: any) {
+      console.error('captureRemoteScreenToClipboard', err);
+      setShowNotification(err?.message || 'No se pudo copiar la captura (permiso del navegador).');
+      setTimeout(() => setShowNotification(null), 3500);
+    }
   };
 
   const fetchRemoteFiles = async (deviceId: number, path: string = "C:\\") => {
@@ -3598,6 +4566,7 @@ export default function App() {
         cclifac: c.cclifac || '',
         fecha_ultimo_pago: c.fecha_ultimo_pago || '',
         activo: c.activo !== false,
+        reseller_id: c.reseller_id || null,
       });
     } else {
       setEditingClient(null);
@@ -3624,14 +4593,45 @@ export default function App() {
         cclifac: '',
         fecha_ultimo_pago: '',
         activo: true,
+        reseller_id: null,
       });
       suggestNextGesactiCode('E');
     }
     setIsClientModalOpen(true);
   }
 
-  if (!isAuthenticated) return <Login onLogin={() => setIsAuthenticated(true)} />;
+  if (!isAuthenticated) {
+    if (showCentinelaPublic) {
+      return (
+        <CentinelaPublicPage
+          onBack={() => {
+            setShowCentinelaPublic(false);
+            try {
+              const url = new URL(window.location.href);
+              url.searchParams.delete('centinela');
+              url.searchParams.delete('page');
+              url.hash = '';
+              window.history.replaceState({}, '', url.pathname + url.search);
+            } catch { /* ignore */ }
+          }}
+        />
+      );
+    }
 
+    return (
+      <Login
+        onLogin={() => setIsAuthenticated(true)}
+        onOpenCentinelaInstall={() => {
+          setShowCentinelaPublic(true);
+          try {
+            const url = new URL(window.location.href);
+            url.searchParams.set('centinela', '1');
+            window.history.replaceState({}, '', url.toString());
+          } catch { /* ignore */ }
+        }}
+      />
+    );
+  }
   // --- RENDERING INDEPENDIENTE PARA SESIONES REMOTAS INDEPENDIENTES (STANDALONE WINDOWS) ---
   if (standaloneId) {
     const session = activeSessions[0];
@@ -3647,6 +4647,9 @@ export default function App() {
     const cmdInfo = sessionCmds[session.id] || { current: "", history: [] };
     const isChatOpen = !!chatVisibility[String(session.id)];
     const isFilesOpen = !!sessionFiles[session.id]?.visible;
+    const viewerClientName = session.client_name
+      || clients.find((c: any) => c.id === session.client_id)?.razon_social
+      || '';
 
     // Video en canvas (latestLiveFrameRef) puede seguir visible aunque frame en state esté vacío tras switch
     const hasLiveRemoteVideo = !!(
@@ -3662,55 +4665,64 @@ export default function App() {
     // ─── OVERLAY DE FULLSCREEN REAL DEL VISOR DECORADO (MANEJADO EN EL CONTENEDOR PRINCIPAL) ───
 
     return (
-      <div className="flex h-screen w-screen flex-col bg-slate-950 text-white p-4 overflow-hidden select-none">
-        {/* Cabecera Standalone */}
-        <div className="flex flex-col sm:flex-row gap-3 justify-between items-start sm:items-center mb-3" style={{ display: isViewerFullscreen ? 'none' : 'flex' }}>
-          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-            <span className={`w-3.5 h-3.5 rounded-full ${hasLiveRemoteVideo ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
-            <h1 className="text-sm sm:text-lg font-black tracking-tight truncate max-w-[200px] sm:max-w-none">{session.device_name || "Soporte Remoto"}</h1>
-            {deviceAssistLabel(session) ? (
-              <span className="text-[10px] sm:text-xs bg-sky-500/10 text-sky-400 border border-sky-500/20 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md font-mono font-black" title="ID de asistencia">
-                ID: {deviceAssistLabel(session)}
-              </span>
-            ) : (
-              <span className="text-[10px] sm:text-xs bg-slate-800 text-slate-400 px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md font-mono" title="ID interno DB">#{session.id}</span>
-            )}
-            {session.alt_remote_id && (
-              <span className="text-[9px] sm:text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-md font-mono" title="RustDesk / AnyDesk">RD: {session.alt_remote_id}</span>
-            )}
-            <span className="text-[9px] sm:text-[10px] bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 px-2 py-0.5 rounded-md font-mono" title={`Build ${APP_BUILD} · ${APP_VERSION_TAG}`}>
-              {APP_VERSION_LABEL}
-            </span>
-            <span className={`text-[9px] sm:text-[10px] font-bold px-2 sm:px-2.5 py-0.5 sm:py-1 rounded-md uppercase tracking-wider ${hasLiveRemoteVideo ? (isControlEnabled ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 animate-pulse' : 'bg-amber-500/15 text-amber-400 border border-amber-500/20') : 'bg-red-500/15 text-red-400 border border-red-500/20'}`}>
-              {!hasLiveRemoteVideo ? 'DESCONECTADO' : (sessionSwitching ? 'Cambiando sesión' : (isControlEnabled ? 'Control Remoto' : 'Solo Observando'))}
-            </span>
-            {isCapsLockActive && (
-              <span className="text-[9px] sm:text-[10px] bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2.5 py-1 rounded-md font-bold flex items-center gap-1 animate-pulse shadow-sm shadow-amber-500/10">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
-                🔠 MAYÚS ACTIVO
-              </span>
-            )}
-            {/* Indicador de calidad de conexión en tiempo real */}
-            {hasLiveRemoteVideo && (
-              <span className={`text-[9px] sm:text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1.5 border font-mono ${
-                wsViewerConnected && connectionFps === 0 ? 'bg-slate-500/10 text-slate-400 border-slate-500/20' :
-                connectionQuality === 'excellent' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
-                connectionQuality === 'good'      ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
-                                                    'bg-red-500/10 text-red-400 border-red-500/20 animate-pulse'
-              }`} title={`Calidad: ${connectionQuality} | ${connectionFps} FPS`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${
-                  wsViewerConnected && connectionFps === 0 ? 'bg-slate-400 animate-pulse' :
-                  connectionQuality === 'excellent' ? 'bg-emerald-400' :
-                  connectionQuality === 'good'      ? 'bg-amber-400' : 'bg-red-400 animate-ping'
-                }`} />
-                {wsViewerConnected && connectionFps === 0 ? 'Espera' :
-                 connectionQuality === 'excellent' ? `${connectionFps} FPS · Cómoda` :
-                 connectionQuality === 'good'      ? `${connectionFps} FPS · Útil` : `${connectionFps} FPS · Bajo`
-                }
-              </span>
-            )}
+      <div className="flex h-screen w-screen flex-col bg-slate-950 text-white p-1 overflow-hidden select-none">
+        {/* Cabecera fina: cliente + PC siempre visibles. El resto va al panel lateral. */}
+        <div className="flex items-center gap-2 mb-1 px-1 min-h-[40px]" style={{ display: isViewerFullscreen ? 'none' : 'flex' }}>
+          <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${hasLiveRemoteVideo ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+          <div className="min-w-0 flex-1">
+            <h1 className="text-sm font-black tracking-tight truncate leading-tight" title={viewerClientName || 'Cliente'}>
+              {viewerClientName || 'Cliente'}
+            </h1>
+            <p className="text-[11px] text-slate-400 truncate leading-tight" title={session.device_name}>
+              PC: {session.device_name || '—'}
+              {deviceAssistLabel(session) ? ` · ID ${deviceAssistLabel(session)}` : ''}
+            </p>
           </div>
-          <div className="flex gap-2 w-full sm:w-auto flex-wrap">
+          <span className={`hidden sm:inline text-[9px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wider shrink-0 ${hasLiveRemoteVideo ? (isControlEnabled ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/15 text-amber-400 border border-amber-500/20') : 'bg-red-500/15 text-red-400 border border-red-500/20'}`}>
+            {!hasLiveRemoteVideo ? 'OFF' : (isControlEnabled ? 'Control' : 'Ver')}
+          </span>
+          {clipBridgeOn && (
+            <span className="hidden sm:inline text-[9px] font-bold px-2 py-0.5 rounded-md uppercase tracking-wider shrink-0 bg-sky-500/15 text-sky-300 border border-sky-500/30" title="Ctrl+C en un archivo de tu PC lo deja listo para Pegar en el cliente">
+              Copiar activo
+            </span>
+          )}
+          {hasLiveRemoteVideo && (
+            <span className="hidden md:inline text-[10px] font-mono text-slate-400 shrink-0">{connectionFps} FPS</span>
+          )}
+          <label
+            className="shrink-0 px-3 py-1.5 rounded-xl text-[11px] font-black uppercase tracking-wider border border-sky-500/40 bg-sky-700 hover:bg-sky-600 text-white cursor-pointer"
+            title="Elegí el archivo de tu PC. Después, en el cliente: cerrá el menú y clic derecho → Pegar. También podés arrastrarlo a la pantalla o Ctrl+V con la ventana enfocada."
+          >
+            Pegar archivo
+            <input
+              type="file"
+              multiple
+              className="hidden"
+              onChange={async (e) => {
+                const list = e.target.files;
+                if (list?.length) await pasteFilesToRemote(session.id, list);
+                e.target.value = '';
+              }}
+            />
+          </label>
+          <button
+            type="button"
+            onClick={() => setViewerToolsOpen(v => !v)}
+            className={`shrink-0 px-3 py-1.5 rounded-xl text-[11px] font-black uppercase tracking-wider border transition-all ${viewerToolsOpen ? 'bg-brand-500 border-brand-400 text-white' : 'bg-slate-800 border-white/10 text-slate-200 hover:bg-slate-700'}`}
+            title="Mostrar u ocultar herramientas, consola y teclado"
+          >
+            {viewerToolsOpen ? 'Ocultar panel' : 'Panel'}
+          </button>
+          <button
+            onClick={() => setShowEndSessionModal(true)}
+            className="shrink-0 bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded-xl text-[11px] font-bold"
+          >
+            Cerrar
+          </button>
+        </div>
+
+        {viewerToolsOpen && (
+          <aside className="fixed top-12 right-2 z-40 w-96 max-h-[calc(100vh-3.5rem)] overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/95 p-3 shadow-2xl flex flex-col gap-3">
             {/* Selector de Monitor (visible solo cuando hay 2+ monitores) */}
             {monitorCount > 1 && (
               <div className="flex items-center gap-1 bg-slate-800/80 rounded-xl px-2 py-1 border border-white/5">
@@ -3826,11 +4838,29 @@ export default function App() {
                   ? 'bg-violet-600 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
                   : 'bg-slate-700 border-white/10 text-slate-400 hover:bg-violet-700/50 hover:text-white'
               }`}
-              title={WEBCODECS_H264 ? 'Stream HD H.264 (WebCodecs, ~24 FPS)' : 'Modo Alto Rendimiento H.264 (JMuxer)'}
+              title="Modo Alto Rendimiento H.264 (fMP4/MSE, ~24 FPS)"
             >
               <span>⚡</span>
               <span className="hidden sm:inline">
-                {hqEnabled ? (WEBCODECS_H264 ? 'HD ON' : 'HQ ON') : (WEBCODECS_H264 ? 'HD' : 'HQ')}
+                {hqEnabled ? 'HD ON' : 'HD'}
+              </span>
+            </button>
+            <button
+              onClick={toggleWebRtc}
+              className={`flex-shrink-0 px-3 py-2 rounded-xl text-xs font-bold border transition-all flex items-center gap-1.5 ${
+                webrtcState === 'open'
+                  ? 'bg-emerald-600 border-emerald-500/30 text-white'
+                  : webrtcState === 'connecting'
+                    ? 'bg-amber-600 border-amber-500/30 text-white'
+                    : webrtcState === 'failed'
+                      ? 'bg-slate-700 border-red-500/40 text-red-300'
+                      : 'bg-slate-700 border-white/10 text-slate-400 hover:bg-emerald-700/50 hover:text-white'
+              }`}
+              title="Canal rápido UDP/P2P (fase 1). Si no conecta, se sigue con HD. Requiere agente 3.3.4+ con aiortc."
+            >
+              <span>⚡</span>
+              <span className="hidden sm:inline">
+                {webrtcState === 'open' ? 'P2P ON' : webrtcState === 'connecting' ? 'P2P…' : webrtcState === 'failed' ? 'P2P falló' : 'Canal rápido'}
               </span>
             </button>
 
@@ -3843,7 +4873,7 @@ export default function App() {
                 setTimeout(() => setShowNotification(null), 3500);
               }}
               className="flex-shrink-0 bg-slate-700 hover:bg-amber-600/40 hover:border-amber-400/50 text-slate-300 hover:text-amber-200 px-3 py-2 rounded-xl text-xs font-bold transition-all shadow-lg border border-white/10 flex items-center gap-1.5"
-              title="Restaurar ventanas minimizadas y despertar renderizado si la pantalla se ve negra"
+              title="Si ves negro: maximizá el Escritorio remoto en TU PC; este botón despierta ventanas en el cliente"
             >
               <span>🗔</span>
               <span className="hidden md:inline">Restaurar Pantalla</span>
@@ -3853,98 +4883,240 @@ export default function App() {
 
             <button
               onClick={enterViewerFullscreen}
-              className="flex-1 sm:flex-none bg-slate-800 hover:bg-slate-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold transition-all shadow-lg border border-white/5 flex items-center justify-center gap-2"
+              className="bg-slate-800 hover:bg-slate-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold transition-all shadow-lg border border-white/5 flex items-center justify-center gap-2"
               title="Pantalla Completa del Visor Remoto"
             >
-              <Maximize2 className="w-4 h-4 text-brand-400" /> <span className="hidden xs:inline">Pantalla Completa</span>
+              <Maximize2 className="w-4 h-4 text-brand-400" /> Pantalla Completa
             </button>
-            <button
-              onClick={() => {
-                setShowEndSessionModal(true);
-              }}
-              className="flex-1 sm:flex-none bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-lg text-center"
-            >
-              Cerrar Conexión
-            </button>
-          </div>
-        </div>
 
-        {/* ÚLTIMO ACCESO DETECTADO CON COMENTARIOS Y REPORTE IA (NUEVO) */}
-        {lastSupportSession && !isLastSessionBannerDismissed && !isViewerFullscreen && (
-          <div className="mb-3 p-4 rounded-2xl glass-dark border border-brand-500/20 text-slate-300 relative animate-in slide-in-from-top-4 flex flex-col md:flex-row gap-4 items-start justify-between shadow-lg">
-            <div className="flex-1 min-w-0">
-              <div className="flex flex-wrap items-center gap-2 mb-2">
-                <span className="text-brand-400 text-[10px] font-black uppercase tracking-widest bg-brand-500/10 px-2 py-0.5 rounded-md">
-                  ℹ️ Último Acceso de Soporte
-                </span>
-                <span className="text-slate-400 text-xs">
-                  por <strong className="text-slate-200">{lastSupportSession.technician_name}</strong> el {new Date(lastSupportSession.end_time).toLocaleString()}
-                </span>
-                {lastSupportSession.duration && (
-                  <span className="text-slate-500 text-[10px] font-mono bg-slate-900/50 px-1.5 py-0.5 rounded">
-                    Duración: {Math.round(lastSupportSession.duration / 60)} min
-                  </span>
+            {/* Herramientas — una sola fila dentro del panel (sin barra flotante) */}
+            <div className="mt-1 pt-3 border-t border-white/10 flex flex-col gap-2.5">
+              <div className="text-[10px] font-black uppercase tracking-wider text-slate-500 px-0.5">Herramientas</div>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  onClick={() => setIsControlEnabled(!isControlEnabled)}
+                  className={`flex flex-col items-center justify-center gap-1 px-2 py-2.5 rounded-xl text-[10px] font-bold border transition-all min-w-0 ${
+                    isControlEnabled
+                      ? 'bg-brand-500 border-brand-400 text-white'
+                      : 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
+                  }`}
+                  title={isControlEnabled ? 'Control activo' : 'Solo observar'}
+                >
+                  <Monitor size={16} />
+                  {isControlEnabled ? 'Control' : 'Ver'}
+                </button>
+                <button
+                  onClick={() => {
+                    const idStr = String(session.id);
+                    if (!chatVisibility[idStr]) fetchChatHistory(session.id);
+                    setChatVisibility(prev => ({ ...prev, [idStr]: !prev[idStr] }));
+                  }}
+                  className={`flex flex-col items-center justify-center gap-1 px-2 py-2.5 rounded-xl text-[10px] font-bold border transition-all min-w-0 ${
+                    isChatOpen ? 'bg-brand-600 border-brand-500 text-white' : 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
+                  }`}
+                  title="Chat con cliente"
+                >
+                  <MessageSquare size={16} />
+                  Chat
+                </button>
+                <button
+                  onClick={async () => {
+                    try {
+                      let sentFiles = false;
+                      try {
+                        const items = await navigator.clipboard.read();
+                        const files: File[] = [];
+                        for (const item of items) {
+                          for (const type of item.types) {
+                            if (type === 'text/plain') continue;
+                            const blob = await item.getType(type);
+                            const ext = type.split('/')[1] || 'bin';
+                            files.push(new File([blob], `portapapeles.${ext}`, { type }));
+                          }
+                        }
+                        if (files.length) {
+                          await pasteFilesToRemote(session.id, files);
+                          sentFiles = true;
+                        }
+                      } catch { /* clipboard.read archivos no siempre disponible */ }
+                      if (sentFiles) return;
+                      const text = await navigator.clipboard.readText();
+                      if (!text) {
+                        setShowNotification('Portapapeles vacío. Arrastrá archivos a la pantalla o usá Enviar archivos.');
+                        setTimeout(() => setShowNotification(null), 3000);
+                        return;
+                      }
+                      await pasteTextToRemote(session.id, text);
+                    } catch {
+                      const text = prompt('Texto a enviar al portapapeles del cliente:');
+                      if (text !== null) await pasteTextToRemote(session.id, text);
+                    }
+                  }}
+                  className="flex flex-col items-center justify-center gap-1 px-2 py-2.5 rounded-xl text-[10px] font-bold border bg-blue-700/80 border-blue-500/40 text-white hover:bg-blue-600 min-w-0"
+                  title="Pegar texto del portapapeles en el cliente. Archivos: arrastrar a la pantalla o Enviar archivos."
+                >
+                  <Clipboard size={16} />
+                  Pegar
+                </button>
+                <button
+                  onClick={() => captureRemoteScreenToClipboard(session.id)}
+                  className="flex flex-col items-center justify-center gap-1 px-2 py-2.5 rounded-xl text-[10px] font-bold border bg-slate-800 border-white/10 text-slate-300 hover:bg-violet-700/60 hover:text-white min-w-0"
+                  title="Capturar pantalla del cliente → tu portapapeles"
+                >
+                  <Camera size={16} />
+                  Captura
+                </button>
+                <button
+                  onClick={() => {
+                    const visible = !sessionFiles[session.id]?.visible;
+                    if (visible) fetchRemoteFiles(session.id);
+                    setSessionFiles(prev => ({ ...prev, [session.id]: { ...prev[session.id], visible } }));
+                  }}
+                  className={`flex flex-col items-center justify-center gap-1 px-2 py-2.5 rounded-xl text-[10px] font-bold border transition-all min-w-0 ${
+                    isFilesOpen ? 'bg-emerald-600 border-emerald-500 text-white' : 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
+                  }`}
+                  title="Explorador de archivos remoto"
+                >
+                  <FileText size={16} />
+                  Archivos
+                </button>
+                <button
+                  onClick={() => setIsDeviceLogsOpen(prev => !prev)}
+                  className={`flex flex-col items-center justify-center gap-1 px-2 py-2.5 rounded-xl text-[10px] font-bold border transition-all min-w-0 ${
+                    isDeviceLogsOpen ? 'bg-violet-600 border-violet-500 text-white' : 'bg-slate-800 border-white/10 text-slate-300 hover:bg-slate-700'
+                  }`}
+                  title="Bitácora / consola"
+                >
+                  <Terminal size={16} />
+                  Logs
+                </button>
+              </div>
+              <label className="flex items-center justify-center gap-2 px-2 py-2 rounded-xl text-[10px] font-bold bg-emerald-700/80 hover:bg-emerald-600 text-white border border-emerald-500/40 cursor-pointer transition-all">
+                <input
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={async (e) => {
+                    const list = e.target.files;
+                    if (list?.length) await pasteFilesToRemote(session.id, list);
+                    e.target.value = '';
+                  }}
+                />
+                <span>📁</span> Enviar archivos al cliente
+              </label>
+              <p className="text-[9px] text-slate-500 leading-snug px-0.5">
+                Tip: también podés arrastrar archivos sobre la pantalla o Ctrl+V con archivos copiados.
+              </p>
+            </div>
+
+            {/* Consola rápida */}
+            <div className="mt-1 pt-3 border-t border-white/10 flex flex-col gap-2">
+              <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">Consola</div>
+              <div className="flex gap-1.5 items-center">
+                <input
+                  type="text"
+                  value={cmdInfo.current}
+                  onChange={(e) => setSessionCmds({ ...sessionCmds, [session.id]: { ...cmdInfo, current: e.target.value } })}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSendCommand(session.id)}
+                  className="flex-1 min-w-0 bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 text-[11px] text-emerald-400 font-mono outline-none"
+                  placeholder="Comando..."
+                />
+                <button onClick={() => handleSendCommand(session.id)} className="bg-emerald-600 p-1.5 rounded-lg text-white hover:bg-emerald-700 shrink-0">
+                  <ArrowUpRight size={14} />
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'ctrl+alt+del' })} className="bg-red-500/20 hover:bg-red-500/40 text-[9px] font-extrabold text-red-400 px-2 py-1 rounded-md border border-red-500/30" title="Ctrl+Alt+Sup">
+                  Ctrl+Alt+Sup
+                </button>
+                <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'enter' })} className="bg-slate-800 text-[9px] font-bold text-white px-2 py-1 rounded-md border border-white/5 hover:bg-slate-700">Enter</button>
+                <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'escape' })} className="bg-slate-800 text-[9px] font-bold text-white px-2 py-1 rounded-md border border-white/5 hover:bg-slate-700">Esc</button>
+                <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'tab' })} className="bg-slate-800 text-[9px] font-bold text-white px-2 py-1 rounded-md border border-white/5 hover:bg-slate-700">Tab</button>
+              </div>
+            </div>
+          </aside>
+        )}
+
+        {/* ÚLTIMO ACCESO — compacto bajo el header */}
+        {viewerToolsOpen && lastSupportSession && !isLastSessionBannerDismissed && !isViewerFullscreen && (
+          <div className="fixed top-12 left-2 z-40 max-w-xs p-2.5 rounded-xl glass-dark border border-brand-500/20 text-slate-300 shadow-lg">
+            <div className="flex items-start gap-2">
+              <div className="flex-1 min-w-0">
+                <div className="text-brand-400 text-[9px] font-black uppercase tracking-widest mb-0.5">Último acceso</div>
+                <div className="text-[11px] text-slate-300 truncate">
+                  {lastSupportSession.technician_name} · {new Date(lastSupportSession.end_time).toLocaleString()}
+                </div>
+                {lastSupportSession.comments && (
+                  <p className="text-[10px] text-slate-400 mt-1 line-clamp-2">"{lastSupportSession.comments}"</p>
                 )}
               </div>
-              
-              {lastSupportSession.comments && (
-                <p className="text-xs sm:text-sm text-slate-200 font-medium mb-2 pl-3 border-l-2 border-brand-500">
-                  <span className="text-brand-400 font-bold text-[10px] uppercase tracking-wider block">Nota del Operador:</span>
-                  "{lastSupportSession.comments}"
-                </p>
-              )}
-              
-              {lastSupportSession.ai_report && (
-                <div className="mt-2 text-[11px] sm:text-xs text-slate-400 bg-slate-950/60 p-3 rounded-xl border border-white/5 font-sans leading-relaxed">
-                  <span className="text-indigo-400 font-extrabold uppercase tracking-wider text-[10px] block mb-1 flex items-center gap-1">
-                    <Sparkles className="w-3.5 h-3.5 animate-pulse text-indigo-400" /> Resumen de Actividad Generado por IA
-                  </span>
-                  <div className="text-slate-300 space-y-1">
-                    {lastSupportSession.ai_report.split('\n').map((line: string, i: number) => {
-                      if (line.trim().startsWith('*') || line.trim().startsWith('-')) {
-                        return <div key={i} className="flex gap-1.5 items-start pl-1">
-                          <span className="text-indigo-500 font-bold">•</span>
-                          <span>{line.replace(/^[\*\-\s]+/, '')}</span>
-                        </div>;
-                      }
-                      return <p key={i}>{line}</p>;
-                    })}
-                  </div>
-                </div>
-              )}
+              <button
+                onClick={() => setIsLastSessionBannerDismissed(true)}
+                className="text-slate-500 hover:text-white p-1 shrink-0"
+                title="Ocultar"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
-            <button 
-              onClick={() => setIsLastSessionBannerDismissed(true)} 
-              className="text-slate-500 hover:text-white bg-slate-900 hover:bg-slate-800 p-2 rounded-xl transition-colors border border-white/5"
-              title="Ocultar recordatorio"
-            >
-              <X className="w-4 h-4" />
-            </button>
           </div>
         )}
 
         {/* Cuerpo Principal */}
-        <div className="flex-1 flex flex-col lg:flex-row gap-4 overflow-y-auto lg:overflow-hidden min-h-0">
+        <div className="flex-1 min-w-0 flex flex-col lg:flex-row gap-4 overflow-hidden min-h-0">
           {/* Pantalla Remota */}
           <div 
             className={isViewerFullscreen 
               ? "fixed inset-0 z-[9999] bg-black flex items-center justify-center select-none" 
-              : "flex-1 bg-black rounded-2xl border border-white/5 flex items-center justify-center relative overflow-hidden min-h-0"}
+              : "flex-1 min-w-0 bg-black rounded-2xl border border-white/5 relative overflow-hidden min-h-0"}
             onMouseMove={isViewerFullscreen ? resetToolbarTimer : undefined}
+            onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
+            onDragOver={(e) => {
+              if (!isControlEnabled) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'copy';
+              setIsDraggingFiles(true);
+            }}
+            onDragLeave={() => setIsDraggingFiles(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDraggingFiles(false);
+              if (!isControlEnabled) return;
+              if (e.dataTransfer.files?.length) pasteFilesToRemote(session.id, e.dataTransfer.files);
+            }}
             style={{ cursor: isViewerFullscreen ? (toolbarVisible ? 'default' : 'none') : 'default' }}
           >
+            {isDraggingFiles && (
+              <div className="absolute inset-0 z-40 flex items-center justify-center bg-brand-600/30 border-4 border-dashed border-brand-300 pointer-events-none">
+                <span className="text-white text-sm font-bold bg-black/60 px-4 py-2 rounded-xl">Soltar para pegar archivos en el cliente</span>
+              </div>
+            )}
             {(hqEnabled || frame || latestLiveFrameRef.current || wsViewerConnected) ? (
-              <div className="relative w-full h-full flex items-center justify-center">
+              <div className="absolute inset-0">
                 <canvas
                   ref={setLiveCanvasRef}
                   tabIndex={0}
                   onMouseDown={(e) => handleMouseDown(e, session.id)}
                   onMouseUp={(e) => handleMouseUp(e, session.id)}
-                  onMouseLeave={(e) => handleMouseUp(e, session.id)}
+                  onMouseMove={(e) => handleMouseMove(e, session.id)}
+                  onMouseLeave={(e) => handleMouseLeave(e, session.id)}
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
                   onWheel={(e) => handleImageWheel(e, session.id)}
-                  style={{ display: (hqState === 'open' && !WEBCODECS_H264) ? 'none' : 'block' }}
-                  className={`w-full h-full object-contain cursor-default select-none outline-none transition-all duration-500 ${showDisconnectedOverlay ? 'filter blur-[4px] brightness-[0.35] grayscale contrast-75' : ''}`}
+                  style={{ display: webrtcState === 'open' || hqState === 'open' ? 'none' : 'block' }}
+                  className={`absolute inset-0 w-full h-full object-contain cursor-default select-none outline-none ${showDisconnectedOverlay ? 'filter blur-[4px] brightness-[0.35] grayscale contrast-75' : captureWarning ? 'filter blur-[3px] brightness-[0.45] saturate-50' : ''}`}
+                />
+
+                <video
+                  ref={webrtcVideoRef}
+                  tabIndex={0}
+                  autoPlay muted playsInline
+                  onMouseDown={(e) => handleMouseDown(e, session.id)}
+                  onMouseUp={(e) => handleMouseUp(e, session.id)}
+                  onMouseMove={(e) => handleMouseMove(e, session.id)}
+                  onMouseLeave={(e) => handleMouseLeave(e, session.id)}
+                  onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                  onWheel={(e) => handleImageWheel(e, session.id)}
+                  style={{ display: webrtcState === 'open' ? 'block' : 'none' }}
+                  className={`absolute inset-0 w-full h-full object-contain outline-none ${captureWarning ? 'filter blur-[3px] brightness-[0.45] saturate-50' : ''}`}
                 />
                 
                 <video
@@ -3953,16 +5125,30 @@ export default function App() {
                   autoPlay muted playsInline
                   onMouseDown={(e) => handleMouseDown(e, session.id)}
                   onMouseUp={(e) => handleMouseUp(e, session.id)}
-                  onMouseLeave={(e) => handleMouseUp(e, session.id)}
+                  onMouseMove={(e) => handleMouseMove(e, session.id)}
+                  onMouseLeave={(e) => handleMouseLeave(e, session.id)}
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
                   onWheel={(e) => handleImageWheel(e, session.id)}
-                  style={{ display: (hqState === 'open' && !WEBCODECS_H264) ? 'block' : 'none' }}
-                  className="w-full h-full object-contain outline-none"
+                  style={{ display: webrtcState !== 'open' && hqState === 'open' ? 'block' : 'none' }}
+                  className={`absolute inset-0 w-full h-full object-contain outline-none ${captureWarning ? 'filter blur-[3px] brightness-[0.45] saturate-50' : ''}`}
                 />
 
                 {hqEnabled && hqState !== 'open' && wsViewerConnected && connectionFps === 0 && (
                   <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 max-w-md px-4 py-2 rounded-xl bg-violet-500/15 border border-violet-500/30 text-violet-100 text-xs text-center pointer-events-none">
                     Modo HD: conectando… Si la pantalla sigue negra, se activará calidad estándar en unos segundos (o desactiva HD).
+                  </div>
+                )}
+
+                {captureWarning && (
+                  <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 max-w-lg w-[92%] px-4 py-3 rounded-xl bg-amber-500/20 border border-amber-400/40 text-amber-50 text-xs text-center shadow-lg flex flex-col gap-2 items-center">
+                    <p className="font-semibold leading-relaxed">{captureWarning}</p>
+                    <button
+                      type="button"
+                      onClick={() => setCaptureWarning(null)}
+                      className="px-3 py-1 rounded-lg bg-amber-500/30 border border-amber-400/40 text-[10px] font-black uppercase tracking-wider hover:bg-amber-500/40"
+                    >
+                      Entendido
+                    </button>
                   </div>
                 )}
 
@@ -4036,9 +5222,9 @@ export default function App() {
                               ? 'bg-violet-600/80 border-violet-500/30 text-white shadow-violet-500/20 shadow-lg'
                               : 'bg-slate-700/60 border-white/10 text-slate-400 hover:bg-violet-700/50 hover:text-white'
                           }`}
-                          title={WEBCODECS_H264 ? 'Stream HD H.264 (WebCodecs, ~24 FPS)' : 'Modo Alto Rendimiento H.264 (JMuxer)'}
+                          title="Modo Alto Rendimiento H.264 (fMP4/MSE, ~24 FPS)"
                         >
-                          {hqEnabled ? (WEBCODECS_H264 ? '⚡ HD ON' : '⚡ HQ ON') : (WEBCODECS_H264 ? '⚡ Stream HD' : '⚡ Alto Rendimiento')}
+                          {hqEnabled ? '⚡ HD ON' : '⚡ Alto Rendimiento'}
                         </button>
                         <button
                           onClick={() => setIsControlEnabled(v => !v)}
@@ -4075,62 +5261,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Panel de Herramientas Flotante */}
-            <div className="absolute top-4 right-4 flex flex-col gap-2 z-30" style={{ display: isViewerFullscreen ? 'none' : 'flex' }}>
-              <button
-                onClick={() => setIsControlEnabled(!isControlEnabled)}
-                className={`p-2.5 rounded-xl text-white shadow-lg border border-white/10 ${isControlEnabled ? 'bg-brand-500 hover:bg-brand-600' : 'bg-slate-700 hover:bg-slate-600'}`}
-                title={isControlEnabled ? "Control Activo (Clic para Solo Observar)" : "Modo Observador (Clic para Controlar)"}
-              >
-                <Monitor size={18} className={isControlEnabled ? "text-white" : "text-slate-400"} />
-              </button>
-              <button
-                onClick={() => {
-                  const idStr = String(session.id);
-                  if (!chatVisibility[idStr]) fetchChatHistory(session.id);
-                  setChatVisibility(prev => ({ ...prev, [idStr]: !prev[idStr] }));
-                }}
-                className={`p-2.5 rounded-xl text-white shadow-lg border border-white/10 ${isChatOpen ? 'bg-brand-600' : 'bg-brand-500/80 hover:bg-brand-500'}`}
-                title="Chat con Cliente"
-              >
-                <MessageSquare size={18} />
-              </button>
-              <button
-                onClick={async () => {
-                  try {
-                    const text = await navigator.clipboard.readText();
-                    syncRemoteClipboard(session.id, text);
-                  } catch (err) {
-                    const text = prompt("Ingrese el texto a enviar al portapapeles de la PC cliente:");
-                    if (text !== null) syncRemoteClipboard(session.id, text);
-                  }
-                }}
-                className="bg-blue-600/80 hover:bg-blue-600 p-2.5 rounded-xl text-white shadow-lg border border-white/10"
-                title="Sincronizar Portapapeles"
-              >
-                <Clipboard size={18} />
-              </button>
-              <button
-                onClick={() => {
-                  const visible = !sessionFiles[session.id]?.visible;
-                  if (visible) fetchRemoteFiles(session.id);
-                  setSessionFiles(prev => ({ ...prev, [session.id]: { ...prev[session.id], visible } }));
-                }}
-                className={`p-2.5 rounded-xl text-white shadow-lg border border-white/10 ${isFilesOpen ? 'bg-emerald-600' : 'bg-emerald-500/80 hover:bg-emerald-500'}`}
-                title="Explorador de Archivos"
-              >
-                <FileText size={18} />
-              </button>
-              <button
-                onClick={() => {
-                  setIsDeviceLogsOpen(prev => !prev);
-                }}
-                className={`p-2.5 rounded-xl text-white shadow-lg border border-white/10 ${isDeviceLogsOpen ? 'bg-violet-600 shadow-violet-500/20' : 'bg-violet-500/80 hover:bg-violet-500'}`}
-                title="Bitácora de Logs de Telemetría"
-              >
-                <Terminal size={18} />
-              </button>
-            </div>
+            {/* Panel de Herramientas — unificado dentro del aside (derecha) */}
           </div>
 
           {/* Paneles de Apoyo: Chat, Archivos y Logs */}
@@ -4297,96 +5428,6 @@ export default function App() {
               )}
             </div>
           )}
-        </div>
-
-        {/* Barra de Teclado, Consola y Teclas Rápidas */}
-        <div className="mt-3 p-3 bg-slate-900 border border-white/5 rounded-2xl flex flex-col gap-3">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Consola */}
-            <div className="flex gap-2 items-center">
-              <span className="text-[10px] uppercase font-black text-slate-500 w-16">Consola:</span>
-              <input
-                type="text"
-                value={cmdInfo.current}
-                onChange={(e) => setSessionCmds({ ...sessionCmds, [session.id]: { ...cmdInfo, current: e.target.value } })}
-                onKeyDown={(e) => e.key === 'Enter' && handleSendCommand(session.id)}
-                className="flex-1 bg-black/40 border border-white/10 rounded-xl px-4 py-2 text-xs text-emerald-400 font-mono outline-none"
-                placeholder="Comando de sistema..."
-              />
-              <button onClick={() => handleSendCommand(session.id)} className="bg-emerald-600 p-2 rounded-xl text-white hover:bg-emerald-700 transition-all">
-                <ArrowUpRight size={16} />
-              </button>
-            </div>
-
-            {/* Teclado */}
-            <div className="flex gap-2 items-center">
-              <span className="text-[10px] uppercase font-black text-slate-500 w-16">Teclado:</span>
-              <input
-                type="text"
-                id={`text-input-${session.id}`}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    const input = e.currentTarget;
-                    if (input.value) {
-                      sendCentinelaControl(session.id, { type: 'write_text', text: input.value });
-                      input.value = '';
-                    }
-                  }
-                }}
-                className="flex-1 bg-black/40 border border-white/10 rounded-xl px-4 py-2 text-xs text-brand-400 font-mono outline-none"
-                placeholder="Escribe texto y presiona Enter para escribirlo allá..."
-              />
-              <button
-                onClick={() => {
-                  const input = document.getElementById(`text-input-${session.id}`) as HTMLInputElement;
-                  if (input && input.value) {
-                    sendCentinelaControl(session.id, { type: 'write_text', text: input.value });
-                    input.value = '';
-                  }
-                }}
-                className="bg-brand-500 p-2 rounded-xl text-white hover:bg-brand-600 transition-all"
-              >
-                <Sparkles size={16} />
-              </button>
-            </div>
-          </div>
-
-          {/* Teclas Rápidas */}
-          <div className="flex gap-2 items-center flex-wrap pl-0 md:pl-16">
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'enter' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ⏎ Enter
-            </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'escape' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ⎋ Esc
-            </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'tab' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ⇥ Tab
-            </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'backspace' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ⌫ Borrar
-            </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'space' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ␣ Espacio
-            </button>
-
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'ctrl+alt+del' })} className="bg-red-500/20 hover:bg-red-500/40 text-[10px] font-extrabold text-red-400 px-3 py-1.5 rounded-lg border border-red-500/30 transition-all" title="Envia la combinación de seguridad CTRL + ALT + SUP (Ctrl+Alt+Del) para desbloquear la pantalla de Windows">
-              🚨 Ctrl + Alt + Sup
-            </button>
-            <span className="text-slate-600 text-xs font-bold px-2">|</span>
-            {/* Flechas de Navegación */}
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'up' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ▲ Arriba
-            </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'down' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ▼ Abajo
-            </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'left' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ◀ Izquierda
-            </button>
-            <button onClick={() => sendCentinelaControl(session.id, { type: 'key_press', key: 'right' })} className="bg-slate-800 text-[10px] font-bold text-white px-3 py-1.5 rounded-lg border border-white/5 hover:bg-slate-700 transition-all">
-              ▶ Derecha
-            </button>
-          </div>
         </div>
 
         {/* MODAL DE COMENTARIO Y REPORTE IA AL FINALIZAR SESIÓN (NUEVO) */}
@@ -4654,46 +5695,60 @@ export default function App() {
         </div>
 
         <nav className="flex-1 px-4 py-6 space-y-2 overflow-y-auto">
-          <div className="mb-4">
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Vistas Principales</p>
-            <NavItem icon={<Ticket size={20} />} text="Bandeja Unificada" badge={tickets.length > 0 ? tickets.length.toString() : ""} active={activeTab === 'tickets' && selectedArea === null} onClick={() => { setActiveTab('tickets'); setSelectedArea(null); setIsSidebarOpen(false); }} />
-            <NavItem icon={<Monitor size={20} />} text="Terminal Remota" badge="En Vivo" active={activeTab === 'monitor'} onClick={() => { setActiveTab('monitor'); setIsSidebarOpen(false); }} />
-            <NavItem icon={<Video size={20} />} text="Agenda" active={activeTab === 'agenda'} onClick={() => { setActiveTab('agenda'); setIsSidebarOpen(false); }} />
-            <NavItem icon={<Users size={20} />} text="Base Clientes" active={activeTab === 'clients'} onClick={() => { setActiveTab('clients'); setIsSidebarOpen(false); }} />
-          </div>
+          {userProfile?.rol === 'reseller' ? (
+            <>
+              <div className="mb-4">
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Mi Panel</p>
+                <NavItem icon={<Ticket size={20} />} text="Mis Pedidos" badge={tickets.length > 0 ? tickets.length.toString() : ""} active={activeTab === 'tickets'} onClick={() => { setActiveTab('tickets'); setSelectedArea(null); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Monitor size={20} />} text="Terminal Remota" active={activeTab === 'monitor'} onClick={() => { setActiveTab('monitor'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Users size={20} />} text="Mis Clientes" active={activeTab === 'clients'} onClick={() => { setActiveTab('clients'); setIsSidebarOpen(false); }} />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="mb-4">
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Vistas Principales</p>
+                <NavItem icon={<Ticket size={20} />} text="Bandeja Unificada" badge={tickets.length > 0 ? tickets.length.toString() : ""} active={activeTab === 'tickets' && selectedArea === null} onClick={() => { setActiveTab('tickets'); setSelectedArea(null); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Monitor size={20} />} text="Terminal Remota" badge="En Vivo" active={activeTab === 'monitor'} onClick={() => { setActiveTab('monitor'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Video size={20} />} text="Agenda" active={activeTab === 'agenda'} onClick={() => { setActiveTab('agenda'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Users size={20} />} text="Base Clientes" active={activeTab === 'clients'} onClick={() => { setActiveTab('clients'); setIsSidebarOpen(false); }} />
+              </div>
 
-          <div className="mb-4">
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Sectores Operativos</p>
-            {areas.map(area => (
-              <NavItem
-                key={area.id}
-                icon={<Folder size={18} className={selectedArea === area.id ? "text-brand-500" : "text-slate-400"} />}
-                text={area.nombre}
-                active={activeTab === 'tickets' && selectedArea === area.id}
-                onClick={() => { setActiveTab('tickets'); setSelectedArea(area.id); setIsSidebarOpen(false); }}
-              />
-            ))}
-          </div>
+              <div className="mb-4">
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Sectores Operativos</p>
+                {areas.map(area => (
+                  <NavItem
+                    key={area.id}
+                    icon={<Folder size={18} className={selectedArea === area.id ? "text-brand-500" : "text-slate-400"} />}
+                    text={area.nombre}
+                    active={activeTab === 'tickets' && selectedArea === area.id}
+                    onClick={() => { setActiveTab('tickets'); setSelectedArea(area.id); setIsSidebarOpen(false); }}
+                  />
+                ))}
+              </div>
 
-          <div className="mb-4">
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Control Interno</p>
-            <NavItem icon={<Activity size={20} />} text="Plantel de Personal" active={activeTab === 'personnel'} onClick={() => { setActiveTab('personnel'); setIsSidebarOpen(false); }} />
-            <NavItem icon={<Smartphone size={20} />} text="Dispositivos Móviles" active={activeTab === 'android_devices'} onClick={() => { setActiveTab('android_devices'); setIsSidebarOpen(false); }} />
-            <NavItem icon={<Clock size={20} />} text="Activaciones OL" active={activeTab === 'acti_pending'} onClick={() => { setActiveTab('acti_pending'); setIsSidebarOpen(false); }} />
-            <NavItem icon={<CalendarDays size={20} />} text="Extensiones OL" active={activeTab === 'extensiones'} onClick={() => { setActiveTab('extensiones'); setIsSidebarOpen(false); }} />
-          </div>
+              <div className="mb-4">
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Control Interno</p>
+                <NavItem icon={<Activity size={20} />} text="Plantel de Personal" active={activeTab === 'personnel'} onClick={() => { setActiveTab('personnel'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<CreditCard size={20} />} text="Revendedores" active={activeTab === 'resellers'} onClick={() => { setActiveTab('resellers'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Smartphone size={20} />} text="Dispositivos Móviles" active={activeTab === 'android_devices'} onClick={() => { setActiveTab('android_devices'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Clock size={20} />} text="Activaciones OL" active={activeTab === 'acti_pending'} onClick={() => { setActiveTab('acti_pending'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<CalendarDays size={20} />} text="Extensiones OL" active={activeTab === 'extensiones'} onClick={() => { setActiveTab('extensiones'); setIsSidebarOpen(false); }} />
+              </div>
 
-          <div className="mb-4">
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Diagnóstico</p>
-            <NavItem icon={<Terminal size={20} />} text="Bitácora de Logs" active={activeTab === 'logs'} onClick={() => { setActiveTab('logs'); setIsSidebarOpen(false); }} />
-          </div>
+              <div className="mb-4">
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Diagnóstico</p>
+                <NavItem icon={<Terminal size={20} />} text="Bitácora de Logs" active={activeTab === 'logs'} onClick={() => { setActiveTab('logs'); setIsSidebarOpen(false); }} />
+              </div>
 
-          <div>
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Sistema</p>
-            <NavItem icon={<Sparkles size={20} />} text="IA Copiloto" badge="Beta" onClick={() => setIsSidebarOpen(false)} />
-            <NavItem icon={<FileText size={20} />} text="Licencias" active={activeTab === 'licenses'} onClick={() => { setActiveTab('licenses'); setIsSidebarOpen(false); }} />
-            <NavItem icon={<Settings size={20} />} text="Ajustes" active={activeTab === 'settings'} onClick={() => { setActiveTab('settings'); setIsSidebarOpen(false); }} />
-          </div>
+              <div>
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-2 mb-2">Sistema</p>
+                <NavItem icon={<Sparkles size={20} />} text="IA Copiloto" badge="Beta" onClick={() => setIsSidebarOpen(false)} />
+                <NavItem icon={<FileText size={20} />} text="Licencias" active={activeTab === 'licenses'} onClick={() => { setActiveTab('licenses'); setIsSidebarOpen(false); }} />
+                <NavItem icon={<Settings size={20} />} text="Ajustes" active={activeTab === 'settings'} onClick={() => { setActiveTab('settings'); setIsSidebarOpen(false); }} />
+              </div>
+            </>
+          )}
         </nav>
 
         <div className="p-4 border-t border-opacity-10 border-white relative group">
@@ -4720,7 +5775,7 @@ export default function App() {
             )}
             <div className="flex-1 min-w-0">
               <p className="text-sm font-semibold truncate text-slate-800 dark:text-white">{userProfile?.full_name || userProfile?.nombre || 'Agente'}</p>
-              <p className="text-xs text-brand-500 font-medium truncate uppercase">{userProfile?.rol || 'Soporte'} {userProfile?.departamento ? `| ${userProfile.departamento}` : ''}</p>
+              <p className="text-xs text-brand-500 font-medium truncate uppercase">{userProfile?.rol === 'reseller' ? 'Reseller' : userProfile?.rol === 'admin' ? 'Administrador' : userProfile?.rol || 'Soporte'} {userActivities(userProfile).length ? `| ${userActivities(userProfile).join(' · ')}` : (userProfile?.departamento ? `| ${userProfile.departamento}` : '')}</p>
             </div>
           </div>
           <button onClick={handleLogout} className="absolute right-6 top-[28px] p-2 rounded-full hidden group-hover:flex bg-red-500 text-white shadow-lg animate-in fade-in zoom-in transition hover:bg-red-600">
@@ -4789,26 +5844,79 @@ export default function App() {
             {activeTab === 'tickets' && (
               <>
                 <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
-                  <div><h1 className="text-2xl sm:text-4xl font-extrabold tracking-tight">Análisis Operativo</h1></div>
-                  <button onClick={() => setIsModalOpen(true)} className="w-full sm:w-auto bg-brand-500 hover:bg-brand-600 text-white px-6 py-2.5 rounded-xl font-bold shadow-[0_0_15px_rgba(245,158,11,0.3)] transition-all hover:-translate-y-1 text-center text-xs sm:text-sm">
-                    + Cargar Derivación
-                  </button>
+                  <div>
+                    <h1 className="text-2xl sm:text-4xl font-extrabold tracking-tight">
+                      {ticketsVista === 'historico'
+                        ? 'Histórico de pedidos'
+                        : selectedArea && /desarroll|programac/i.test(areas.find(a => a.id === selectedArea)?.nombre || '')
+                          ? 'Pedidos a Programación'
+                          : 'Análisis Operativo'}
+                    </h1>
+                    <p className="text-sm text-slate-400 mt-1">
+                      {ticketsVista === 'historico'
+                        ? 'Pedidos ya entregados / cerrados. No aparecen en la bandeja activa.'
+                        : 'Atención carga pedidos. Programación resuelve → Atención entrega al cliente → Histórico.'}
+                    </p>
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                    <div className={`flex rounded-xl border p-1 ${darkMode ? 'border-dark-border bg-dark-card/40' : 'border-slate-200 bg-white'}`}>
+                      <button
+                        type="button"
+                        onClick={() => setTicketsVista('activa')}
+                        className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all ${ticketsVista === 'activa' ? 'bg-brand-500 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+                      >
+                        Activos
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTicketsVista('historico')}
+                        className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all ${ticketsVista === 'historico' ? 'bg-brand-500 text-white' : 'text-slate-400 hover:text-slate-200'}`}
+                      >
+                        Histórico
+                      </button>
+                    </div>
+                    {ticketsVista === 'activa' && (
+                      <button onClick={() => { setIsModalOpen(true); setNewOrigen('cliente'); setNewPedidoFiles([]); }} className="w-full sm:w-auto bg-brand-500 hover:bg-brand-600 text-white px-6 py-2.5 rounded-xl font-bold shadow-[0_0_15px_rgba(245,158,11,0.3)] transition-all hover:-translate-y-1 text-center text-xs sm:text-sm">
+                        + Pedido a Programación
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className={`rounded-2xl border p-1 shadow-sm ${darkMode ? 'glass-dark border-dark-border' : 'bg-white border-slate-200'}`}>
-                  <div className="p-5 pb-0"><h2 className="text-lg font-bold">Solicitudes Recientes</h2></div>
+                  <div className="p-5 pb-0"><h2 className="text-lg font-bold">{ticketsVista === 'historico' ? 'Cerrados / entregados' : 'Solicitudes Recientes'}</h2></div>
                   <div className="p-4 mt-2">
                     <div className="hidden md:grid grid-cols-12 gap-4 pb-3 border-b border-slate-100 dark:border-dark-border/50 text-xs font-bold text-slate-400 tracking-wider uppercase">
-                      <div className="col-span-1 pl-2">ID</div><div className="col-span-3">Empresa</div><div className="col-span-4">Asunto del Problema</div><div className="col-span-2">Estado</div><div className="col-span-2">Urgencia</div>
+                      <div className="col-span-1 pl-2">ID</div>
+                      <div className="col-span-1">Origen</div>
+                      <div className="col-span-2">Empresa / Pedido</div>
+                      <div className="col-span-2">Asunto</div>
+                      <div className="col-span-1">Estado</div>
+                      <div className="col-span-1">Fecha</div>
+                      <div className="col-span-2">Registró</div>
+                      <div className="col-span-2">Dirigido a</div>
                     </div>
                     <div className="space-y-1 mt-2 min-h-[150px]">
                       {loading ? <div className="flex justify-center p-8"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand-500"></div></div> :
-                        tickets.length === 0 ? <div className="text-center p-8 text-slate-400">Excelente, sin tickets pendientes en cola.</div> :
+                        tickets.length === 0 ? <div className="text-center p-8 text-slate-400">No hay pedidos en esta bandeja.</div> :
                           tickets.map((t: any) => {
-                            const c = clients.find(cl => cl.id === t.client_id);
+                            const c = t.cliente || clients.find(cl => cl.id === t.client_id);
+                            const isInternal = (t.origen || 'cliente') === 'interno';
                             return (
-                              <div key={t.id} onClick={() => openTicketModal({ ...t, clientName: c?.razon_social })}>
-                                <TicketRow id={`#${t.id}`} client={c ? c.razon_social : "Desconocido"} subject={t.asunto} status={t.estado} priority={t.prioridad} darkMode={darkMode} />
+                              <div key={t.id} onClick={() => openTicketModal({ ...t, clientName: isInternal ? (c?.razon_social || 'Pedido interno') : (c?.razon_social || 'Sin cliente') })}>
+                                <TicketRow
+                                  id={`#${t.id}`}
+                                  origen={t.origen || 'cliente'}
+                                  client={isInternal ? (c ? `${c.razon_social} · interno` : 'Pedido interno') : (c ? c.razon_social : 'Sin cliente')}
+                                  subject={t.asunto}
+                                  status={t.estado}
+                                  priority={t.prioridad}
+                                  createdAt={t.fecha_creacion}
+                                  assignee={t.asignado_a?.full_name || t.asignado_a?.nombre || ''}
+                                  registeredBy={ticketRegisteredBy(t)}
+                                  hasAttachments={(t.intervenciones || []).some((inv: any) => inv.adjunto_url)}
+                                  darkMode={darkMode}
+                                />
                               </div>
                             )
                           })}
@@ -4824,6 +5932,7 @@ export default function App() {
                 clients={clients}
                 users={users}
                 currentUserId={userProfile?.id}
+                onlineDeviceIds={Object.keys(centinelas || {}).map(Number).filter(n => !Number.isNaN(n))}
                 onNotify={(msg) => {
                   setShowNotification(msg);
                   setTimeout(() => setShowNotification(null), 3500);
@@ -4833,13 +5942,41 @@ export default function App() {
 
             {activeTab === 'monitor' && (
               <div className="space-y-8 animate-in slide-in-from-bottom-8">
-                <div className="flex items-end justify-between">
+                <div className="flex items-end justify-between gap-3">
                   <div>
                     <h1 className="text-4xl font-extrabold tracking-tight flex items-center gap-3">
                       Flota de Terminales <span className="relative flex h-4 w-4"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span><span className="relative inline-flex rounded-full h-4 w-4 bg-emerald-500"></span></span>
                     </h1>
                     <p className="text-slate-400 mt-2">Visor maestro de las computadoras registradas por cliente.</p>
                   </div>
+                  <label className="shrink-0 cursor-pointer bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-100 text-xs font-black uppercase tracking-wider px-4 py-2.5 rounded-xl">
+                    Importar TeamViewer
+                    <input
+                      type="file"
+                      accept=".csv,.txt,text/csv"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = '';
+                        if (!file) return;
+                        try {
+                          const res = await importTeamviewerCsv(file);
+                          const lines = [
+                            `PCs nuevas: ${res.creadas ?? 0}`,
+                            `Actualizadas: ${res.actualizadas ?? 0}`,
+                            `Sin cliente en Support: ${res.sin_cliente ?? 0}`,
+                          ];
+                          const detail = (res.sin_cliente_detalle || []).slice(0, 12)
+                            .map((r: any) => `Fila ${r.fila}: ${r.equipo} (${r.grupo || 'sin grupo'}) — ${r.motivo}`)
+                            .join('\n');
+                          alert(detail ? `${lines.join('\n')}\n\n${detail}` : lines.join('\n'));
+                          loadData();
+                        } catch (err: any) {
+                          alert(err?.message || 'No se pudo importar el CSV');
+                        }
+                      }}
+                    />
+                  </label>
                 </div>
 
                 {pendingDevices && pendingDevices.length > 0 && (
@@ -4894,8 +6031,6 @@ export default function App() {
                                 onClick={() => {
                                   setAssignModal(dev);
                                   setAssignClientId("");
-                                  setAssignSearchText("");
-                                  setShowAssignDropdown(false);
                                 }}
                                 className="bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-[10px] px-3 py-2 rounded-xl transition-all shadow-md shadow-indigo-600/10 whitespace-nowrap"
                               >
@@ -5265,12 +6400,13 @@ export default function App() {
                       onClick={async () => {
                         setIsSyncing(true);
                         try {
-                          const res = await syncClientsFromDbf();
-                          const n = res?.saldos?.updated;
+                          // Solo saldos ERP (Clientes:CSaldo). NO pide CLIGESCO.DBF en el servidor.
+                          const res = await syncSaldosFromErp();
+                          const n = res?.updated;
                           setShowNotification(
                             n != null
-                              ? `Sync OK: CLIGESCO + ${n} saldos desde Clientes:CSaldo`
-                              : "¡Clientes sincronizados (DBF + saldos ERP)!"
+                              ? `Sync OK: ${n} saldos desde Clientes:CSaldo`
+                              : "¡Saldos ERP actualizados!"
                           );
                           setTimeout(() => setShowNotification(null), 4000);
                           loadData();
@@ -5284,7 +6420,7 @@ export default function App() {
                       className={`flex items-center justify-center gap-2 w-full sm:w-auto px-5 py-2.5 rounded-xl font-bold shadow-md transition-all text-xs sm:text-sm border ${darkMode ? 'bg-slate-900 border-white/10 text-slate-300 hover:bg-slate-800' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'}`}
                     >
                       <Sparkles className={`w-4 h-4 text-brand-500 ${isSyncing ? 'animate-spin' : ''}`} />
-                      {isSyncing ? 'Sincronizando...' : 'Sincronizar ERP'}
+                      {isSyncing ? 'Sincronizando...' : 'Sincronizar saldos ERP'}
                     </button>
                     <button onClick={() => openClientModal()} className="w-full sm:w-auto bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2.5 rounded-xl font-bold shadow-lg transition-all hover:-translate-y-1 text-center text-xs sm:text-sm">
                       + Alta cliente
@@ -5308,8 +6444,8 @@ export default function App() {
                       </div>
                     </div>
                     <div className="mt-4 flex items-center gap-1.5 text-xs text-slate-400">
-                      <span className="font-semibold text-emerald-500">Sincronizados</span>
-                      <span>desde CLIGESCO.DBF</span>
+                      <span className="font-semibold text-emerald-500">GesActi</span>
+                      <span>alta, baja y «Sincronizar Support»</span>
                     </div>
                   </div>
                 </div>
@@ -5693,6 +6829,14 @@ export default function App() {
                                     <span className="hidden xl:inline text-[10px] font-black uppercase">Lic Fac</span>
                                   </button>
                                 )}
+                                <button
+                                  onClick={() => handleOpenCbus(c)}
+                                  className="flex items-center gap-1 p-2 bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border border-sky-500/20 rounded-xl transition-all"
+                                  title="CBU / débito automático (ventas_ClienDA)"
+                                >
+                                  <CreditCard size={14} />
+                                  <span className="hidden xl:inline text-[10px] font-black uppercase">CBU</span>
+                                </button>
                                 {c.cclifac && (
                                   <button
                                     onClick={() => handleOpenExtracto(c)}
@@ -5743,8 +6887,10 @@ export default function App() {
                           rol: 'soporte',
                           celular: '',
                           departamento: 'Atención al Cliente',
+                          actividades: ['Atención al Cliente'],
                           profile_picture: '',
-                          activo: true
+                          activo: true,
+                          reseller_id: null
                         });
                         setShowUserAbmModal(true);
                       }}
@@ -5780,7 +6926,7 @@ export default function App() {
                   <div className={`p-5 rounded-2xl border transition-all ${darkMode ? 'glass-dark border-dark-border bg-indigo-500/5' : 'bg-white border-slate-200 shadow-sm'}`}>
                     <p className="text-xs font-bold text-indigo-400 uppercase tracking-widest">Desarrollo</p>
                     <div className="flex items-baseline gap-2 mt-2">
-                      <span className="text-3xl font-black text-indigo-400">{users.filter(u => u.departamento === 'Desarrollo').length}</span>
+                      <span className="text-3xl font-black text-indigo-400">{users.filter(u => userInActivity(u, 'Desarrollo')).length}</span>
                       <span className="text-xs font-bold text-indigo-400">Ingenieros</span>
                     </div>
                   </div>
@@ -5789,7 +6935,7 @@ export default function App() {
                   <div className={`p-5 rounded-2xl border transition-all ${darkMode ? 'glass-dark border-dark-border bg-amber-500/5' : 'bg-white border-slate-200 shadow-sm'}`}>
                     <p className="text-xs font-bold text-amber-500 uppercase tracking-widest">Atención al Cliente</p>
                     <div className="flex items-baseline gap-2 mt-2">
-                      <span className="text-3xl font-black text-amber-500">{users.filter(u => u.departamento === 'Atención al Cliente').length}</span>
+                      <span className="text-3xl font-black text-amber-500">{users.filter(u => userInActivity(u, 'Atención al Cliente')).length}</span>
                       <span className="text-xs font-bold text-amber-400">Agentes</span>
                     </div>
                   </div>
@@ -5799,13 +6945,7 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {users.map((u: any) => {
                     const isCurrentUser = u.id === userProfile?.id;
-                    const depColor = u.departamento === 'Desarrollo' 
-                      ? 'border-violet-500/30 text-violet-400 bg-violet-500/5' 
-                      : u.departamento === 'Atención al Cliente'
-                      ? 'border-sky-500/30 text-sky-400 bg-sky-500/5'
-                      : u.departamento === 'Caja'
-                      ? 'border-emerald-500/30 text-emerald-400 bg-emerald-500/5'
-                      : 'border-teal-500/30 text-teal-400 bg-teal-500/5'; // Finanzas
+                    const actividadesUser = userActivities(u);
 
                     return (
                       <div 
@@ -5854,13 +6994,15 @@ export default function App() {
                             )}
                           </div>
 
-                          {/* Sector / Departamento */}
+                          {/* Sector / Actividades */}
                           <div className="flex flex-wrap gap-2 pt-1">
-                            <span className={`text-[10px] font-black px-3 py-1 rounded-full border uppercase tracking-wide ${depColor}`}>
-                              {u.departamento || 'Soporte'}
-                            </span>
+                            {(actividadesUser.length ? actividadesUser : ['Soporte']).map((act) => (
+                              <span key={act} className={`text-[10px] font-black px-3 py-1 rounded-full border uppercase tracking-wide ${activityBadgeClass(act)}`}>
+                                {act}
+                              </span>
+                            ))}
                             <span className="text-[10px] font-black px-3 py-1 rounded-full border border-slate-700 bg-slate-800/20 text-slate-400 uppercase tracking-wide">
-                              {u.rol === 'admin' ? '🔑 Administrador' : '🛠️ Operador'}
+                              {u.rol === 'admin' ? '🔑 Administrador' : u.rol === 'reseller' ? '🏢 Reseller' : '🛠️ Operador'}
                             </span>
                             {!u.activo && (
                               <span className="text-[10px] font-black px-3 py-1 rounded-full bg-red-500/10 text-red-500 border border-red-500/20 uppercase tracking-wide animate-pulse">
@@ -5932,8 +7074,10 @@ export default function App() {
                                   rol: u.rol || 'soporte',
                                   celular: u.celular || '',
                                   departamento: u.departamento || 'Atención al Cliente',
+                                  actividades: userActivities(u).length ? userActivities(u) : ['Atención al Cliente'],
                                   profile_picture: u.profile_picture || '',
-                                  activo: u.activo
+                                  activo: u.activo,
+                                  reseller_id: u.reseller_id || null
                                 });
                                 setShowUserAbmModal(true);
                               }}
@@ -5970,6 +7114,99 @@ export default function App() {
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'resellers' && (
+              <div className="space-y-8 animate-in fade-in slide-in-from-bottom-6 duration-300">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div>
+                    <h1 className="text-2xl sm:text-4xl font-extrabold tracking-tight flex items-center gap-3">
+                      <CreditCard className="text-brand-500" size={28} />
+                      Revendedores
+                    </h1>
+                    <p className="text-xs sm:text-sm text-slate-400 mt-1">ABM de empresas revendedoras, sus clientes y usuarios.</p>
+                  </div>
+                  {userProfile?.rol === 'admin' && (
+                    <button
+                      onClick={() => {
+                        setResellerForm({ nombre: '', contacto: '', email: '', telefono: '', comision_pct: 0, notas: '', activo: true });
+                        setSelectedResellerForEdit(null);
+                        setShowResellerModal(true);
+                      }}
+                      className="bg-brand-500 hover:bg-brand-600 text-white px-5 py-2.5 rounded-xl font-bold shadow-lg shadow-brand-500/20 transition-all hover:-translate-y-1 text-xs sm:text-sm flex items-center justify-center gap-2"
+                    >
+                      <Plus size={18} /> Nuevo Reseller
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                  {resellers.map((r: any) => (
+                    <div key={r.id} className={`rounded-2xl border p-5 transition-all hover:shadow-lg ${darkMode ? 'bg-slate-900/50 border-white/5' : 'bg-white border-slate-200'}`}>
+                      <div className="flex items-start justify-between mb-3">
+                        <div>
+                          <h3 className="font-bold text-lg text-slate-800 dark:text-white">{r.nombre}</h3>
+                          {r.contacto && <p className="text-xs text-slate-500">{r.contacto}</p>}
+                        </div>
+                        <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${r.activo !== false ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'}`}>
+                          {r.activo !== false ? 'Activo' : 'Inactivo'}
+                        </span>
+                      </div>
+                      <div className="space-y-1 text-xs text-slate-500 mb-4">
+                        {r.email && <p className="flex items-center gap-1"><Mail size={12} /> {r.email}</p>}
+                        {r.telefono && <p className="flex items-center gap-1"><Phone size={12} /> {r.telefono}</p>}
+                        <p className="flex items-center gap-1"><Users size={12} /> {r.cantidad_clientes || 0} clientes · {r.cantidad_usuarios || 0} usuarios</p>
+                        {r.comision_pct > 0 && <p className="text-brand-500 font-bold">Comisión: {r.comision_pct}%</p>}
+                      </div>
+                      {userProfile?.rol === 'admin' && (
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => {
+                              setSelectedResellerForEdit(r);
+                              setResellerForm({
+                                nombre: r.nombre || '',
+                                contacto: r.contacto || '',
+                                email: r.email || '',
+                                telefono: r.telefono || '',
+                                comision_pct: r.comision_pct || 0,
+                                notas: r.notas || '',
+                                activo: r.activo !== false
+                              });
+                              setShowResellerModal(true);
+                            }}
+                            className="flex-1 py-2 rounded-xl text-xs font-bold bg-brand-500/10 text-brand-500 hover:bg-brand-500/20 border border-brand-500/20 transition-all"
+                          >
+                            Editar
+                          </button>
+                          <button
+                            onClick={async () => {
+                              if (!confirm(`¿Eliminar "${r.nombre}"? Sus clientes y usuarios quedarán sin asignar.`)) return;
+                              try {
+                                await deleteReseller(r.id);
+                                setShowNotification(`Reseller ${r.nombre} eliminado.`);
+                                loadData();
+                                setTimeout(() => setShowNotification(null), 3000);
+                              } catch (err: any) {
+                                alert(err.message || 'Error al eliminar');
+                              }
+                            }}
+                            className="py-2 px-3 rounded-xl text-xs font-bold bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/20 transition-all"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {resellers.length === 0 && (
+                    <div className="col-span-full text-center py-12 text-slate-500">
+                      <CreditCard size={48} className="mx-auto mb-4 opacity-20" />
+                      <p className="font-bold">No hay revendedores cargados</p>
+                      <p className="text-xs mt-1">Creá el primero para empezar a operar con el modelo multiempresa.</p>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -7063,27 +8300,53 @@ export default function App() {
                         <button onClick={async () => {
                           try {
                             const text = await navigator.clipboard.readText();
-                            syncRemoteClipboard(session.id, text);
+                            if (!text) return;
+                            await pasteTextToRemote(session.id, text);
                           } catch (err) {
                             const text = prompt("Ingrese el texto a enviar al portapapeles de la PC cliente:");
-                            if (text !== null) syncRemoteClipboard(session.id, text);
+                            if (text !== null) {
+                              await pasteTextToRemote(session.id, text);
+                            }
                           }
-                        }} className="bg-blue-500/80 p-2 rounded-xl text-white shadow-lg border border-white/10">
+                        }} className="bg-blue-500/80 p-2 rounded-xl text-white shadow-lg border border-white/10" title="Pegar texto o archivos en el cliente">
                           <Clipboard size={16} />
+                        </button>
+                        <button
+                          onClick={() => captureRemoteScreenToClipboard(session.id)}
+                          className="bg-violet-500/80 p-2 rounded-xl text-white shadow-lg border border-white/10"
+                          title="Capturar pantalla → portapapeles"
+                        >
+                          <Camera size={16} />
                         </button>
                         <button onClick={() => fetchRemoteFiles(session.id)} className="bg-emerald-500/80 p-2 rounded-xl text-white shadow-lg border border-white/10">
                           <FileText size={16} />
                         </button>
                       </div>
 
-                      <div className="flex-1 bg-black flex items-center justify-center relative min-h-[300px]">
+                      <div
+                        className="flex-1 bg-black flex items-center justify-center relative min-h-[300px]"
+                        onDragOver={(e) => {
+                          if (!isControlEnabled) return;
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'copy';
+                          setIsDraggingFiles(true);
+                        }}
+                        onDragLeave={() => setIsDraggingFiles(false)}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          setIsDraggingFiles(false);
+                          if (!isControlEnabled) return;
+                          if (e.dataTransfer.files?.length) pasteFilesToRemote(session.id, e.dataTransfer.files);
+                        }}
+                      >
                         {frame ? (
                           <img
                             src={frame.startsWith('blob:') || frame.startsWith('data:') ? frame : `data:image;base64,${frame}`}
                             tabIndex={0}
                             onMouseDown={(e) => handleMouseDown(e, session.id)}
                             onMouseUp={(e) => handleMouseUp(e, session.id)}
-                            onMouseLeave={(e) => handleMouseUp(e, session.id)}
+                            onMouseMove={(e) => handleMouseMove(e, session.id)}
+                            onMouseLeave={(e) => handleMouseLeave(e, session.id)}
                             onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
                             onWheel={(e) => handleImageWheel(e, session.id)}
                             className="w-full h-full object-contain cursor-crosshair select-none outline-none"
@@ -7378,6 +8641,21 @@ export default function App() {
                         className="w-full p-3 rounded-xl border bg-transparent text-sm outline-none focus:ring-2 focus:ring-brand-500 dark:border-white/10 font-mono"
                       />
                     </div>
+                    {userProfile?.rol === 'admin' && resellers.length > 0 && (
+                      <div className="md:col-span-2">
+                        <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Revendedor Asignado</label>
+                        <select
+                          className="w-full p-3 rounded-xl border bg-slate-800 text-white text-sm outline-none focus:ring-2 focus:ring-brand-500 dark:border-white/10"
+                          value={clientForm.reseller_id || ''}
+                          onChange={e => setClientForm({ ...clientForm, reseller_id: e.target.value ? Number(e.target.value) : null })}
+                        >
+                          <option value="" className="bg-slate-800 text-white">— Sin asignar (cliente directo) —</option>
+                          {resellers.filter((r: any) => r.activo !== false).map((r: any) => (
+                            <option key={r.id} value={r.id} className="bg-slate-800 text-white">{r.nombre}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
                     <div className="flex items-center gap-3 md:col-span-2 bg-white/5 rounded-xl px-4 py-3 border border-white/5">
                       <input
                         type="checkbox"
@@ -8114,29 +9392,237 @@ export default function App() {
           </div>
         )}
 
+        {isModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4 animate-in fade-in">
+            <div className={`w-full max-w-xl p-6 sm:p-8 rounded-[2rem] border shadow-2xl animate-in slide-in-from-bottom-6 ${darkMode ? 'glass-dark border-brand-500/15' : 'bg-white border-slate-200'}`}>
+              <div className="flex justify-between items-start mb-5">
+                <div>
+                  <p className="text-[10px] font-black uppercase tracking-widest text-brand-500 mb-1">Atención → Programación</p>
+                  <h3 className="text-xl font-black">Nuevo pedido</h3>
+                  <p className="text-xs text-slate-400 mt-1">Lo ve todo el sector de desarrollo, aunque lo dirijas a un programador.</p>
+                </div>
+                <button type="button" onClick={() => setIsModalOpen(false)} className="p-2 hover:bg-red-500/10 rounded-full"><X size={20} className="text-slate-400" /></button>
+              </div>
+              <form onSubmit={handleCreateTicket} className="space-y-4">
+                <div className="grid grid-cols-2 gap-2">
+                  <button type="button" onClick={() => setNewOrigen('cliente')} className={`py-2.5 rounded-xl text-xs font-black uppercase tracking-wider border transition-all ${newOrigen === 'cliente' ? 'bg-sky-500/15 text-sky-400 border-sky-500/30' : 'border-white/10 text-slate-400'}`}>Pedido de cliente</button>
+                  <button type="button" onClick={() => { setNewOrigen('interno'); }} className={`py-2.5 rounded-xl text-xs font-black uppercase tracking-wider border transition-all ${newOrigen === 'interno' ? 'bg-violet-500/15 text-violet-400 border-violet-500/30' : 'border-white/10 text-slate-400'}`}>Pedido interno</button>
+                </div>
+
+                <div className="space-y-2">
+                  {newOrigen === 'interno' && (
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Cliente relacionado (opcional)</p>
+                  )}
+                  <ClientSearchSelect
+                    clients={clients}
+                    valueId={newClientId}
+                    onChange={(id) => setNewClientId(id)}
+                    darkMode={darkMode}
+                    placeholder={newOrigen === 'cliente' ? 'Buscar cliente por código o nombre (ej. 1307 Aguilar)...' : 'Buscar cliente (opcional)...'}
+                    optionalLabel={newOrigen === 'interno' ? 'Sin cliente — pedido interno' : undefined}
+                  />
+                </div>
+
+                <input required type="text" value={newSubject} onChange={e => setNewSubject(e.target.value)} placeholder="Asunto del pedido..." className={`w-full p-2.5 rounded-xl border outline-none text-sm ${darkMode ? 'bg-black/20 border-white/10 text-white' : 'bg-slate-50 border-slate-200'}`} />
+                <textarea required value={newDesc} onChange={e => setNewDesc(e.target.value)} placeholder="Detalle para programación..." rows={4} className={`w-full p-2.5 rounded-xl border outline-none text-sm resize-none ${darkMode ? 'bg-black/20 border-white/10 text-white' : 'bg-slate-50 border-slate-200'}`} />
+
+                <div className={`rounded-xl border p-3 space-y-2 ${darkMode ? 'bg-black/20 border-white/10' : 'bg-slate-50 border-slate-200'}`}>
+                  <label className="flex items-center justify-between gap-3 cursor-pointer">
+                    <span className="flex items-center gap-2 text-xs font-bold text-slate-300">
+                      <Paperclip size={14} className="text-brand-500" />
+                      Adjuntos
+                    </span>
+                    <span className="text-[10px] font-black uppercase tracking-wider text-brand-500 bg-brand-500/10 px-2.5 py-1 rounded-lg border border-brand-500/20">
+                      + Agregar archivos
+                    </span>
+                    <input
+                      type="file"
+                      multiple
+                      accept=".xls,.xlsx,.csv,.jpg,.jpeg,.png,.gif,.webp,.bmp,.txt,.pdf,.doc,.docx,.zip,.xml,.json,.dbf"
+                      className="hidden"
+                      onChange={(e) => {
+                        const picked = Array.from(e.target.files || []);
+                        if (!picked.length) return;
+                        const tooBig = picked.find((f) => f.size > 20 * 1024 * 1024);
+                        if (tooBig) {
+                          alert(`"${tooBig.name}" supera el límite de 20 MB.`);
+                          e.target.value = '';
+                          return;
+                        }
+                        setNewPedidoFiles((prev) => {
+                          const names = new Set(prev.map((f) => `${f.name}-${f.size}`));
+                          const extra = picked.filter((f) => !names.has(`${f.name}-${f.size}`));
+                          return [...prev, ...extra].slice(0, 8);
+                        });
+                        e.target.value = '';
+                      }}
+                    />
+                  </label>
+                  <p className="text-[10px] text-slate-500">Excel, JPG, PNG, TXT, PDF y similares. Hasta 8 archivos / 20 MB c/u.</p>
+                  {newPedidoFiles.length > 0 && (
+                    <div className="space-y-1.5">
+                      {newPedidoFiles.map((file, idx) => (
+                        <div key={`${file.name}-${idx}`} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/20 border border-white/5">
+                          <FileText size={14} className="text-brand-400 shrink-0" />
+                          <span className="flex-1 min-w-0 text-[11px] font-bold truncate text-slate-200">{file.name}</span>
+                          <span className="text-[9px] text-slate-500 shrink-0">{file.size > 1024 * 1024 ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(file.size / 1024))} KB`}</span>
+                          <button
+                            type="button"
+                            onClick={() => setNewPedidoFiles((prev) => prev.filter((_, i) => i !== idx))}
+                            className="p-1 rounded-md text-slate-500 hover:text-red-400 hover:bg-red-500/10"
+                            title="Quitar"
+                          >
+                            <X size={12} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <select value={newPriority} onChange={e => setNewPriority(e.target.value)} className={`w-full p-2.5 rounded-xl border outline-none text-sm ${darkMode ? 'bg-black/20 border-white/10 text-white' : 'bg-slate-50 border-slate-200'}`}>
+                    <option value="baja">Prioridad baja</option>
+                    <option value="media">Prioridad media</option>
+                    <option value="alta">Prioridad alta</option>
+                    <option value="critica">Prioridad crítica</option>
+                  </select>
+                  <select value={newAssigneeId} onChange={e => setNewAssigneeId(e.target.value)} className={`w-full p-2.5 rounded-xl border outline-none text-sm ${darkMode ? 'bg-black/20 border-white/10 text-white' : 'bg-slate-50 border-slate-200'}`}>
+                    <option value="">Todo el sector (sin asignar)</option>
+                    {(users.filter((u: any) => userInDesarrollo(u)).length
+                      ? users.filter((u: any) => userInDesarrollo(u))
+                      : users
+                    ).map((u: any) => (
+                      <option key={u.id} value={u.id}>{u.full_name || u.nombre}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <button type="submit" disabled={isSubmitting} className="w-full bg-brand-500 hover:bg-brand-600 disabled:opacity-50 text-white font-extrabold py-3.5 rounded-xl shadow-lg shadow-brand-500/20 transition-colors tracking-wide">
+                  {isSubmitting ? (newPedidoFiles.length ? 'Subiendo adjuntos...' : 'Enviando...') : 'Enviar a Programación'}
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+
         {/* MODAL DEL TICKET (Derivador + IA Copiloto) */}
         {selectedTicket && (
-          <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4 overflow-y-auto animate-in fade-in">
-            <div className={`w-full max-w-4xl p-6 sm:p-8 rounded-[2rem] border shadow-2xl flex flex-col gap-6 animate-in slide-in-from-bottom-8 ${darkMode ? 'glass-dark border-brand-500/15' : 'bg-white border-slate-200'}`}>
+          <div
+            className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-900/80 backdrop-blur-sm p-3 sm:p-4 overflow-y-auto animate-in fade-in"
+            onClick={closeTicketModal}
+            onKeyDown={(e) => { if (e.key === 'Escape') closeTicketModal(); }}
+            role="dialog"
+            aria-modal="true"
+          >
+            <div
+              className={`relative w-full max-w-4xl max-h-[92vh] overflow-y-auto p-5 sm:p-8 rounded-[2rem] border shadow-2xl flex flex-col gap-6 animate-in slide-in-from-bottom-8 ${darkMode ? 'glass-dark border-brand-500/15' : 'bg-white border-slate-200'}`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Botón cerrar fijo: siempre visible aunque DevTools estreche la pantalla */}
+              <button
+                type="button"
+                onClick={closeTicketModal}
+                className="absolute top-3 right-3 z-20 flex items-center gap-1.5 px-3 py-2 rounded-xl bg-red-500/15 border border-red-500/40 text-red-300 hover:bg-red-500/30 hover:text-white transition-all shadow-lg"
+                title="Cerrar (Esc)"
+              >
+                <X size={18} />
+                <span className="text-[10px] font-black uppercase tracking-wider">Cerrar</span>
+              </button>
               
               {/* Cabecera */}
-              <div className="flex justify-between items-start gap-4">
+              <div className="flex justify-between items-start gap-4 pr-24">
                 <div>
-                  <div className="flex items-center gap-2 mb-1.5">
+                  <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                     <span className="text-brand-500 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest bg-brand-500/10 px-3 py-1 rounded-full">
                       Requerimiento #{selectedTicket.id}
                     </span>
-                    <span className="text-slate-400 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest bg-slate-500/10 px-3 py-1 rounded-full">
-                      {selectedTicket.clientName}
+                    <span className={`font-extrabold text-[10px] sm:text-xs uppercase tracking-widest px-3 py-1 rounded-full ${
+                      (selectedTicket.estado || '').toLowerCase() === 'entregado'
+                        ? 'text-sky-400 bg-sky-500/10'
+                        : (selectedTicket.estado || '').toLowerCase() === 'resuelto'
+                          ? 'text-emerald-400 bg-emerald-500/10'
+                          : (selectedTicket.estado || '').toLowerCase() === 'en_curso'
+                            ? 'text-brand-400 bg-brand-500/10'
+                            : 'text-blue-400 bg-blue-500/10'
+                    }`}>
+                      {(selectedTicket.estado || 'nuevo').replace('_', ' ')}
                     </span>
+                    <span className={`font-extrabold text-[10px] sm:text-xs uppercase tracking-widest px-3 py-1 rounded-full ${(selectedTicket.origen || 'cliente') === 'interno' ? 'text-violet-400 bg-violet-500/10' : 'text-sky-400 bg-sky-500/10'}`}>
+                      {(selectedTicket.origen || 'cliente') === 'interno' ? 'Pedido interno' : 'Pedido de cliente'}
+                    </span>
+                    <span className="text-slate-400 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest bg-slate-500/10 px-3 py-1 rounded-full">
+                      {selectedTicket.clientName || selectedTicket.cliente?.razon_social || (selectedTicket.origen === 'interno' ? 'Interno' : 'Sin cliente')}
+                    </span>
+                    {ticketRegisteredBy(selectedTicket) && (
+                      <span className="text-amber-300 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest bg-amber-500/10 px-3 py-1 rounded-full">
+                        Registró: {ticketRegisteredBy(selectedTicket)}
+                      </span>
+                    )}
                   </div>
                   <h2 className="text-xl sm:text-2xl font-black text-slate-800 dark:text-white leading-tight">
                     {selectedTicket.asunto}
                   </h2>
                 </div>
-                <button onClick={closeTicketModal} className="shrink-0 p-2 hover:bg-red-500/10 rounded-full transition-colors group">
-                  <X size={24} className="text-slate-400 group-hover:text-red-500 transition-colors" />
-                </button>
+                <div className="hidden sm:flex items-center gap-2 shrink-0 flex-wrap justify-end max-w-[40%]">
+                  {(selectedTicket.estado || '').toLowerCase() !== 'entregado' && !isEditingTicket && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditSubject(selectedTicket.asunto || "");
+                        setEditDesc(selectedTicket.descripcion || "");
+                        setEditPriority(selectedTicket.prioridad || "media");
+                        setEditOrigen((selectedTicket.origen === "interno" ? "interno" : "cliente") as "cliente" | "interno");
+                        setEditClientId(selectedTicket.client_id ? String(selectedTicket.client_id) : "");
+                        setIsEditingTicket(true);
+                      }}
+                      className="px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 transition-all"
+                      title="Corregir asunto, detalle, cliente u origen"
+                    >
+                      Editar pedido
+                    </button>
+                  )}
+                  {(selectedTicket.estado || '').toLowerCase() === 'resuelto' && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const updated = await updateTicketStatus(selectedTicket.id, 'entregado');
+                          setSelectedTicket({ ...selectedTicket, ...updated, clientName: selectedTicket.clientName });
+                          loadData();
+                          setShowNotification('Pedido entregado → pasó a histórico');
+                          setTimeout(() => setShowNotification(null), 3000);
+                          closeTicketModal();
+                        } catch (err: any) {
+                          alert(err?.message || 'No se pudo dar por entregado');
+                        }
+                      }}
+                      className="px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30 hover:bg-sky-500/25 transition-all"
+                      title="Cierra el pedido y lo mueve al histórico"
+                    >
+                      Dar por entregado
+                    </button>
+                  )}
+                  {(selectedTicket.estado || '').toLowerCase() !== 'resuelto' && (selectedTicket.estado || '').toLowerCase() !== 'entregado' && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const updated = await updateTicketStatus(selectedTicket.id, 'resuelto');
+                          setSelectedTicket({ ...selectedTicket, ...updated, clientName: selectedTicket.clientName });
+                          loadData();
+                          setShowNotification('Resuelto: vuelve a Atención para entrega');
+                          setTimeout(() => setShowNotification(null), 3000);
+                        } catch (err: any) {
+                          alert(err?.message || 'No se pudo marcar como resuelto');
+                        }
+                      }}
+                      className="px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25 transition-all"
+                    >
+                      Marcar resuelto
+                    </button>
+                  )}
+                </div>
               </div>
 
               {/* Grid Principal: Izquierda (Detalle e Intervenciones) | Derecha (IA Copiloto y Control Remoto) */}
@@ -8148,8 +9634,130 @@ export default function App() {
                     
                     {/* Requerimiento Original */}
                     <div className="border-l-4 border-brand-500 pl-4 py-1 mb-2 bg-brand-500/5 p-3 rounded-r-xl">
-                      <p className="text-[9px] font-black text-brand-500 uppercase tracking-widest mb-1">Descripción del Problema</p>
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <p className="text-[9px] font-black text-brand-500 uppercase tracking-widest">Descripción del Problema</p>
+                        {(selectedTicket.estado || '').toLowerCase() !== 'entregado' && !isEditingTicket && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditSubject(selectedTicket.asunto || "");
+                              setEditDesc(selectedTicket.descripcion || "");
+                              setEditPriority(selectedTicket.prioridad || "media");
+                              setEditOrigen((selectedTicket.origen === "interno" ? "interno" : "cliente") as "cliente" | "interno");
+                              setEditClientId(selectedTicket.client_id ? String(selectedTicket.client_id) : "");
+                              setIsEditingTicket(true);
+                            }}
+                            className="sm:hidden text-[9px] font-black uppercase tracking-wider text-amber-300"
+                          >
+                            Editar
+                          </button>
+                        )}
+                      </div>
+                      {isEditingTicket ? (
+                        <div className="space-y-3 mt-2">
+                          <div className="grid grid-cols-2 gap-2">
+                            <button type="button" onClick={() => setEditOrigen('cliente')} className={`py-2 rounded-xl text-[10px] font-black uppercase tracking-wider border transition-all ${editOrigen === 'cliente' ? 'bg-sky-500/15 text-sky-400 border-sky-500/30' : 'border-white/10 text-slate-400'}`}>Pedido de cliente</button>
+                            <button type="button" onClick={() => setEditOrigen('interno')} className={`py-2 rounded-xl text-[10px] font-black uppercase tracking-wider border transition-all ${editOrigen === 'interno' ? 'bg-violet-500/15 text-violet-400 border-violet-500/30' : 'border-white/10 text-slate-400'}`}>Pedido interno</button>
+                          </div>
+                          <ClientSearchSelect
+                            clients={clients}
+                            valueId={editClientId}
+                            onChange={(id) => setEditClientId(id)}
+                            darkMode={darkMode}
+                            placeholder={editOrigen === 'cliente' ? 'Buscar cliente...' : 'Cliente (opcional)...'}
+                            optionalLabel={editOrigen === 'interno' ? 'Sin cliente — pedido interno' : undefined}
+                          />
+                          <input
+                            type="text"
+                            value={editSubject}
+                            onChange={(e) => setEditSubject(e.target.value)}
+                            className={`w-full p-2.5 rounded-xl border outline-none text-sm font-semibold ${darkMode ? 'bg-black/20 border-white/10 text-white' : 'bg-white border-slate-200'}`}
+                            placeholder="Asunto..."
+                          />
+                          <textarea
+                            value={editDesc}
+                            onChange={(e) => setEditDesc(e.target.value)}
+                            rows={5}
+                            className={`w-full p-2.5 rounded-xl border outline-none text-sm resize-y ${darkMode ? 'bg-black/20 border-white/10 text-white' : 'bg-white border-slate-200'}`}
+                            placeholder="Detalle..."
+                          />
+                          <select
+                            value={editPriority}
+                            onChange={(e) => setEditPriority(e.target.value)}
+                            className={`w-full p-2.5 rounded-xl border outline-none text-sm ${darkMode ? 'bg-black/20 border-white/10 text-white' : 'bg-white border-slate-200'}`}
+                          >
+                            <option value="baja">Prioridad baja</option>
+                            <option value="media">Prioridad media</option>
+                            <option value="alta">Prioridad alta</option>
+                            <option value="critica">Prioridad crítica</option>
+                          </select>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              disabled={isSavingTicketEdit}
+                              onClick={handleSaveTicketEdit}
+                              className="flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider bg-brand-500 hover:bg-brand-600 text-white disabled:opacity-50"
+                            >
+                              {isSavingTicketEdit ? 'Guardando...' : 'Guardar cambios'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isSavingTicketEdit}
+                              onClick={() => setIsEditingTicket(false)}
+                              className="px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider border border-white/10 text-slate-400 hover:bg-white/5"
+                            >
+                              Cancelar
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
                       <p className="text-sm font-semibold text-slate-700 dark:text-slate-200 whitespace-pre-wrap">{selectedTicket.descripcion}</p>
+                      )}
+                      {((selectedTicket.intervenciones || interventions || []).filter((inv: any) => inv.adjunto_url)).length > 0 && (
+                        <div className="mt-3 space-y-1.5">
+                          <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Archivos adjuntos</p>
+                          {(selectedTicket.intervenciones || interventions || []).filter((inv: any) => inv.adjunto_url).map((inv: any) => (
+                            <a
+                              key={`adj-${inv.id}`}
+                              href={attachmentHref(inv.adjunto_url)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="flex items-center gap-2 px-2.5 py-2 rounded-xl bg-black/20 border border-white/5 hover:border-brand-500/30 transition-all"
+                            >
+                              <Paperclip size={13} className="text-brand-400 shrink-0" />
+                              <span className="flex-1 min-w-0 text-[11px] font-extrabold truncate text-slate-200">
+                                {attachmentDisplayName(inv.adjunto_url, inv.mensaje?.replace(/^Adjunto del pedido:\s*/i, ''))}
+                              </span>
+                              <ArrowUpRight size={13} className="text-brand-500 shrink-0" />
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                          Visible para todo Programación
+                        </span>
+                        <select
+                          value={selectedTicket.assigned_user_id || ""}
+                          onClick={e => e.stopPropagation()}
+                          onChange={async (e) => {
+                            const val = e.target.value ? parseInt(e.target.value) : null;
+                            try {
+                              const updated = await assignTicket(selectedTicket.id, val);
+                              setSelectedTicket({ ...selectedTicket, ...updated, clientName: selectedTicket.clientName });
+                              loadData();
+                            } catch (err: any) {
+                              alert(err?.message || "No se pudo asignar.");
+                            }
+                          }}
+                          className={`text-[10px] font-black px-3 py-1.5 rounded-xl border outline-none uppercase tracking-wider ${darkMode ? 'bg-black/20 border-white/5 text-slate-300' : 'bg-white border-slate-200'}`}
+                        >
+                          <option value="">Todo el sector (sin asignar)</option>
+                          {users.filter((u: any) => userInDesarrollo(u)).map((u: any) => (
+                            <option key={u.id} value={u.id}>{u.full_name || u.nombre}</option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
 
                     {/* Intervenciones */}
@@ -8184,7 +9792,7 @@ export default function App() {
                                     <p className="text-[11px] font-extrabold truncate">{inv.adjunto_url.split('/').pop()}</p>
                                     <p className="text-[8px] text-slate-500 uppercase">{inv.adjunto_tipo}</p>
                                   </div>
-                                  <a href={`${API_URL.replace('/api', '')}/uploads/${inv.adjunto_url.split('/').pop()}`} target="_blank" rel="noreferrer" className="text-brand-500 hover:text-brand-400"><ArrowUpRight size={14} /></a>
+                                  <a href={attachmentHref(inv.adjunto_url)} target="_blank" rel="noreferrer" className="text-brand-500 hover:text-brand-400"><ArrowUpRight size={14} /></a>
                                 </div>
                               )}
                             </div>
@@ -8357,6 +9965,53 @@ export default function App() {
                   </div>
 
                 </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/5 pt-3">
+                <div className="flex flex-wrap gap-2 sm:hidden">
+                  {(selectedTicket.estado || '').toLowerCase() === 'resuelto' && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const updated = await updateTicketStatus(selectedTicket.id, 'entregado');
+                          setSelectedTicket({ ...selectedTicket, ...updated, clientName: selectedTicket.clientName });
+                          loadData();
+                          closeTicketModal();
+                        } catch (err: any) {
+                          alert(err?.message || 'No se pudo dar por entregado');
+                        }
+                      }}
+                      className="px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30"
+                    >
+                      Dar por entregado
+                    </button>
+                  )}
+                  {(selectedTicket.estado || '').toLowerCase() !== 'resuelto' && (selectedTicket.estado || '').toLowerCase() !== 'entregado' && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const updated = await updateTicketStatus(selectedTicket.id, 'resuelto');
+                          setSelectedTicket({ ...selectedTicket, ...updated, clientName: selectedTicket.clientName });
+                          loadData();
+                        } catch (err: any) {
+                          alert(err?.message || 'No se pudo marcar como resuelto');
+                        }
+                      }}
+                      className="px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                    >
+                      Marcar resuelto
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={closeTicketModal}
+                  className="ml-auto px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider bg-slate-700/80 text-slate-100 border border-white/10 hover:bg-slate-600 transition-all"
+                >
+                  Cerrar ventana
+                </button>
               </div>
 
             </div>
@@ -8869,14 +10524,12 @@ export default function App() {
             <div className="space-y-4 pt-2">
               <div>
                 <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2.5">Cliente Asociado</label>
-                <select 
-                  className="w-full bg-slate-800/80 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 transition-all text-sm" 
-                  value={licClientId}
-                  onChange={(e) => setLicClientId(e.target.value)}
-                >
-                  <option value="">Seleccione un cliente...</option>
-                  {clients.map(c => <option key={c.id} value={c.id}>{c.razon_social}</option>)}
-                </select>
+                <ClientSearchSelect
+                  clients={clients}
+                  valueId={licClientId}
+                  onChange={(id) => setLicClientId(id)}
+                  placeholder="Buscar cliente por código o nombre..."
+                />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -9017,7 +10670,6 @@ export default function App() {
                           type="button"
                           onClick={() => {
                             setAssignClientId(String(assignModal.proposed_client.id));
-                            setAssignSearchText(`${assignModal.proposed_client.razon_social} (${assignModal.proposed_client.codigo || ''})`);
                           }}
                           className="w-full bg-emerald-600/95 hover:bg-emerald-500 text-white font-extrabold text-[10px] py-2 rounded-xl transition-all shadow-md shadow-emerald-600/10 active:scale-[0.98]"
                         >
@@ -9039,64 +10691,12 @@ export default function App() {
 
               <div className="relative">
                 <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2 font-mono">Empresa / Cliente</label>
-                <div className="relative">
-                  <input
-                    type="text"
-                    className="w-full bg-slate-800/80 border border-white/10 rounded-xl px-4 py-3.5 text-white outline-none focus:border-indigo-500 transition-all text-sm font-bold placeholder:text-slate-500"
-                    placeholder="Escribe el nombre o código para filtrar..."
-                    value={assignSearchText}
-                    onChange={(e) => {
-                      setAssignSearchText(e.target.value);
-                      setAssignClientId("");
-                      setShowAssignDropdown(true);
-                    }}
-                    onFocus={() => setShowAssignDropdown(true)}
-                  />
-                  {assignClientId && (
-                    <span className="absolute right-3 top-3.5 text-xs text-emerald-400 font-bold flex items-center gap-1 bg-emerald-500/10 px-2.5 py-0.5 rounded-full">
-                      ✓ Seleccionado
-                    </span>
-                  )}
-                </div>
-
-                {showAssignDropdown && (
-                  <>
-                    {/* Backdrop to close the dropdown on click outside */}
-                    <div className="fixed inset-0 z-10" onClick={() => setShowAssignDropdown(false)} />
-                    
-                    <div className="absolute left-0 right-0 mt-1 max-h-60 overflow-y-auto bg-slate-800 border border-white/10 rounded-xl shadow-2xl z-20 scrollbar-thin divide-y divide-white/5 animate-in slide-in-from-top-2 duration-150">
-                      {clients
-                        .filter(c => {
-                          if (!assignSearchText) return true;
-                          const term = assignSearchText.toLowerCase();
-                          return c.razon_social?.toLowerCase().includes(term) || c.codigo?.toLowerCase().includes(term);
-                        })
-                        .slice(0, 80)
-                        .map(c => (
-                          <div
-                            key={c.id}
-                            className="p-3 text-xs text-slate-300 hover:bg-indigo-600 hover:text-white cursor-pointer transition-all font-semibold flex items-center justify-between"
-                            onClick={() => {
-                              setAssignClientId(String(c.id));
-                              setAssignSearchText(`${c.razon_social} (${c.codigo || ''})`);
-                              setShowAssignDropdown(false);
-                            }}
-                          >
-                            <span>{c.razon_social}</span>
-                            <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded font-bold">{c.codigo || 'S/C'}</span>
-                          </div>
-                        ))
-                      }
-                      {clients.filter(c => {
-                        if (!assignSearchText) return true;
-                        const term = assignSearchText.toLowerCase();
-                        return c.razon_social?.toLowerCase().includes(term) || c.codigo?.toLowerCase().includes(term);
-                      }).length === 0 && (
-                        <p className="p-4 text-xs text-slate-500 italic text-center">No se encontraron clientes coincidentes.</p>
-                      )}
-                    </div>
-                  </>
-                )}
+                <ClientSearchSelect
+                  clients={clients}
+                  valueId={assignClientId}
+                  onChange={(id) => setAssignClientId(id)}
+                  placeholder="Escribí código o nombre para filtrar..."
+                />
               </div>
 
               <div className="flex gap-3 pt-4">
@@ -9306,22 +10906,59 @@ export default function App() {
                   <option value="soporte">Soporte Técnico (Operador)</option>
                   <option value="desarrollo">Desarrollador</option>
                   <option value="admin">Administrador del Sistema</option>
+                  <option value="reseller">Reseller (Revendedor)</option>
                 </select>
               </div>
 
-              {/* Departamento */}
+              {/* Reseller (solo si el rol es reseller) */}
+              {userAbmForm.rol === 'reseller' && (
+                <div>
+                  <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Empresa Reseller</label>
+                  <select
+                    className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3.5 text-white outline-none focus:border-brand-500 transition-all text-sm font-bold"
+                    value={userAbmForm.reseller_id || ''}
+                    onChange={(e) => setUserAbmForm({ ...userAbmForm, reseller_id: e.target.value ? Number(e.target.value) : null })}
+                  >
+                    <option value="">— Sin asignar —</option>
+                    {resellers.filter((r: any) => r.activo !== false).map((r: any) => (
+                      <option key={r.id} value={r.id}>{r.nombre}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {/* Actividades (puede tener más de una) */}
               <div>
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Departamento de la Empresa</label>
-                <select
-                  className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3.5 text-white outline-none focus:border-brand-500 transition-all text-sm font-bold"
-                  value={userAbmForm.departamento}
-                  onChange={(e) => setUserAbmForm({ ...userAbmForm, departamento: e.target.value })}
-                >
-                  <option value="Desarrollo">Desarrollo (Ingeniería)</option>
-                  <option value="Atención al Cliente">Atención al Cliente (Soporte)</option>
-                  <option value="Caja">Caja</option>
-                  <option value="Finanzas">Finanzas</option>
-                </select>
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Actividades</label>
+                <p className="text-[10px] text-slate-500 mb-2">Puede estar en más de una: Atención y Desarrollo, o Desarrollo y Finanzas.</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {ACTIVIDADES.map((act) => {
+                    const checked = userAbmForm.actividades.includes(act.key);
+                    return (
+                      <label
+                        key={act.key}
+                        className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl border cursor-pointer transition-all ${
+                          checked
+                            ? 'border-brand-500/50 bg-brand-500/10 text-white'
+                            : 'border-white/10 bg-slate-800/60 text-slate-300 hover:border-white/20'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          className="w-4 h-4 rounded text-brand-500 focus:ring-brand-500 bg-slate-800 border-white/10"
+                          checked={checked}
+                          onChange={() => {
+                            const next = checked
+                              ? userAbmForm.actividades.filter((item) => item !== act.key)
+                              : [...userAbmForm.actividades, act.key];
+                            setUserAbmForm({ ...userAbmForm, actividades: next, departamento: next.join(' / ') });
+                          }}
+                        />
+                        <span className="text-xs font-bold">{act.label}</span>
+                      </label>
+                    );
+                  })}
+                </div>
               </div>
 
               {/* Celular */}
@@ -9365,6 +11002,72 @@ export default function App() {
                 >
                   Guardar Usuario
                 </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showResellerModal && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in">
+          <div className="bg-slate-900 border border-brand-500/20 rounded-3xl px-6 pt-6 pb-5 max-w-[400px] w-full space-y-5 shadow-2xl animate-in zoom-in-95 max-h-[90vh] overflow-y-auto scrollbar-thin">
+            <div className="flex justify-between items-center">
+              <h3 className="text-lg font-black text-white flex items-center gap-2">
+                <CreditCard className="text-brand-500" /> {selectedResellerForEdit ? 'Editar Reseller' : 'Nuevo Reseller'}
+              </h3>
+              <button onClick={() => setShowResellerModal(false)} className="text-slate-400 hover:text-white"><X size={20} /></button>
+            </div>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              if (!resellerForm.nombre) { alert('El nombre es obligatorio.'); return; }
+              try {
+                if (selectedResellerForEdit) {
+                  await updateReseller(selectedResellerForEdit.id, resellerForm);
+                  setShowNotification(`Reseller ${resellerForm.nombre} actualizado.`);
+                } else {
+                  await createReseller(resellerForm);
+                  setShowNotification(`Reseller ${resellerForm.nombre} creado.`);
+                }
+                setShowResellerModal(false);
+                loadData();
+                setTimeout(() => setShowNotification(null), 3000);
+              } catch (err: any) {
+                alert(err.message || 'Error al guardar');
+              }
+            }} className="space-y-4">
+              <div>
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Nombre / Razón Social *</label>
+                <input required className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 text-sm font-bold" value={resellerForm.nombre} onChange={(e) => setResellerForm({ ...resellerForm, nombre: e.target.value })} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Persona de Contacto</label>
+                <input className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 text-sm font-bold" value={resellerForm.contacto} onChange={(e) => setResellerForm({ ...resellerForm, contacto: e.target.value })} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Email</label>
+                  <input type="email" className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 text-sm font-bold" value={resellerForm.email} onChange={(e) => setResellerForm({ ...resellerForm, email: e.target.value })} />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Teléfono</label>
+                  <input className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 text-sm font-bold" value={resellerForm.telefono} onChange={(e) => setResellerForm({ ...resellerForm, telefono: e.target.value })} />
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Comisión (%)</label>
+                <input type="number" step="0.1" min="0" max="100" className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 text-sm font-bold" value={resellerForm.comision_pct} onChange={(e) => setResellerForm({ ...resellerForm, comision_pct: parseFloat(e.target.value) || 0 })} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Notas Internas</label>
+                <textarea rows={2} className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white outline-none focus:border-brand-500 text-sm font-bold resize-none" value={resellerForm.notas} onChange={(e) => setResellerForm({ ...resellerForm, notas: e.target.value })} />
+              </div>
+              <div className="flex items-center gap-3 py-2">
+                <input type="checkbox" id="reseller_activo" className="w-4 h-4 rounded text-brand-500 bg-slate-800 border-white/10" checked={resellerForm.activo} onChange={(e) => setResellerForm({ ...resellerForm, activo: e.target.checked })} />
+                <label htmlFor="reseller_activo" className="text-xs font-bold text-slate-300 uppercase tracking-wider cursor-pointer">Reseller Activo</label>
+              </div>
+              <div className="flex gap-3 pt-4">
+                <button type="button" onClick={() => setShowResellerModal(false)} className="flex-1 py-3 text-sm font-bold text-slate-400 hover:text-white hover:bg-white/5 rounded-2xl transition-all">Cancelar</button>
+                <button type="submit" className="flex-1 bg-brand-500 hover:bg-brand-600 text-white font-extrabold py-3 rounded-2xl shadow-lg shadow-brand-500/20 transition-all text-sm uppercase tracking-wider">Guardar</button>
               </div>
             </form>
           </div>
@@ -9433,6 +11136,83 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setLicFactModal(prev => ({ ...prev, isOpen: false }))}
+                className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-bold text-white border border-white/5"
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cbuModal.isOpen && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-50 flex items-center justify-center p-4 overflow-y-auto animate-in fade-in duration-200">
+          <div className={`relative w-full max-w-4xl rounded-3xl p-6 sm:p-8 flex flex-col max-h-[90vh] shadow-2xl border animate-in zoom-in-95 duration-200 ${darkMode ? 'glass-dark border-white/10 text-white' : 'bg-white border-slate-200 text-slate-800'}`}>
+            <div className="flex justify-between items-start gap-4 border-b pb-4 dark:border-white/10">
+              <div>
+                <span className="text-[10px] uppercase font-black tracking-widest text-sky-400 bg-sky-500/10 px-2.5 py-1 rounded-full">
+                  ventas_ClienDA · SQL
+                </span>
+                <h3 className="text-xl sm:text-2xl font-black mt-2 leading-none">
+                  CBU: <span className="text-sky-400">{cbuModal.client?.razon_social}</span>
+                </h3>
+                <p className="text-xs text-slate-400 mt-1 font-medium">
+                  CCLIFAC: <strong className="font-mono text-slate-300">{cbuModal.client?.cclifac || cbuModal.client?.codigo}</strong>
+                </p>
+              </div>
+              <button
+                onClick={() => setCbuModal(prev => ({ ...prev, isOpen: false }))}
+                className="hover:bg-red-500/10 hover:text-red-500 p-2 rounded-xl transition-all"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto mt-4">
+              {cbuModal.loading ? (
+                <div className="py-16 text-center text-slate-400 text-sm">Consultando ventas_ClienDA…</div>
+              ) : cbuModal.items.length === 0 ? (
+                <div className="py-16 text-center text-slate-500 text-sm">Este cliente no tiene CBU cargados.</div>
+              ) : (
+                <table className="w-full text-left text-xs">
+                  <thead className="text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+                    <tr>
+                      <th className="py-2 pr-2">Estado</th>
+                      <th className="py-2 pr-2">CBU</th>
+                      <th className="py-2 pr-2">Banco del CBU</th>
+                      <th className="py-2 pr-2">Cuenta débito</th>
+                      <th className="py-2">Nro. cuenta</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cbuModal.items.map((row: any) => {
+                      const cbu = String(row.cbu || '');
+                      const cbuFmt = cbu.length === 22 ? `${cbu.slice(0, 8)} ${cbu.slice(8)}` : cbu;
+                      const cuenta = [row.cban, row.cuenta_nombre, row.cuenta_servicio].filter(Boolean).join(' · ');
+                      return (
+                        <tr key={row.id} className="border-b border-white/5">
+                          <td className="py-2.5 pr-2">
+                            <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${row.activo ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-500/20 text-slate-400 border border-slate-500/30'}`}>
+                              {row.activo ? 'Activo' : 'Inactivo'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 pr-2 font-mono text-sky-300 select-all">{cbuFmt || '—'}</td>
+                          <td className="py-2.5 pr-2 text-slate-200">{row.banco_cbu || '—'}</td>
+                          <td className="py-2.5 pr-2 text-slate-300">{cuenta || '—'}</td>
+                          <td className="py-2.5 font-mono text-slate-400">{row.cuenta_numero || '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            <div className="mt-4 pt-4 border-t dark:border-white/10 flex justify-between items-center">
+              <span className="text-xs text-slate-400">{cbuModal.items.length} CBU</span>
+              <button
+                type="button"
+                onClick={() => setCbuModal(prev => ({ ...prev, isOpen: false }))}
                 className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-bold text-white border border-white/5"
               >
                 Cerrar
@@ -9612,15 +11392,41 @@ const NavItem = ({ icon, text, active, badge, onClick }: any) => (
   </button>
 );
 
-const TicketRow = ({ id, client, subject, status, priority, darkMode }: any) => {
-  const statusColors: any = { 'nuevo': 'text-blue-500 bg-blue-500/10', 'en_curso': 'text-brand-500 bg-brand-500/10', 'resuelto': 'text-emerald-500 bg-emerald-500/10' };
+function ticketRegisteredBy(t: any): string {
+  const u = t?.creado_por;
+  if (u?.full_name || u?.nombre) return String(u.full_name || u.nombre).trim();
+  const first = (t?.intervenciones || []).find((inv: any) => inv?.usuario?.full_name || inv?.usuario?.nombre)?.usuario;
+  if (first?.full_name || first?.nombre) return String(first.full_name || first.nombre).trim();
+  return '';
+}
+
+const TicketRow = ({ id, client, subject, status, priority, origen, createdAt, assignee, registeredBy, hasAttachments, darkMode }: any) => {
+  const statusColors: any = { 'nuevo': 'text-blue-500 bg-blue-500/10', 'en_curso': 'text-brand-500 bg-brand-500/10', 'resuelto': 'text-emerald-500 bg-emerald-500/10', 'entregado': 'text-sky-500 bg-sky-500/10', 'bloqueado': 'text-rose-500 bg-rose-500/10' };
+  const isInternal = (origen || 'cliente') === 'interno';
   return (
     <div className={`grid grid-cols-12 gap-4 p-3.5 rounded-xl items-center cursor-pointer transition-all ${darkMode ? 'hover:bg-white/5' : 'hover:bg-slate-50'}`}>
       <div className="col-span-1 text-xs font-bold text-slate-500">{id}</div>
-      <div className="col-span-3 text-sm font-extrabold text-brand-500 truncate">{client}</div>
-      <div className="col-span-4 text-sm truncate">{subject}</div>
-      <div className="col-span-2"><span className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase ${statusColors[status.toLowerCase()] || 'text-slate-400 bg-slate-400/10'}`}>{status}</span></div>
-      <div className="col-span-2 text-xs font-bold capitalize">{priority}</div>
+      <div className="col-span-1">
+        <span className={`px-2 py-1 rounded-full text-[9px] font-black uppercase tracking-wider ${isInternal ? 'text-violet-400 bg-violet-500/10' : 'text-sky-400 bg-sky-500/10'}`}>
+          {isInternal ? 'Interno' : 'Cliente'}
+        </span>
+      </div>
+      <div className="col-span-2 text-sm font-extrabold text-brand-500 truncate">{client}</div>
+      <div className="col-span-2 text-sm truncate flex items-center gap-1.5">
+        {hasAttachments && <Paperclip size={12} className="text-brand-500 shrink-0" />}
+        <span className="truncate">{subject}</span>
+      </div>
+      <div className="col-span-1"><span className={`px-2 py-1 rounded-full text-[9px] font-bold uppercase ${statusColors[(status || '').toLowerCase()] || 'text-slate-400 bg-slate-400/10'}`}>{status}</span></div>
+      <div className="col-span-1 text-[10px] font-bold text-slate-400" title={createdAt ? new Date(createdAt).toLocaleString() : 'Sin fecha de creación'}>
+        {createdAt ? new Date(createdAt).toLocaleString('es-AR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'}
+      </div>
+      <div className="col-span-2 text-[10px] font-bold text-amber-200/90 truncate" title={registeredBy || 'Sin dato de quién lo cargó'}>
+        {registeredBy || '—'}
+      </div>
+      <div className="col-span-2 text-[10px] font-bold text-slate-400 truncate" title={assignee || 'Visible para todo el sector'}>
+        {assignee ? assignee : 'Todo el sector'}
+        {priority ? <span className="block text-[9px] uppercase text-slate-500">{priority}</span> : null}
+      </div>
     </div>
   );
 };

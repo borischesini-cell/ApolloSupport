@@ -16,7 +16,10 @@ $RepoRoot = Split-Path $PSScriptRoot -Parent
 Set-Location $RepoRoot
 
 function Resolve-DeployPath([string]$Path) {
-    if ($Server) { return ($Server + "\C$\" + ($Path -replace ':\\','\' -replace '^\\','')) }
+    if ($Server) {
+        $rel = $Path.Substring(3)
+        return $Server + '\C$\' + $rel
+    }
     return $Path
 }
 

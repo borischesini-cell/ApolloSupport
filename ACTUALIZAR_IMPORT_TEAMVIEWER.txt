@@ -1,0 +1,15 @@
+IMPORTAR TEAMVIEWER
+====================
+1) En TeamViewer: lista de equipos → exportar CSV
+   Columnas útiles: Alias, TeamViewer ID, Grupo, Descripción
+2) El Grupo tiene que coincidir con la razón social (o código) del cliente en Support.
+   Si no coincide, esa fila queda en "sin cliente" y no se crea.
+3) Portal → Terminal Remota → Importar TeamViewer
+4) Publicar antes:
+   - Y:\ApolloSupport\backend\main.py
+   - Y:\ApolloSupport\backend\teamviewer_import.py
+   - Y:\ApolloSupport\frontend\dist\
+   nssm restart ApolloBackend
+
+Reimportar el mismo CSV actualiza notas y no duplica la PC.
+El ID queda en las notas: [TeamViewer ID: xxx xxx xxx]

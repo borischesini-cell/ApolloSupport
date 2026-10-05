@@ -1,0 +1,18 @@
+ACTUALIZAR SERVIDOR — Portal 3.2.7 + tickets edit + saldos
+==========================================================
+Desde Y:\ApolloSupport:
+
+1) Backend
+   Copy-Item Y:\ApolloSupport\backend\main.py    C:\ApolloSupport\backend\main.py -Force
+   Copy-Item Y:\ApolloSupport\backend\schemas.py C:\ApolloSupport\backend\schemas.py -Force
+   nssm restart ApolloBackend
+
+2) Portal (htdocs)
+   Copiar Y:\ApolloSupport\frontend\dist\* → C:\Apache24\htdocs\apollosupport\
+   (o la ruta real del portal)
+
+Incluye:
+- Editar pedido (asunto/detalle/cliente/origen/prioridad)
+- Botón «Sincronizar saldos ERP» sin exigir CLIGESCO.DBF en el server
+
+Centinela OTA 3.3.15 ya está en Y:\ApolloSupport\backend\updates\

@@ -1,0 +1,10 @@
+ACTUALIZAR SERVIDOR — Centinela 3.3.15
+======================================
+Copia Y:\ApolloSupport\backend\updates\ → C:\ApolloSupport\backend\updates\
+nssm restart ApolloBackend
+update_check → 3.3.15
+
+Cliente RDP (SRV2016RDP etc.):
+- Debe quedar pie de ApolloSoporte en v3.3.15 (NO 3.3.12)
+- HD OFF (el agente lo rechaza solo en RDP)
+- Ver escritorio compuesto por ventanas

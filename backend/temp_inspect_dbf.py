@@ -1,7 +1,7 @@
 from dbfread import DBF
 import os
 
-dbf_path = r"p:\ApolloSupport\bases\CLIGESCO.DBF"
+dbf_path = r"m:\programa\CLIGESCO.DBF"
 if not os.path.exists(dbf_path):
     print("DBF file not found at:", dbf_path)
 else:

@@ -1,0 +1,4 @@
+# Canal rápido P2P — Python 3.8 x64 (el companion se compila con 3.8).
+# Última aiortc que soporta 3.8. No instalar en 32-bit (no hay ruedas).
+aiortc==1.9.0
+av>=9,<13

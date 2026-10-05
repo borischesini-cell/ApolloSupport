@@ -1,0 +1,20 @@
+ACTUALIZAR SERVIDOR — Portal 3.2.11 + clipboard archivos + panel
+================================================================
+Desde Y:\ApolloSupport:
+
+1) Backend
+   Copy-Item Y:\ApolloSupport\backend\main.py C:\ApolloSupport\backend\main.py -Force
+   nssm restart ApolloBackend
+
+2) Portal (htdocs)
+   Copiar Y:\ApolloSupport\frontend\dist\* → ruta del portal
+   Verificar version.txt = 3.2.11
+
+3) Centinela OTA 3.3.17
+   Copiar Y:\ApolloSupport\backend\updates\* → C:\ApolloSupport\backend\updates\
+   (ApolloSetup*.exe + version.json)
+   Los clientes actualizan solos; el pegado de archivos requiere este agente.
+
+Incluye:
+- Panel del visor unificado (sin barra flotante desordenada)
+- Copiar/pegar archivos endurecido (Preferred DropEffect + lock)

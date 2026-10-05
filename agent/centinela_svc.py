@@ -25,7 +25,9 @@ import logging.handlers
 
 # ── Configuracion ─────────────────────────────────────────────────────────────
 SERVICE_NAME    = "ApolloCentinela"
-__version__     = "3.2.6"
+__version__     = "3.3.36"
+SERVICE_MUTEX_NAME = "Global\\ApolloCentinelaService"
+ERROR_ALREADY_EXISTS = 183
 BASE_DIR        = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
 CONFIG_DIR      = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport")
 CONFIG_FILE     = os.path.join(CONFIG_DIR, "centinela.dat")
@@ -389,16 +391,41 @@ def _token_from_process_in_session(session_id, image_name):
 
 
 def _token_from_winlogon_in_session(session_id):
-    """Token del winlogon.exe de la sesion (RDP desconectada / sin usuario activo)."""
+    """(token, from_explorer). Explorer = UI; winlogon = pantalla de login."""
     _enable_service_token_privileges()
+    token = _token_from_process_in_session(session_id, "explorer.exe")
+    if token:
+        logger.info("Token obtenido desde explorer.exe en sesion %d", session_id)
+        return token, True
     token = _token_from_process_in_session(session_id, "winlogon.exe")
     if token:
         logger.info("Token obtenido desde winlogon.exe en sesion %d", session_id)
-        return token
-    token = _token_from_process_in_session(session_id, "explorer.exe")
-    if token:
-        logger.info("Token obtenido desde explorer.exe en sesion %d (fallback)", session_id)
-    return token
+        return token, False
+    return None, False
+
+
+def _session_has_explorer(session_id):
+    """True si hay explorer.exe en la sesion (usuario con escritorio visible)."""
+    try:
+        for p in psutil.process_iter(["name"]):
+            try:
+                if (p.info.get("name") or "").lower() != "explorer.exe":
+                    continue
+                if int(p.SessionId) == int(session_id):
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError, TypeError, ValueError):
+                continue
+    except Exception as e:
+        logger.debug("_session_has_explorer: %s", e)
+    tok = _token_from_process_in_session(session_id, "explorer.exe")
+    if tok:
+        try:
+            KERNEL32.CloseHandle(tok)
+        except Exception:
+            pass
+        return True
+    return False
+
 
 def _token_from_service_session(session_id):
     """Token SYSTEM del servicio, reasignado a la sesion destino."""
@@ -420,7 +447,7 @@ def _token_from_service_session(session_id):
 def obtain_launch_token(session_id, force_system=False):
     """
     Devuelve (handle_token_primario, has_user_token) o (None, False).
-    Orden: usuario logueado -> winlogon de la sesion -> SYSTEM+SessionId.
+    has_user_token=True => lanzar con ventana/tray (escritorio default).
     """
     _enable_service_token_privileges()
     if not force_system:
@@ -433,19 +460,20 @@ def obtain_launch_token(session_id, force_system=False):
 
         err = KERNEL32.GetLastError()
         logger.warning(
-            "WTSQueryUserToken fallo (error %d) en sesion %d; probando winlogon/SYSTEM",
+            "WTSQueryUserToken fallo (error %d) en sesion %d; probando explorer/winlogon/SYSTEM",
             err, session_id,
         )
 
-    wl = _token_from_winlogon_in_session(session_id)
+    wl, from_explorer = _token_from_winlogon_in_session(session_id)
     if wl:
         dup = _duplicate_primary_token(wl, session_id)
         KERNEL32.CloseHandle(wl)
         if dup:
-            return dup, False
+            return dup, bool(from_explorer)
 
     dup = _token_from_service_session(session_id)
-    return (dup, False) if dup else (None, False)
+    interactive = _session_has_explorer(session_id)
+    return (dup, interactive) if dup else (None, False)
 
 
 def spawn_in_user_session(exe_path, args="", session_id=None):
@@ -470,11 +498,22 @@ def spawn_in_user_session(exe_path, args="", session_id=None):
     if session_id == 0xFFFFFFFF:
         session_id = 1
 
-    force_sys = "--type-credentials" in args or "--winlogon" in args
-    dup_token, has_user_token = obtain_launch_token(session_id, force_system=force_sys)
-    if not dup_token:
-        logger.error("No se pudo obtener token para lanzar companion en sesion %d", session_id)
-        return None
+    is_inject_helper = "--inject-helper" in args
+    if is_inject_helper:
+        # El helper de inyeccion DEBE correr como SYSTEM real (para saltear UIPI y poder
+        # operar el UAC / ventanas elevadas). NO usar el token de explorer (integridad media).
+        _enable_service_token_privileges()
+        dup_token = _token_from_service_session(session_id)
+        has_user_token = False
+        if not dup_token:
+            logger.error("[INJECT] No se pudo obtener token SYSTEM para helper en sesion %d", session_id)
+            return None
+    else:
+        force_sys = "--type-credentials" in args or "--winlogon" in args
+        dup_token, has_user_token = obtain_launch_token(session_id, force_system=force_sys)
+        if not dup_token:
+            logger.error("No se pudo obtener token para lanzar companion en sesion %d", session_id)
+            return None
 
     env_block = ctypes.c_void_p()
     creation_flags = 0
@@ -487,32 +526,59 @@ def spawn_in_user_session(exe_path, args="", session_id=None):
 
     si = STARTUPINFOW()
     si.cb = ctypes.sizeof(STARTUPINFOW)
-    # --winlogon / --type-credentials: escritorio de login (SAS, lock, sin sesion).
-    # Sin token de usuario tambien hay que ir a Winlogon para ver la pantalla de logueo.
-    if "--type-credentials" in args or "--winlogon" in args or not has_user_token:
+    spawn_args = args or ""
+    explicit_headless = (
+        "--type-credentials" in spawn_args.split()
+        or "--winlogon" in spawn_args.split()
+        or "--headless" in spawn_args.split()
+    )
+    # Si hay explorer (usuario en RDP/escritorio), NUNCA forzar headless:
+    # eso es lo que dejaba el agente online sin tray ni ventana con el ID.
+    interactive_desktop = bool(has_user_token) or _session_has_explorer(session_id)
+    # El helper de inyeccion SIEMPRE va al escritorio interactivo (winsta0\default),
+    # donde aparece el UAC (con PromptOnSecureDesktop=0) y las ventanas elevadas.
+    if is_inject_helper:
+        interactive_desktop = True
+    use_winlogon_desktop = explicit_headless or (
+        not interactive_desktop and ("--winlogon" in spawn_args.split() or not has_user_token)
+    )
+
+    if use_winlogon_desktop and not interactive_desktop:
         si.lpDesktop = "winsta0\\Winlogon"
     else:
         si.lpDesktop = "winsta0\\default"
-        
+
     si.dwFlags = 0x00000001   # STARTF_USESHOWWINDOW
-    if "--type-credentials" in args or "--winlogon" in args or "--headless" in args:
-        si.wShowWindow = 0    # SW_HIDE (inyeccion / captura en Winlogon)
+    if explicit_headless and not interactive_desktop:
+        si.wShowWindow = 0    # SW_HIDE
     else:
-        si.wShowWindow = 5    # SW_SHOW — ventana/tray visibles tras instalar o reinicio
+        si.wShowWindow = 5    # SW_SHOW — ventana/tray visibles
 
     pi = PROCESS_INFORMATION()
     work_dir = os.path.dirname(exe_path)
     app_name = ctypes.create_unicode_buffer(exe_path)
-    # lpCommandLine debe ser buffer mutable; con lpApplicationName fijado, el comando puede citar el mismo exe
-    spawn_args = args or ""
-    # Captura sin UI en Winlogon / sin usuario logueado
+    # Solo agregar --headless si es login/winlogon real (sin explorer)
     if "--type-credentials" not in spawn_args.split():
-        need_headless = (not has_user_token) or ("--winlogon" in spawn_args.split())
+        need_headless = (not interactive_desktop) and (
+            ("--winlogon" in spawn_args.split()) or (not has_user_token)
+        )
         if need_headless and "--headless" not in spawn_args.split():
             spawn_args = f"{spawn_args} --headless".strip()
+        # Con escritorio de usuario: quitar --headless accidental
+        if interactive_desktop and not explicit_headless:
+            parts = [p for p in spawn_args.split() if p not in ("--headless", "--winlogon")]
+            spawn_args = " ".join(parts)
     cmdline_str = f'"{exe_path}"' if not spawn_args else f'"{exe_path}" {spawn_args}'
     cmdline = ctypes.create_unicode_buffer(cmdline_str)
     work_buf = ctypes.create_unicode_buffer(work_dir)
+
+    logger.info(
+        "Spawn companion sesion=%d interactive=%s headless_args=%r desktop=%s",
+        session_id,
+        interactive_desktop,
+        spawn_args,
+        si.lpDesktop,
+    )
 
     try:
         ok = ADVAPI32.CreateProcessAsUserW(
@@ -536,6 +602,10 @@ def spawn_in_user_session(exe_path, args="", session_id=None):
     if ok:
         global _companion_spawn_grace_until, _companion_spawn_pid
         KERNEL32.CloseHandle(pi.hThread)
+        if is_inject_helper:
+            # El helper NO es el companion: no tocar el tracking del companion.
+            logger.info("[INJECT] Helper SYSTEM lanzado en sesion %d (PID %d)", session_id, pi.dwProcessId)
+            return pi.hProcess
         _companion_spawn_pid = int(pi.dwProcessId)
         _companion_spawn_grace_until = time.time() + 20
         logger.info("Companion lanzado en sesion %d (PID %d)", session_id, pi.dwProcessId)
@@ -803,46 +873,117 @@ def process_switch_session_signal():
 
 
 def find_session_with_user_token():
-    """Primera sesion WTS con usuario logueado (token interactivo)."""
-    for sid, _state in _enumerate_wts_sessions():
+    """
+    Mejor sesion con usuario logueado.
+    Prioridad: Active + explorer (escritorio visible) > Active > otras.
+    Evita anclarse a una sesion vieja (ej. 2) y matar el companion del
+    RDP/AnyDesk donde el usuario esta mirando (ej. 8).
+    """
+    scored = []
+    for sid, state in _enumerate_wts_sessions():
         if sid == 0:
             continue
+        if not session_has_user_token(sid):
+            continue
+        score = 0
+        if state == WTS_ACTIVE:
+            score += 100
+        elif state == WTS_CONNECTED:
+            score += 40
+        elif state == WTS_DISCONNECTED:
+            score += 5
+        if _session_has_explorer(sid):
+            score += 50
+        if find_companion_pid_in_session(sid):
+            score += 35
+        scored.append((score, int(sid)))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best_score, best_sid = scored[0]
+    logger.info(
+        "[SESSION] Mejor sesion usuario=%d score=%d (candidatos=%s)",
+        best_sid, best_score, scored[:5],
+    )
+    return best_sid
+
+
+def adopt_visible_companion_session(current_target):
+    """
+    Si el companion ya corre en otra sesion Active con escritorio (usuario
+    abrio el acceso directo ahi), adoptar esa sesion en lugar de matarlo.
+    """
+    best = None
+    best_score = -1
+    for sid, state in _enumerate_wts_sessions():
+        if sid == 0 or int(sid) == int(current_target):
+            continue
+        if state != WTS_ACTIVE:
+            continue
+        if not find_companion_pid_in_session(sid):
+            continue
+        score = 50
+        if _session_has_explorer(sid):
+            score += 50
         if session_has_user_token(sid):
-            return int(sid)
-    return None
+            score += 20
+        if score > best_score:
+            best_score = score
+            best = int(sid)
+    return best
 
 
 def resolve_companion_session_id():
     """
     Sesion donde debe correr el companion (UI + captura).
-    - Switch manual: _pinned_session
-    - Usuario logueado (RDP o consola): esa sesion
-    - Sin login (reinicio nocturno): consola / Winlogon para pantalla de login
+    - Switch manual: _pinned_session (salvo que no tenga escritorio y haya otra Active)
+    - Usuario logueado: mejor sesion Active+explorer
+    - Sin login: consola / Winlogon
     """
     global _pinned_session
+    best = find_session_with_user_token()
+
     if _pinned_session not in (None, 0xFFFFFFFF):
         allow_wl = _pending_post_login or _last_spawn_was_credentials
-        if session_has_user_token(_pinned_session):
-            return int(_pinned_session)
-        if session_suitable_for_companion(_pinned_session, allow_winlogon=allow_wl):
-            return int(_pinned_session)
-        logged = find_session_with_user_token()
-        if logged is not None and not allow_wl:
+        pin = int(_pinned_session)
+        pin_ok = session_has_user_token(pin) or session_suitable_for_companion(
+            pin, allow_winlogon=allow_wl
+        )
+        # Pin sin explorer + otra sesion Active con escritorio => el usuario esta alla
+        if (
+            pin_ok
+            and best is not None
+            and int(best) != pin
+            and not allow_wl
+            and not _session_has_explorer(pin)
+            and _session_has_explorer(best)
+            and get_session_state(best) == WTS_ACTIVE
+        ):
+            logger.warning(
+                "[SESSION] Pin %d sin escritorio visible; usuario en sesion %d — redirigiendo",
+                pin, best,
+            )
+            _pinned_session = int(best)
+            return int(best)
+        if session_has_user_token(pin):
+            return pin
+        if session_suitable_for_companion(pin, allow_winlogon=allow_wl):
+            return pin
+        if best is not None and not allow_wl:
             logger.warning(
                 "[SESSION] Sesion %d sin token; usuario activo en %d — redirigiendo",
-                _pinned_session, logged,
+                pin, best,
             )
-            _pinned_session = logged
-            return logged
+            _pinned_session = int(best)
+            return int(best)
         logger.warning(
             "[SESSION] Sesion %d no apta (desconectada/sin token); desanclando",
-            _pinned_session,
+            pin,
         )
         _pinned_session = None
 
-    logged = find_session_with_user_token()
-    if logged is not None:
-        return logged
+    if best is not None:
+        return int(best)
 
     active = get_active_session_id()
     if active != 0xFFFFFFFF and session_has_user_token(active):
@@ -889,7 +1030,7 @@ def companion_monitor():
     global _companion_rapid_failures, _companion_backoff_until
     global _force_relaunch_winlogon
 
-    time.sleep(2)  # dejar que el instalador/servicio suelte los .exe
+    time.sleep(0.3)  # soltar handles del instalador; no bloquear el primer spawn
 
     while _svc_running:
         if _force_relaunch_winlogon:
@@ -922,11 +1063,43 @@ def companion_monitor():
 
         target_sess = resolve_companion_session_id()
 
+        # Si el usuario abrio el companion en otra sesion Active (AnyDesk/RDP),
+        # adoptar esa en vez de matarlo por "fuera de sesion".
+        adopted = adopt_visible_companion_session(target_sess)
+        if adopted is not None:
+            logger.warning(
+                "[SESSION] Companion visible en sesion %d (target era %d) — adoptando",
+                adopted, target_sess,
+            )
+            _pinned_session = adopted
+            target_sess = adopted
+
         # Evitar pelea Consola vs AnyDesk: un solo companion en la sesion elegida
         keep_alive_pid = _pid_from_handle(_companion_handle) if is_process_alive(_companion_handle) else _companion_spawn_pid
         kill_companions_outside_session(target_sess, keep_pid=keep_alive_pid)
 
         companion_alive = is_process_alive(_companion_handle)
+
+        # Si hay escritorio de usuario pero el companion quedo headless (online sin
+        # tray/ventana), reemplazarlo solos — el cliente no debe hacer taskkill.
+        if companion_alive and _session_has_explorer(target_sess):
+            alive_pid = _pid_from_handle(_companion_handle) or _companion_spawn_pid
+            if alive_pid and companion_cmdline_is_headless(alive_pid):
+                logger.warning(
+                    "[UI] Companion headless con explorer en sesion %d (pid=%s) — relanzando UI",
+                    target_sess, alive_pid,
+                )
+                try:
+                    KERNEL32.TerminateProcess(_companion_handle, 0)
+                    KERNEL32.CloseHandle(_companion_handle)
+                except Exception:
+                    pass
+                _companion_handle = None
+                kill_stale_companion_processes(session_id=target_sess)
+                time.sleep(0.3)
+                _companion_handle = spawn_in_user_session(COMPANION_EXE, session_id=target_sess)
+                _last_session = target_sess
+                companion_alive = is_process_alive(_companion_handle)
 
         if not companion_alive:
             if _companion_handle:
@@ -956,7 +1129,7 @@ def companion_monitor():
                     kill_stale_companion_processes(
                         keep_pid=_companion_spawn_pid, session_id=target_sess
                     )
-                    time.sleep(1)
+                    time.sleep(0.2)
                     _companion_handle = spawn_in_user_session(COMPANION_EXE, session_id=target_sess)
                     _last_session = target_sess
                     if _companion_handle:
@@ -1210,8 +1383,20 @@ def get_process_session_id(pid):
     return None
 
 
+def _is_inject_helper_pid(pid):
+    """True si el proceso es el helper de inyeccion SYSTEM (--inject-helper), NO el companion.
+    Comparten el mismo .exe, asi que hay que distinguirlos por la linea de comandos."""
+    try:
+        cmd = psutil.Process(int(pid)).cmdline() or []
+        return "--inject-helper" in " ".join(str(x) for x in cmd).lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+    except Exception:
+        return False
+
+
 def find_companion_pid_in_session(session_id):
-    """PID del companion vivo en la sesion indicada (si existe)."""
+    """PID del companion vivo en la sesion indicada (si existe). Ignora el helper de inyeccion."""
     try:
         for proc in psutil.process_iter(["pid", "name"]):
             try:
@@ -1219,13 +1404,23 @@ def find_companion_pid_in_session(session_id):
                 if name not in COMPANION_IMAGE_NAMES:
                     continue
                 pid = proc.info.get("pid")
-                if pid and get_process_session_id(pid) == int(session_id):
+                if pid and get_process_session_id(pid) == int(session_id) and not _is_inject_helper_pid(pid):
                     return int(pid)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
     except Exception:
         pass
     return None
+
+
+def companion_cmdline_is_headless(pid):
+    """True si el companion corre con --headless/--winlogon (sin ventana de ID)."""
+    try:
+        cmd = psutil.Process(int(pid)).cmdline() or []
+        joined = " ".join(str(x) for x in cmd).lower()
+        return ("--headless" in joined) or ("--winlogon" in joined)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+        return False
 
 
 def open_companion_process_handle(pid):
@@ -1276,6 +1471,8 @@ def kill_stale_companion_processes(keep_pid=None, session_id=None):
                     continue
                 if in_grace and pid == _companion_spawn_pid:
                     continue
+                if _is_inject_helper_pid(pid):
+                    continue  # nunca matar el helper de inyeccion SYSTEM
                 if target_sess is not None:
                     psid = get_process_session_id(pid)
                     if psid is None or int(psid) != target_sess:
@@ -1310,6 +1507,8 @@ def kill_companions_outside_session(keep_session, keep_pid=None):
                 pid = proc.info.get("pid")
                 if pid in keep:
                     continue
+                if _is_inject_helper_pid(pid):
+                    continue  # nunca matar el helper de inyeccion SYSTEM
                 psid = get_process_session_id(pid)
                 if psid is not None and int(psid) == keep_sess:
                     continue
@@ -1324,82 +1523,244 @@ def kill_companions_outside_session(keep_session, keep_pid=None):
         logger.debug("[KILL] kill_companions_outside_session: %s", e)
 
 
-def stop_all_centinela_for_update():
-    """Mata companion/servicio para que el instalador pueda reemplazar los .exe."""
-    global _svc_running, _companion_handle
-    _svc_running = False
-    keep = _pid_from_handle(_companion_handle)
-    if _companion_handle:
+_inject_helper_handle = None
+_service_mutex_handle = None
+
+
+def find_inject_helper_pid_in_session(session_id):
+    """PID del primer helper de inyeccion SYSTEM en la sesion (si existe)."""
+    pids = find_all_inject_helper_pids_in_session(session_id)
+    return pids[0] if pids else None
+
+
+def find_all_inject_helper_pids_in_session(session_id):
+    """Lista todos los PIDs de helpers de inyeccion SYSTEM en la sesion."""
+    result = []
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if (proc.info.get("name") or "").lower() not in COMPANION_IMAGE_NAMES:
+                    continue
+                pid = proc.info.get("pid")
+                if not pid or get_process_session_id(pid) != int(session_id):
+                    continue
+                if _is_inject_helper_pid(pid):
+                    result.append(int(pid))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
+    return result
+
+
+def _kill_stale_service_processes(keep_pid=None):
+    """Mata procesos de ESTA misma imagen que quedaron vivos en sesion 0
+    (zombies de stop/start previos). Nunca toca el PID propio ni procesos de
+    otra sesion: en sesion 0 solo corresponde existir al servicio, y los
+    companions/helpers corren bajo otro nombre de imagen."""
+    try:
+        frozen = getattr(sys, "frozen", False)
+        my_image = psutil.Process(os.getpid()).name().lower()
+    except Exception:
+        return
+    killed = []
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid = proc.info.get("pid")
+                if not pid or pid == os.getpid() or (keep_pid and pid == keep_pid):
+                    continue
+                if frozen:
+                    if (proc.info.get("name") or "").lower() != my_image:
+                        continue
+                else:
+                    try:
+                        if "centinela_svc" not in " ".join(proc.cmdline()).lower():
+                            continue
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                if get_process_session_id(pid) != 0:
+                    continue
+                proc.kill()
+                killed.append(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
+    for pid in killed:
+        logger.warning("[KILL] Servicio zombie en sesion 0 terminado: pid=%s", pid)
+
+
+def _acquire_service_mutex():
+    """Adquiere el mutex de instancia unica Global\\ApolloCentinelaService.
+    Si esta tomado, hay otra instancia viva o un zombie: barre la sesion 0 y
+    reintenta (al morir el dueño, Windows libera el mutex automaticamente).
+    Devuelve el handle o None si no se pudo adquirir."""
+    global _service_mutex_handle
+    for attempt in (1, 2):
+        h = KERNEL32.CreateMutexW(None, True, SERVICE_MUTEX_NAME)
+        err = KERNEL32.GetLastError()
+        if not h:
+            logger.error("[GUARD] CreateMutex fallo con error %s", err)
+            return None
+        if err != ERROR_ALREADY_EXISTS:
+            _service_mutex_handle = h
+            if attempt == 2:
+                logger.info("[GUARD] Mutex del servicio adquirido tras limpiar instancia previa")
+            return h
+        KERNEL32.CloseHandle(h)
+        logger.warning("[GUARD] Mutex del servicio ocupado (intento %d): barriendo instancia previa", attempt)
+        _kill_stale_service_processes(keep_pid=os.getpid())
+        time.sleep(1)
+    logger.error("[GUARD] No se pudo adquirir el mutex del servicio; se aborta el arranque")
+    return None
+
+
+def inject_helper_monitor():
+    """Mantiene vivo un helper SYSTEM de inyeccion en la sesion del usuario logueado.
+    Permite operar el UAC y ventanas elevadas (que el companion de integridad media no puede
+    por UIPI). El companion le reenvia la entrada por loopback; si no esta, inyecta directo."""
+    global _inject_helper_handle
+    time.sleep(6)  # dejar que arranque el companion primero
+    while _svc_running:
         try:
-            KERNEL32.TerminateProcess(_companion_handle, 0)
-        except Exception:
-            pass
-        _companion_handle = None
-    kill_stale_companion_processes(keep_pid=keep)
-    for img in (
-        "ApolloCentinela.exe", "Apollo_Centinela.exe",
-        "ApolloGesComBeta.exe", "ApolloGesCom.exe", "ApolloSoporte.exe",
-    ):
-        _run_hidden(["taskkill", "/F", "/T", "/IM", img])
-    _run_hidden([_sc_exe_path(), "stop", SERVICE_NAME])
-    time.sleep(1)
-    _run_hidden(["taskkill", "/F", "/T", "/IM", "ApolloCentinelaService.exe"])
-    time.sleep(1)
+            sess = resolve_companion_session_id()
+            if sess and sess != 0xFFFFFFFF and session_has_user_token(sess):
+                all_helpers = find_all_inject_helper_pids_in_session(sess)
+                tracked_pid = _pid_from_handle(_inject_helper_handle) if _inject_helper_handle else None
+
+                if len(all_helpers) > 1:
+                    keep = tracked_pid if tracked_pid and tracked_pid in all_helpers else all_helpers[0]
+                    for pid in all_helpers:
+                        if pid != keep:
+                            try:
+                                psutil.Process(pid).kill()
+                                logger.info("[INJECT] Helper duplicado terminado: PID %d (mantengo PID %d)", pid, keep)
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                    all_helpers = [keep]
+
+                if not all_helpers:
+                    if _inject_helper_handle:
+                        try:
+                            KERNEL32.CloseHandle(_inject_helper_handle)
+                        except Exception:
+                            pass
+                        _inject_helper_handle = None
+                    h = spawn_in_user_session(COMPANION_EXE, args="--inject-helper", session_id=sess)
+                    if h:
+                        _inject_helper_handle = h
+                    else:
+                        logger.warning("[INJECT] No se pudo lanzar helper SYSTEM en sesion %d", sess)
+        except Exception as e:
+            logger.debug("[INJECT] monitor error: %s", e)
+        time.sleep(5)
+
+
+_ota_update_lock = threading.Lock()
+
+
+def _update_api_base(cfg):
+    base_ws_url = str((cfg or {}).get("base_ws_url") or "")
+    if not base_ws_url:
+        return ""
+    return base_ws_url.replace("wss://", "https://").replace("ws://", "http://").split("/api/ws", 1)[0].rstrip("/")
+
+
+def _preferred_update_arch():
+    return "x64" if ctypes.sizeof(ctypes.c_void_p) == 8 else "x86"
+
+
+def _resolve_update_url(base_url, data):
+    downloads = data.get("downloads") or {}
+    selected = downloads.get(_preferred_update_arch()) or downloads.get("combined") or {}
+    if isinstance(selected, dict):
+        download_url = selected.get("url") or ""
+    else:
+        download_url = selected if isinstance(selected, str) else ""
+    download_url = str(download_url or data.get("url") or "").strip()
+    if not download_url:
+        return ""
+    if download_url.startswith(("http://", "https://")):
+        return download_url
+    return f"{base_url}/{download_url.lstrip('/')}"
+
+
+def _fetch_update_info():
+    import urllib.request
+
+    cfg = load_config()
+    base_url = _update_api_base(cfg)
+    if not base_url:
+        return "", ""
+    api_url = f"{base_url}/api/centinela/update_check"
+    request = urllib.request.Request(
+        api_url,
+        headers={"User-Agent": "ApolloCentinelaService"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return str(data.get("version") or "0.0.0"), _resolve_update_url(base_url, data)
+
 
 async def perform_update(url):
-    import urllib.request
-    import tempfile
     import shutil
+    import tempfile
+    import urllib.request
+
+    if not _ota_update_lock.acquire(blocking=False):
+        logger.info("[OTA] Ya hay una actualización en curso")
+        return
     try:
         temp_dir = tempfile.gettempdir()
-        installer_path = os.path.join(temp_dir, "ApolloSetup_update.exe")
-
-        logger.info(f"[OTA] Descargando actualizacion desde {url}...")
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-        with urllib.request.urlopen(req, timeout=120) as response, open(installer_path, 'wb') as out_file:
+        arch = _preferred_update_arch()
+        installer_path = os.path.join(temp_dir, f"ApolloSetup_update_{arch}.exe")
+        logger.info("[OTA] Descargando instalador %s desde %s", arch, url)
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "ApolloCentinelaService"},
+        )
+        with urllib.request.urlopen(request, timeout=180) as response, open(installer_path, "wb") as out_file:
             shutil.copyfileobj(response, out_file)
+        if os.path.getsize(installer_path) < 1_000_000:
+            raise RuntimeError("Instalador descargado incompleto")
+        with open(installer_path, "rb") as installer_file:
+            if installer_file.read(2) != b"MZ":
+                raise RuntimeError("El archivo descargado no es un ejecutable válido")
 
-        logger.info("[OTA] Deteniendo companion y servicio antes del instalador...")
-        stop_all_centinela_for_update()
-
-        logger.info("[OTA] Ejecutando instalacion silenciosa (%s)...", installer_path)
+        log_path = os.path.join(temp_dir, "ApolloCentinela_setup.log")
+        logger.info("[OTA] Lanzando instalador silencioso: %s", installer_path)
         subprocess.Popen(
-            [installer_path, '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS'],
+            [
+                installer_path,
+                "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                "/CLOSEAPPLICATIONS", "/FORCECLOSEAPPLICATIONS",
+                f"/LOG={log_path}",
+            ],
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
-        time.sleep(2)
-        logger.info("[OTA] Saliendo del proceso del servicio para liberar .exe (os._exit)")
+        logger.info("[OTA] Instalador iniciado; el servicio se cerrará para liberar el binario")
         os._exit(0)
     except Exception as e:
-        logger.error(f"[OTA] Error aplicando actualizacion: {e}")
+        logger.error("[OTA] Error aplicando actualización: %s", e)
+        _ota_update_lock.release()
+
 
 async def update_checker_loop():
+    await asyncio.sleep(120)
     while True:
         try:
-            # Esperar 2 minutos despues de arrancar antes de la primera comprobacion
-            await asyncio.sleep(120)
-            
-            cfg = load_config()
-            if cfg and 'base_ws_url' in cfg:
-                base_url = cfg['base_ws_url'].replace('wss://', 'https://').replace('ws://', 'http://').split('/api/ws')[0]
-                api_url = f"{base_url}/api/centinela/update_check"
-                
-                import urllib.request
-                req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode())
-                
-                remote_version = data.get("version", "0.0.0")
-                download_url = data.get("url", "")
-                
-                if parse_version(remote_version) > parse_version(__version__) and download_url:
-                    logger.info(f"[OTA] Nueva version {remote_version} detectada (Actual: {__version__}). Iniciando update...")
-                    await perform_update(download_url)
+            remote_version, download_url = _fetch_update_info()
+            if parse_version(remote_version) > parse_version(__version__) and download_url:
+                logger.info(
+                    "[OTA] Nueva versión %s detectada (actual: %s)",
+                    remote_version,
+                    __version__,
+                )
+                await perform_update(download_url)
         except Exception as e:
-            logger.debug(f"[OTA] Chequeo de version fallido: {e}")
-            
-        # Comprobar cada 12 horas
+            logger.debug("[OTA] Chequeo de versión fallido: %s", e)
         await asyncio.sleep(12 * 3600)
 
 # ── Loop principal WebSocket ──────────────────────────────────────────────────
@@ -1417,6 +1778,10 @@ def run_as_service():
     """
     global _svc_running
     logger.info("=== Apollo Centinela Service v%s iniciando ===", __version__)
+    _kill_stale_service_processes(keep_pid=os.getpid())
+    if not _acquire_service_mutex():
+        logger.error("=== Apollo Centinela Service aborta arranque: ya existe una instancia ===")
+        return
     _enable_service_token_privileges()
     logger.info("Rol: monitor del companion. La conexion WS la maneja el companion.")
     logger.info(
@@ -1435,9 +1800,29 @@ def run_as_service():
     except Exception as e:
         logger.error(f"[SAS] Error activando directiva en el Registro: {e}")
 
+    # --- UAC: mostrar el prompt en el escritorio interactivo (no en el Secure Desktop) ---
+    # Por defecto Windows dibuja el UAC en un escritorio aislado (Winlogon/Secure Desktop)
+    # que NO se puede capturar ni controlar desde la sesion del usuario -> el tecnico ve la
+    # pantalla "congelada". PromptOnSecureDesktop=0 hace que el UAC salga en el escritorio
+    # normal (winsta0\default), donde el companion SI lo captura y puede operarlo.
+    # Compromiso de seguridad: el prompt deja de estar aislado (aceptable en una herramienta
+    # de soporte administrada; es lo que hacen TeamViewer/AnyDesk en su modo asistido).
+    try:
+        import winreg
+        uac_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, uac_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "PromptOnSecureDesktop", 0, winreg.REG_DWORD, 0)
+        logger.info("[UAC] PromptOnSecureDesktop=0: el UAC saldra en el escritorio interactivo (visible para el tecnico).")
+    except Exception as e:
+        logger.error(f"[UAC] No se pudo ajustar PromptOnSecureDesktop: {e}")
+
     # Un solo hilo lanza/vigila el companion (evita carrera con kill_stale al arrancar)
     monitor_thread = threading.Thread(target=companion_monitor, daemon=True)
     monitor_thread.start()
+
+    # Hilo que mantiene el helper SYSTEM de inyeccion (UAC / ventanas elevadas)
+    inject_thread = threading.Thread(target=inject_helper_monitor, daemon=True)
+    inject_thread.start()
 
     ws_thread = threading.Thread(target=lambda: asyncio.run(websocket_loop()), daemon=True)
     ws_thread.start()
@@ -1502,28 +1887,20 @@ def run_as_service():
             # --- OTA UPDATE SIGNAL CHECK ---
             force_ota_file = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "ApolloSupport", "force_ota.txt")
             if os.path.isfile(force_ota_file):
-                logger.info("[OTA] Detectado archivo signal force_ota.txt. Forzando actualizacion...")
+                logger.info("[OTA] Detectada solicitud de actualización")
                 try:
+                    remote_version, download_url = _fetch_update_info()
+                    if not download_url:
+                        raise RuntimeError("El servidor no publicó un instalador compatible")
                     os.remove(force_ota_file)
-                except:
-                    pass
-                
-                cfg = load_config()
-                if cfg and 'base_ws_url' in cfg:
-                    base_url = cfg['base_ws_url'].replace('wss://', 'https://').replace('ws://', 'http://').split('/api/ws')[0]
-                    api_url = f"{base_url}/api/centinela/update_check"
-                    
-                    import urllib.request
-                    try:
-                        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-                        with urllib.request.urlopen(req, timeout=10) as response:
-                            data = json.loads(response.read().decode())
-                        download_url = data.get("url", "")
-                        if download_url:
-                            # Lanzar en thread separado
-                            threading.Thread(target=lambda: asyncio.run(perform_update(download_url)), daemon=True).start()
-                    except Exception as e:
-                        logger.error(f"[OTA] Error comprobando API para force update: {e}")
+                    logger.info("[OTA] Iniciando actualización solicitada a v%s", remote_version)
+                    threading.Thread(
+                        target=lambda: asyncio.run(perform_update(download_url)),
+                        daemon=True,
+                        name="CentinelaOTA",
+                    ).start()
+                except Exception as e:
+                    logger.error("[OTA] Error preparando la actualización solicitada: %s", e)
                         
     except (KeyboardInterrupt, SystemExit):
         pass
@@ -1531,16 +1908,136 @@ def run_as_service():
         _svc_running = False
         if _companion_handle:
             KERNEL32.TerminateProcess(_companion_handle, 0)
+        if _inject_helper_handle:
+            try:
+                KERNEL32.TerminateProcess(_inject_helper_handle, 0)
+            except Exception:
+                pass
         logger.info("=== Apollo Centinela Service detenido ===")
 
 if __name__ == "__main__":
-    run_as_service()
+    # Windows Service: hay que registrarse con el SCM o sc start queda en START_PENDING.
+    # Si se ejecuta a mano (consola/debug), StartServiceCtrlDispatcher falla con 1063
+    # y corremos el loop directo.
+    SERVICE_WIN32_OWN_PROCESS = 0x00000010
+    SERVICE_ACCEPT_STOP = 0x00000001
+    SERVICE_ACCEPT_SHUTDOWN = 0x00000004
+    SERVICE_RUNNING = 0x00000004
+    SERVICE_STOP_PENDING = 0x00000003
+    SERVICE_STOPPED = 0x00000001
+    SERVICE_START_PENDING = 0x00000002
+    SERVICE_CONTROL_STOP = 0x00000001
+    SERVICE_CONTROL_SHUTDOWN = 0x00000005
+    ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063
 
+    class SERVICE_STATUS(ctypes.Structure):
+        _fields_ = [
+            ("dwServiceType", ctypes.wintypes.DWORD),
+            ("dwCurrentState", ctypes.wintypes.DWORD),
+            ("dwControlsAccepted", ctypes.wintypes.DWORD),
+            ("dwWin32ExitCode", ctypes.wintypes.DWORD),
+            ("dwServiceSpecificExitCode", ctypes.wintypes.DWORD),
+            ("dwCheckPoint", ctypes.wintypes.DWORD),
+            ("dwWaitHint", ctypes.wintypes.DWORD),
+        ]
 
-# ¿Cómo lo usarás tú a partir de mañana?
-# Haces un cambio groso en el código.
-# Abres centinela_svc.py y cambias arriba de todo __version__ = "3.2.5".
-# Le das doble clic a tu .bat mágico para generar el instalador.
-# Agarras el nuevo ApolloSetup_v3.1.3.exe (Universal), lo renombras simplemente a ApolloSetup.exe y lo subes a la carpeta updates/ de tu servidor.
-# Editas el version.json del servidor y le pones "version": "3.1.3".
-# Te sientas a tomar un café. En las próximas 12 horas, todos los clientes del país se habrán actualizado solos, sin que les salte ni un solo cartelito en la pantalla.
+    class SERVICE_TABLE_ENTRYW(ctypes.Structure):
+        _fields_ = [
+            ("lpServiceName", ctypes.wintypes.LPWSTR),
+            ("lpServiceProc", ctypes.c_void_p),
+        ]
+
+    ADVAPI32.RegisterServiceCtrlHandlerW.argtypes = [
+        ctypes.wintypes.LPCWSTR, ctypes.c_void_p
+    ]
+    ADVAPI32.RegisterServiceCtrlHandlerW.restype = ctypes.wintypes.HANDLE
+    ADVAPI32.SetServiceStatus.argtypes = [
+        ctypes.wintypes.HANDLE, ctypes.POINTER(SERVICE_STATUS)
+    ]
+    ADVAPI32.SetServiceStatus.restype = ctypes.wintypes.BOOL
+    ADVAPI32.StartServiceCtrlDispatcherW.argtypes = [ctypes.POINTER(SERVICE_TABLE_ENTRYW)]
+    ADVAPI32.StartServiceCtrlDispatcherW.restype = ctypes.wintypes.BOOL
+
+    _status_handle = None
+    _svc_status = SERVICE_STATUS()
+
+    def _report_svc_status(state, win32_exit=0, wait_hint=0, checkpoint=0):
+        _svc_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS
+        _svc_status.dwCurrentState = state
+        accepted = 0
+        if state == SERVICE_RUNNING:
+            accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+        _svc_status.dwControlsAccepted = accepted
+        _svc_status.dwWin32ExitCode = win32_exit
+        _svc_status.dwServiceSpecificExitCode = 0
+        _svc_status.dwCheckPoint = checkpoint
+        _svc_status.dwWaitHint = wait_hint
+        if _status_handle:
+            ADVAPI32.SetServiceStatus(_status_handle, ctypes.byref(_svc_status))
+
+    HANDLER_FN = ctypes.WINFUNCTYPE(None, ctypes.wintypes.DWORD)
+
+    @HANDLER_FN
+    def _service_ctrl_handler(ctrl_code):
+        global _svc_running
+        if ctrl_code in (SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN):
+            logger.info("[SCM] Stop/Shutdown recibido (ctrl=%s)", ctrl_code)
+            _report_svc_status(SERVICE_STOP_PENDING, wait_hint=8000, checkpoint=1)
+            _svc_running = False
+
+    SERVICE_MAIN_FN = ctypes.WINFUNCTYPE(
+        None, ctypes.wintypes.DWORD, ctypes.POINTER(ctypes.wintypes.LPWSTR)
+    )
+
+    @SERVICE_MAIN_FN
+    def _service_main(argc, argv):
+        global _status_handle, _svc_running
+        try:
+            _status_handle = ADVAPI32.RegisterServiceCtrlHandlerW(
+                SERVICE_NAME, _service_ctrl_handler
+            )
+            if not _status_handle:
+                logger.error(
+                    "[SCM] RegisterServiceCtrlHandlerW fallo error=%s",
+                    KERNEL32.GetLastError(),
+                )
+                return
+            # Reportar RUNNING al toque: si no, sc start queda START_PENDING eterno.
+            _report_svc_status(SERVICE_START_PENDING, wait_hint=2000, checkpoint=1)
+            _svc_running = True
+            _report_svc_status(SERVICE_RUNNING)
+            logger.info("[SCM] Servicio RUNNING (v%s)", __version__)
+            run_as_service()
+        except Exception as e:
+            logger.exception("[SCM] ServiceMain error: %s", e)
+        finally:
+            _svc_running = False
+            try:
+                _report_svc_status(SERVICE_STOPPED)
+            except Exception:
+                pass
+            logger.info("[SCM] Servicio STOPPED")
+            # Los hilos daemon (monitores/WS) pueden quedar colgados al salir y
+            # retener el proceso vivo aunque el SCM ya lo reporto STOPPED:
+            # os._exit garantiza la muerte real del proceso de servicio.
+            os._exit(0)
+
+    # Mantener refs globales (ctypes callbacks)
+    globals()["_service_ctrl_handler_ref"] = _service_ctrl_handler
+    globals()["_service_main_ref"] = _service_main
+
+    dispatch_table = (SERVICE_TABLE_ENTRYW * 2)()
+    dispatch_table[0].lpServiceName = SERVICE_NAME
+    dispatch_table[0].lpServiceProc = ctypes.cast(_service_main, ctypes.c_void_p)
+    dispatch_table[1].lpServiceName = None
+    dispatch_table[1].lpServiceProc = None
+
+    ok = ADVAPI32.StartServiceCtrlDispatcherW(dispatch_table)
+    if not ok:
+        err = KERNEL32.GetLastError()
+        if err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT:
+            logger.info("[SCM] Modo interactivo (no SCM) — run_as_service directo")
+            run_as_service()
+        else:
+            logger.error("[SCM] StartServiceCtrlDispatcherW fallo error=%s", err)
+            sys.exit(err)

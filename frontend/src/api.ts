@@ -66,7 +66,7 @@ export interface DeltaMeta {
 interface ViewerWsOptions {
   deviceId: number | null;
   enabled: boolean;
-  onFrame: (base64: string, delta?: DeltaMeta) => void;
+  onFrame: (src: string, delta?: DeltaMeta) => void;
   onQuality?: (fps: number, quality: ConnectionQuality) => void;
   onMessage?: (msg: Record<string, unknown>) => void;  // para session_list, login_result, etc.
   onHqChunk?: (chunk: ArrayBuffer) => void; // Manejador de chunks binarios H.264
@@ -121,30 +121,54 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
       } catch { /* */ }
 
       pingTimerRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send('ping');
+          ws.send(JSON.stringify({ type: 'refresh_frame' }));
+        }
       }, 20000);
     };
 
     ws.onmessage = async (event) => {
       if (!mountedRef.current) return;
       
-      // Manejar chunks binarios de HQ (H.264)
+      // Protocolo binario: 0x01=full, 0x02=delta + raw image bytes
       if (event.data instanceof ArrayBuffer) {
-        if (onHqChunk) {
-            onHqChunk(event.data);
-            
-            // Reusar el calculador de FPS para HQ
-            const now = performance.now();
-            frameTimestampsRef.current.push(now);
-            const twoSecsAgo = now - 2000;
-            frameTimestampsRef.current = frameTimestampsRef.current.filter(t => t > twoSecsAgo);
-            
-            if (!lastQualityUpdateRef.current || now - lastQualityUpdateRef.current >= 2000) {
-              const fps = Math.round(frameTimestampsRef.current.length / 2);
-              onQuality?.(fps, connectionQualityFromFps(fps));
-
-              lastQualityUpdateRef.current = now;
-            }
+        const view = new Uint8Array(event.data);
+        if (view.length < 2) return;
+        
+        const tag = view[0];
+        let imageBytes: Uint8Array;
+        let delta: DeltaMeta | undefined;
+        
+        if (tag === 0x01) {
+          imageBytes = view.slice(1);
+          delta = undefined;
+        } else if (tag === 0x02 && view.length > 5) {
+          const deltaLen = (view[1] << 24) | (view[2] << 16) | (view[3] << 8) | view[4];
+          if (view.length < 5 + deltaLen) return;
+          const deltaJson = new TextDecoder().decode(view.slice(5, 5 + deltaLen));
+          delta = JSON.parse(deltaJson) as DeltaMeta;
+          imageBytes = view.slice(5 + deltaLen);
+        } else {
+          return;
+        }
+        
+        // Sniff: JPEG empieza 0xFF 0xD8, si no asumir WEBP (agente viejo)
+        const mime = imageBytes[0] === 0xFF && imageBytes[1] === 0xD8 ? 'image/jpeg' : 'image/webp';
+        const blob = new Blob([new Uint8Array(imageBytes)], { type: mime });
+        const blobUrl = URL.createObjectURL(blob);
+        onFrame(blobUrl, delta);
+        
+        // Calcular FPS
+        const now = performance.now();
+        frameTimestampsRef.current.push(now);
+        const twoSecsAgo = now - 2000;
+        frameTimestampsRef.current = frameTimestampsRef.current.filter(t => t > twoSecsAgo);
+        
+        if (!lastQualityUpdateRef.current || now - lastQualityUpdateRef.current >= 2000) {
+          const fps = Math.round(frameTimestampsRef.current.length / 2);
+          onQuality?.(fps, connectionQualityFromFps(fps));
+          lastQualityUpdateRef.current = now;
         }
         return;
       }
@@ -158,9 +182,11 @@ export function useViewerWebSocket({ deviceId, enabled, onFrame, onQuality, onMe
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'frame' && data.frame) {
-          // DIRTY_RECT_START: pasar delta si el agente lo incluyó
-          onFrame(data.frame as string, data.delta as DeltaMeta ?? undefined);
-          // DIRTY_RECT_END
+          // Compatibilidad hacia atrás: construir data URL desde base64 (JPEG=/9j/, WEBP=UklGR)
+          const src = data.frame.startsWith('/9j/')
+            ? `data:image/jpeg;base64,${data.frame}`
+            : `data:image/webp;base64,${data.frame}`;
+          onFrame(src, data.delta as DeltaMeta ?? undefined);
 
           // Calcular FPS
           const now = performance.now();
@@ -251,8 +277,12 @@ export const getAuthHeaders = () => ({
 // ==========================================
 // TICKETS Y AREAS
 // ==========================================
-export const getTickets = async (areaId?: number) => {
-    const url = areaId ? `${API_URL}/tickets/?area_id=${areaId}` : `${API_URL}/tickets/`;
+export const getTickets = async (areaId?: number, vista: 'activa' | 'historico' | 'todas' = 'activa') => {
+    const params = new URLSearchParams();
+    if (areaId) params.set('area_id', String(areaId));
+    if (vista) params.set('vista', vista);
+    const qs = params.toString();
+    const url = qs ? `${API_URL}/tickets/?${qs}` : `${API_URL}/tickets/`;
     const response = await fetch(url, { headers: getAuthHeaders() });
     if (response.status === 401) throw new Error('Sesión Expirada');
     if (!response.ok) throw new Error('Error al obtener tickets');
@@ -266,7 +296,57 @@ export const createTicket = async (data: any) => {
         body: JSON.stringify(data)
     });
     if (response.status === 401) throw new Error('Sesión Expirada');
-    return await response.json();
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const detail = body?.detail;
+        throw new Error(typeof detail === 'string' ? detail : 'No se pudo crear el pedido.');
+    }
+    return body;
+};
+
+export const updateTicket = async (ticketId: number, data: any) => {
+    const response = await fetch(`${API_URL}/tickets/${ticketId}`, {
+        method: 'PATCH',
+        headers: getAuthHeaders(),
+        body: JSON.stringify(data)
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const detail = body?.detail;
+        throw new Error(typeof detail === 'string' ? detail : 'No se pudo actualizar el pedido.');
+    }
+    return body;
+};
+
+export const assignTicket = async (ticketId: number, assignedUserId: number | null) => {
+    const response = await fetch(`${API_URL}/tickets/${ticketId}/assign`, {
+        method: 'PATCH',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ assigned_user_id: assignedUserId })
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const detail = body?.detail;
+        throw new Error(typeof detail === 'string' ? detail : 'No se pudo asignar el pedido.');
+    }
+    return body;
+};
+
+export const updateTicketStatus = async (ticketId: number, estado: string) => {
+    const response = await fetch(`${API_URL}/tickets/${ticketId}/status`, {
+        method: 'PATCH',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ estado })
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const detail = body?.detail;
+        throw new Error(typeof detail === 'string' ? detail : 'No se pudo cambiar el estado.');
+    }
+    return body;
 };
 
 export const getAreas = async () => {
@@ -279,18 +359,38 @@ export const addIntervention = async (ticketId: number, data: any) => {
     const response = await fetch(`${API_URL}/tickets/${ticketId}/interventions`, {
         method: 'POST',
         headers: getAuthHeaders(),
-        body: JSON.stringify(data)
+        body: JSON.stringify({ ...data, ticket_id: ticketId })
     });
     if (response.status === 401) throw new Error('Sesión Expirada');
-    return await response.json();
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const detail = body?.detail;
+        const msg = typeof detail === 'string'
+            ? detail
+            : Array.isArray(detail)
+                ? detail.map((d: any) => d?.msg || JSON.stringify(d)).join('; ')
+                : 'No se pudo grabar la intervención.';
+        throw new Error(msg);
+    }
+    return body;
 };
 
 // ==========================================
 // CLIENTES
 // ==========================================
 export const getClients = async () => {
-    const response = await fetch(`${API_URL}/clients/?limit=5000`, { headers: getAuthHeaders() });
+    const response = await fetch(`${API_URL}/clients/?limit=15000`, { headers: getAuthHeaders() });
     if (response.status === 401) throw new Error('Sesión Expirada');
+    return await response.json();
+};
+
+export const searchClients = async (q: string, limit = 80) => {
+    const response = await fetch(
+        `${API_URL}/clients/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+        { headers: getAuthHeaders() }
+    );
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) return [];
     return await response.json();
 };
 
@@ -330,6 +430,23 @@ export const syncClientsFromDbf = async () => {
     if (!response.ok) {
         const err = await response.json().catch(() => ({}));
         throw new Error(err.detail || 'Error al sincronizar clientes con la base de datos DBF');
+    }
+    return await response.json();
+};
+
+export const importGesactiDbf = async (file: File) => {
+    const token = localStorage.getItem('token');
+    const body = new FormData();
+    body.append('file', file, file.name || 'CLIGESCO.DBF');
+    const response = await fetch(`${API_URL}/clients/gesacti/import-dbf`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body,
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al importar CLIGESCO.DBF');
     }
     return await response.json();
 };
@@ -417,6 +534,16 @@ export const syncEstadosCuentaCorrienteFromErp = async () => {
     if (!response.ok) {
         const err = await response.json().catch(() => ({}));
         throw new Error(err.detail || 'Error al sincronizar estados desde el ERP');
+    }
+    return await response.json();
+};
+
+export const getClientCbus = async (clientIdOrCode: string | number) => {
+    const response = await fetch(`${API_URL}/erp/clientes/${clientIdOrCode}/cbus`, { headers: getAuthHeaders() });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al consultar CBU del cliente');
     }
     return await response.json();
 };
@@ -534,6 +661,29 @@ export const fetchWindowsSessions = async (deviceId: number): Promise<WindowsSes
   return (data.sessions as WindowsSessionInfo[]) ?? [];
 };
 
+/** Pide get_sessions al agente y reintenta hasta que llegue la lista. */
+export const fetchWindowsSessionsPolled = async (
+  deviceId: number,
+  attempts = 10,
+  delayMs = 350,
+): Promise<WindowsSessionInfo[]> => {
+  try {
+    await sendCentinelaControl(deviceId, { type: 'get_sessions' });
+  } catch {
+    /* offline */
+  }
+  for (let i = 0; i < attempts; i++) {
+    await new Promise(r => setTimeout(r, delayMs));
+    try {
+      const sessions = await fetchWindowsSessions(deviceId);
+      if (sessions.length) return sessions;
+    } catch {
+      break;
+    }
+  }
+  return [];
+};
+
 export const getCentinelaFrame = async (clientId: number) => {
     const headers = {
         ...getAuthHeaders(),
@@ -592,6 +742,23 @@ export const updateCentinelaDeviceNotes = async (deviceId: number, notes: string
     return response.ok;
 };
 
+export const importTeamviewerCsv = async (file: File) => {
+    const token = localStorage.getItem('token');
+    const body = new FormData();
+    body.append('file', file, file.name || 'teamviewer.csv');
+    const response = await fetch(`${API_URL}/centinelas/import-teamviewer`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body,
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(typeof data?.detail === 'string' ? data.detail : 'No se pudo importar el CSV de TeamViewer');
+    }
+    return data;
+};
+
 export const getPendingCentinelas = async () => {
     const response = await fetch(`${API_URL}/centinelas/pending`, { headers: getAuthHeaders() });
     if (response.status === 401) throw new Error('Sesión Expirada');
@@ -616,11 +783,44 @@ export const assignCentinelaLicense = async (deviceId: number, clientId: number)
     return await parseJsonOrThrow(response);
 };
 
-export const getCentinelaClipboard = async (deviceId: number) => {
+export type RemoteClipboardFile = { name: string; url: string; size?: number | null };
+
+export type WebRtcIceServer = { urls: string[]; username?: string; credential?: string };
+
+export const getWebRtcIceServers = async (): Promise<WebRtcIceServer[]> => {
+    const response = await fetch(`${API_URL}/centinelas/webrtc/ice`, { headers: getAuthHeaders() });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    const data = await response.json().catch(() => ({}));
+    return Array.isArray(data?.iceServers) ? data.iceServers : [];
+};
+
+export const getCentinelaClipboard = async (deviceId: number): Promise<{ text: string; files: RemoteClipboardFile[] }> => {
     const response = await fetch(`${API_URL}/centinelas/devices/${deviceId}/clipboard`, { headers: getAuthHeaders() });
     if (response.status === 401) throw new Error('Sesión Expirada');
     const data = await response.json();
-    return data.text;
+    return {
+        text: data?.text || '',
+        files: Array.isArray(data?.files) ? data.files : [],
+    };
+};
+
+export const pasteFilesToCentinela = async (deviceId: number, files: File[]) => {
+    const form = new FormData();
+    for (const file of files.slice(0, 8)) {
+        form.append('files', file, file.name);
+    }
+    const response = await fetch(`${API_URL}/centinelas/devices/${deviceId}/clipboard/files`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+        body: form,
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const detail = body?.detail;
+        throw new Error(typeof detail === 'string' ? detail : 'No se pudieron enviar los archivos');
+    }
+    return body;
 };
 
 
@@ -636,7 +836,12 @@ export const uploadFile = async (file: File) => {
         body: formData
     });
     if (response.status === 401) throw new Error('Sesión Expirada');
-    return await response.json();
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const detail = body?.detail;
+        throw new Error(typeof detail === 'string' ? detail : `No se pudo subir ${file.name}`);
+    }
+    return body;
 };
 
 export const fetchAiAnalysis = async (id: number) => {
@@ -981,6 +1186,8 @@ export type ScheduledRecording = {
   ended_at?: string | null;
   error_message?: string | null;
   notes?: string | null;
+  windows_session_id?: number | null;
+  windows_session_label?: string | null;
   client_name?: string | null;
   device_name?: string | null;
   assist_id?: string | null;
@@ -1078,6 +1285,8 @@ export const createAgendaRecording = async (payload: {
   scheduled_at: string;
   duration_minutes?: number;
   notes?: string;
+  windows_session_id?: number;
+  windows_session_label?: string;
 }): Promise<ScheduledRecording> => {
   const response = await fetch(`${API_URL}/agenda/recordings`, {
     method: 'POST',
@@ -1120,4 +1329,54 @@ export const getIaBillingMonth = async (desde: string, hasta: string, serial?: s
     if (response.status === 401) throw new Error('Sesión Expirada');
     if (!response.ok) throw new Error('Error al obtener consumo ApolloIA');
     return await response.json();
+};
+
+// ==========================================
+// RESELLERS
+// ==========================================
+export const getResellers = async () => {
+    const response = await fetch(`${API_URL}/resellers`, { headers: getAuthHeaders() });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    return await response.json();
+};
+
+export const createReseller = async (data: any) => {
+    const response = await fetch(`${API_URL}/resellers`, {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al crear reseller');
+    }
+    return response.json();
+};
+
+export const updateReseller = async (id: number, data: any) => {
+    const response = await fetch(`${API_URL}/resellers/${id}`, {
+        method: 'PUT',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al actualizar reseller');
+    }
+    return response.json();
+};
+
+export const deleteReseller = async (id: number) => {
+    const response = await fetch(`${API_URL}/resellers/${id}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+    });
+    if (response.status === 401) throw new Error('Sesión Expirada');
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Error al eliminar reseller');
+    }
+    return response.json();
 };

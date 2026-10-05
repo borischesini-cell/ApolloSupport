@@ -1,0 +1,8 @@
+ACTUALIZAR — aviso RDP minimizado (portal 3.2.8 + Centinela 3.3.16)
+====================================================================
+Portal:  Y:\ApolloSupport\frontend\dist\  → htdocs
+OTA:     Y:\ApolloSupport\backend\updates\ → C:\ApolloSupport\backend\updates\
+         nssm restart ApolloBackend
+
+Si captura negra ~1s en sesion RDP, el portal muestra cartel:
+"restaurá o maximizá la ventana de Escritorio remoto en tu PC"

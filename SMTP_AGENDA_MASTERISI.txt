@@ -1,0 +1,28 @@
+ApolloSupport — SMTP Agenda (para agente Cursor del servidor Support)
+Fecha: 2026-09-10
+
+Agregar/reemplazar estas líneas en:
+  C:\ApolloSupport\backend\.env
+
+NO subir este archivo a git.
+
+--------------------------------------------------------------------------------
+JITSI_BASE_URL=https://meet.jit.si
+RECORDINGS_DIR=C:\ApolloSupport\backend\recordings
+RECORDINGS_RETENTION_DAYS=30
+SMTP_HOST=mail.masterisi.com.ar
+SMTP_PORT=26
+SMTP_USER=masterisi@masterisi.com.ar
+SMTP_PASSWORD=ohpeipaGhai1
+SMTP_FROM=masterisi@masterisi.com.ar
+SMTP_USE_TLS=0
+--------------------------------------------------------------------------------
+
+Luego:
+  1. mkdir C:\ApolloSupport\backend\recordings   (si no existe)
+  2. nssm restart ApolloBackend
+
+Si el login SMTP falla, probar SMTP_USER=masterisi (sin @dominio).
+Puerto 26 sin TLS (como en Windows Live Mail: Secured=No).
+
+Probar: crear reunión en Agenda → "Avisar" (debe enviar mail al email del cliente).

@@ -4,7 +4,7 @@
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.2.6"
+#define MyAppVersion   "3.3.36"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"
@@ -30,10 +30,12 @@ SetupIconFile=..\apollo_logo.ico
 WizardImageFile=wizard_banner.bmp
 WizardSmallImageFile=wizard_icon.bmp
 WizardStyle=modern
-Compression=lzma2/ultra64
-SolidCompression=yes
+Compression=lzma2/max
+SolidCompression=no
 PrivilegesRequired=admin
 MinVersion=6.1
+CloseApplications=force
+CloseApplicationsFilter=ApolloCentinela.exe,ApolloCentinelaService.exe,Apollo_Centinela.exe,ApolloGesComBeta.exe,ApolloGesCom.exe,ApolloSoporte.exe
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 UninstallDisplayIcon={app}\{#ServiceExe}
@@ -76,7 +78,7 @@ Source: "dlls\msvcp140.dll";       DestDir: "{app}"; Flags: ignoreversion
 Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 
 ; ffmpeg.exe ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â necesario para el modo Alto Rendimiento (H.264 MSE).
-Source: "..\ffmpeg.exe";           DestDir: "{app}"; Flags: ignoreversion
+Source: "..\ffmpeg.exe";           DestDir: "{app}"; Flags: ignoreversion nocompression
 
 [Dirs]
 Name: "{commonappdata}\ApolloSupport"; Permissions: everyone-modify
@@ -103,18 +105,15 @@ Filename: "{sys}\sc.exe"; Parameters: "config ""{#ServiceName}"" start= auto"; F
 Filename: "{sys}\sc.exe"; Parameters: "failure ""{#ServiceName}"" reset= 86400 actions= restart/5000/restart/10000/restart/30000"; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "description ""{#ServiceName}"" ""Agente Apollo Centinela - Master IS. Mantiene la conexion con el servidor de soporte 24/7."""; Flags: runhidden waituntilterminated
 
-; 2. Iniciar el servicio
-Filename: "{sys}\sc.exe"; Parameters: "start ""{#ServiceName}"""; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StartingSvc}"
-
-; 3. Esperar al monitor + lanzar UI visible (mutex evita duplicado)
-Filename: "{sys}\cmd.exe"; Parameters: "/c timeout /t 8 /nobreak"; Flags: runhidden waituntilterminated; StatusMsg: "Iniciando agente..."
-Filename: "{app}\{#CompanionExe}"; Description: "Iniciar Apollo Centinela"; Flags: nowait postinstall skipifsilent runascurrentuser; StatusMsg: "Iniciando agente..."
+; 2. Arrancar servicio (elevado). El companion lo abre CurStepChanged/ssDone
+;    con ExecAsOriginalUser para que la ventana salga en el escritorio del usuario.
+Filename: "{sys}\cmd.exe"; Parameters: "/c sc start ""{#ServiceName}"" >nul 2>&1 & for /L %I in (1,1,15) do @(sc query ""{#ServiceName}"" | findstr /I ""RUNNING"" >nul && exit /b 0 & timeout /t 1 /nobreak >nul) & exit /b 0"; Flags: runhidden waituntilterminated; StatusMsg: "{cm:StartingSvc}"
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM ""{#CompanionExe}""";  Flags: runhidden waituntilterminated; RunOnceId: "KillCompanion"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM ""{#ServiceExe}""";    Flags: runhidden waituntilterminated; RunOnceId: "KillService"
 Filename: "{sys}\sc.exe";       Parameters: "stop ""{#ServiceName}""";     Flags: runhidden waituntilterminated; RunOnceId: "StopSvc"
-Filename: "{sys}\cmd.exe";      Parameters: "/c timeout /t 3 /nobreak";    Flags: runhidden waituntilterminated; RunOnceId: "Wait"
+Filename: "{sys}\cmd.exe";      Parameters: "/c timeout /t 1 /nobreak";    Flags: runhidden waituntilterminated; RunOnceId: "Wait"
 Filename: "{sys}\sc.exe";       Parameters: "delete ""{#ServiceName}""";   Flags: runhidden waituntilterminated; RunOnceId: "DeleteSvc"
 
 
@@ -133,9 +132,9 @@ begin
   if RegQueryStringValue(HKLM,
     'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
     'Version', sVersion) then
-  begin
-    Result := False;
-  end else begin
+    Result := False
+  else if FileExists(ExpandConstant('{sys}\vcruntime140.dll')) then
+    Result := False
+  else
     Result := True;
-  end;
 end;

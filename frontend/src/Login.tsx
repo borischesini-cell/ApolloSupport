@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Lock, Eye, EyeOff, User, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
+import { Lock, Eye, EyeOff, User, Trash2, ChevronDown, ChevronUp, Download } from 'lucide-react';
 import { API_URL } from './api';
 
 interface SavedUser {
@@ -8,7 +8,13 @@ interface SavedUser {
     password?: string;
 }
 
-export default function Login({ onLogin }: { onLogin: () => void }) {
+export default function Login({
+  onLogin,
+  onOpenCentinelaInstall,
+}: {
+  onLogin: () => void;
+  onOpenCentinelaInstall?: () => void;
+}) {
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [showPassword, setShowPassword] = useState(false);
@@ -388,6 +394,17 @@ export default function Login({ onLogin }: { onLogin: () => void }) {
                     >
                         {loading ? 'Verificando seguridad...' : 'INGRESAR'}
                     </button>
+
+                    {onOpenCentinelaInstall && (
+                        <button
+                            type="button"
+                            onClick={onOpenCentinelaInstall}
+                            className="w-full mt-3 flex items-center justify-center gap-2 py-3 rounded-xl border border-white/10 bg-slate-900/60 hover:bg-slate-800 text-slate-200 text-xs font-bold transition-all"
+                        >
+                            <Download size={15} className="text-brand-400" />
+                            Instalar / Actualizar Centinela
+                        </button>
+                    )}
                 </form>
             </div>
         </div>

@@ -1,4 +1,4 @@
 {
-    "version": "3.2.6",
-    "url": "https://support.ultimate.net.ar/api/centinela/download_update"
+    "version": "3.3.35",
+    "notes": "Video fluido: el stream pasa de WebP a JPEG y la captura usa una cascada con cache de fuente validada, lo que sube el rendimiento a 22 FPS reales en el peor caso (PC por RDP, sin DXGI) contra 5 FPS de la version anterior. Se corrigio ademas un shadowing de variable global que dejaba los frames congelados en el visor. El portal detecta JPEG y WebP automaticamente, asi que la actualizacion es transparente. Se eliminaron los parametros de modo desarrollo del agente (APOLLO_DEV y los overrides de tuning por variable de entorno): la URL del servidor ahora solo se configura via centinela.dat."
 }

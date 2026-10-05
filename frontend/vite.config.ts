@@ -3,8 +3,8 @@ import react from '@vitejs/plugin-react'
 import fs from 'node:fs'
 import path from 'node:path'
 
-const APP_VERSION = '3.2.6'
-const APP_BUILD = '2026-08-31'
+const APP_VERSION = '3.3.22'
+const APP_BUILD = '2026-09-25'
 
 function injectSwVersion(swBody: string): string {
   return swBody

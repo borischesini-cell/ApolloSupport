@@ -1,0 +1,17 @@
+DESBLOQUEAR cliente con ApolloCentinela en START_PENDING
+========================================================
+Pegar en CMD como Administrador en el cliente:
+
+taskkill /F /IM ApolloCentinelaService.exe /T
+taskkill /F /IM ApolloCentinela.exe /T
+sc stop ApolloCentinela
+timeout /t 2 /nobreak
+sc start ApolloCentinela
+timeout /t 3 /nobreak
+sc query ApolloCentinela
+start "" "C:\Archivos de programa\Apollo Centinela\ApolloCentinela.exe"
+
+Si sc query sigue en START_PENDING: el servicio viejo no habla con Windows.
+Instalar ApolloSetup 3.3.12 (fix SCM) y repetir.
+
+Verificar: STATE debe ser RUNNING (4). Debe abrir ventana ApolloSoporte con ID.

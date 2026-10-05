@@ -1,0 +1,83 @@
+ApolloSupport — Instrucciones para agente Cursor (SERVIDOR DE PRODUCCIÓN)
+Asunto: Publicar Centinela 3.3.10 (upgrade web/OTA automatico: ventana+ID sin pasos manuales)
+Fecha: 2026-09-20
+Máquina: servidor Support (Apache + ApolloBackend)
+
+================================================================================
+POR QUÉ ESTE DEPLOY
+================================================================================
+Clientes en Server/RDP quedaban "online" pero SIN tray ni ventana (modo headless).
+El 3.3.10 corrige el servicio + el instalador abre solo ApolloSoporte con el ID.
+
+La pagina https://support.ultimate.net.ar/?centinela=1 lee version.json de updates/.
+Hasta que no copies updates/ a produccion, la web seguira ofreciendo 3.3.8 roto.
+
+================================================================================
+ORIGEN (PUENTE)
+================================================================================
+  \\192.168.11.20\Puente\ApolloSupport
+  (o Y:\ApolloSupport)
+
+================================================================================
+DESTINO
+================================================================================
+  Backend:   C:\ApolloSupport\backend\
+  Updates:   C:\ApolloSupport\backend\updates\
+  Frontend:  C:\Apache24\htdocs\apollosupport\
+  Servicio:  ApolloBackend
+
+================================================================================
+TAREA — EJECUTAR EN ORDEN
+================================================================================
+
+1) COPIAR OTA CENTINELA (obligatorio para la pagina de descarga)
+
+   $puente = "\\192.168.11.20\Puente\ApolloSupport"
+   if (-not (Test-Path $puente)) { $puente = "Y:\ApolloSupport" }
+
+   New-Item -ItemType Directory -Force -Path "C:\ApolloSupport\backend\updates" | Out-Null
+   Copy-Item "$puente\backend\updates\version.json"         "C:\ApolloSupport\backend\updates\version.json" -Force
+   Copy-Item "$puente\backend\updates\ApolloSetup.exe"      "C:\ApolloSupport\backend\updates\ApolloSetup.exe" -Force
+   Copy-Item "$puente\backend\updates\ApolloSetup_x64.exe"  "C:\ApolloSupport\backend\updates\ApolloSetup_x64.exe" -Force
+   # x86 solo si existe en el puente:
+   if (Test-Path "$puente\backend\updates\ApolloSetup_x86.exe") {
+     Copy-Item "$puente\backend\updates\ApolloSetup_x86.exe" "C:\ApolloSupport\backend\updates\ApolloSetup_x86.exe" -Force
+   }
+
+2) COPIAR PORTAL (opcional pero recomendado: textos + fallback HD)
+
+   robocopy "$puente\frontend\dist" "C:\Apache24\htdocs\apollosupport" /MIR /R:2 /W:3
+
+3) REINICIAR BACKEND
+
+   nssm restart ApolloBackend
+
+4) VERIFICAR
+
+   curl.exe -s http://127.0.0.1:8001/api/centinela/update_check
+   # Debe decir: "version": "3.3.10"
+
+   type C:\ApolloSupport\backend\updates\version.json
+
+   # En el navegador (Ctrl+F5):
+   #   https://support.ultimate.net.ar/?centinela=1
+   # Debe mostrar VERSIÓN 3.3.10
+
+================================================================================
+QUE DEBE PASAR EN EL CLIENTE (SIN PASOS MANUALES)
+================================================================================
+  1. Entra a la pagina / descarga el instalador (o "Actualizar ahora" en Centinela)
+  2. Windows pide UAC → el usuario toca Sí (unico click necesario)
+  3. El setup termina solo y abre ApolloSoporte con ID + PIN
+  4. Icono en bandeja disponible
+
+NO pedir a clientes: taskkill, net start, ni "abrir a mano" Program Files.
+
+================================================================================
+CHECKLIST
+================================================================================
+[ ] updates/version.json = 3.3.10
+[ ] ApolloSetup.exe + _x64.exe copiados
+[ ] ApolloBackend reiniciado
+[ ] /api/centinela/update_check → 3.3.10
+[ ] Pagina ?centinela=1 muestra 3.3.10

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Video, Film, CalendarClock, Plus, Copy, Mail, Phone, Monitor,
-  X, RefreshCw, ExternalLink, Play, Download, Trash2,
+  X, RefreshCw, ExternalLink, Play, Download, Trash2, Search,
 } from 'lucide-react';
 import {
   getAuthHeaders,
@@ -15,16 +15,30 @@ import {
   createAgendaRecording,
   cancelAgendaRecording,
   agendaRecordingDownloadUrl,
+  fetchWindowsSessionsPolled,
   type ScheduledMeeting,
   type ScheduledRecording,
+  type WindowsSessionInfo,
 } from './api';
+import { clientMatchesQuery, gescom7 } from './ClientSearchSelect';
+
+type DeviceLite = {
+  id: number;
+  device_name: string;
+  assist_id?: string | null;
+  is_online?: boolean;
+  last_seen?: string | null;
+};
 
 type ClientLite = {
   id: number;
+  codigo?: string | null;
   razon_social: string;
+  nombre_fantasia?: string | null;
+  cclifac?: string | null;
   email?: string | null;
   telefono?: string | null;
-  devices?: Array<{ id: number; device_name: string; assist_id?: string | null }>;
+  devices?: DeviceLite[];
 };
 
 type UserLite = {
@@ -39,10 +53,179 @@ type Props = {
   clients: ClientLite[];
   users: UserLite[];
   currentUserId?: number | null;
+  /** Device IDs currently connected via Centinela telemetry */
+  onlineDeviceIds?: number[];
   onNotify?: (msg: string) => void;
 };
 
 type SubTab = 'meetings' | 'recordings' | 'library';
+
+function clientCentinelaInfo(client: ClientLite, onlineSet: Set<number>) {
+  const devices = client.devices || [];
+  const online = devices.filter(d => onlineSet.has(d.id) || d.is_online).length;
+  return {
+    total: devices.length,
+    online,
+    hasCentinela: devices.length > 0,
+  };
+}
+
+function ClientSearchSelect({
+  clients,
+  value,
+  onChange,
+  onlineSet,
+  showCentinelaStatus = false,
+  onlyWithCentinela = false,
+}: {
+  clients: ClientLite[];
+  value: string;
+  onChange: (clientId: string) => void;
+  onlineSet: Set<number>;
+  showCentinelaStatus?: boolean;
+  onlyWithCentinela?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  const selected = clients.find(c => String(c.id) === value);
+
+  useEffect(() => {
+    if (selected) {
+      setQuery(selected.razon_social);
+    } else if (!value) {
+      setQuery('');
+    }
+  }, [value, selected?.id, selected?.razon_social]);
+
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, []);
+
+  const filtered = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    let list = clients;
+    if (onlyWithCentinela) {
+      list = list.filter(c => (c.devices?.length || 0) > 0);
+    }
+    if (term) {
+      list = list.filter(c => clientMatchesQuery(c, term));
+    }
+    // Prefer clients with Centinela / online first
+    list = [...list].sort((a, b) => {
+      const ia = clientCentinelaInfo(a, onlineSet);
+      const ib = clientCentinelaInfo(b, onlineSet);
+      if (ia.online !== ib.online) return ib.online - ia.online;
+      if (ia.total !== ib.total) return ib.total - ia.total;
+      return (a.razon_social || '').localeCompare(b.razon_social || '', 'es');
+    });
+    return term ? list.slice(0, 150) : list.slice(0, 40);
+  }, [clients, query, onlineSet, onlyWithCentinela]);
+
+  const statusBadgeFor = (c: ClientLite) => {
+    const info = clientCentinelaInfo(c, onlineSet);
+    if (!info.hasCentinela) {
+      return (
+        <span className="text-[9px] font-black uppercase tracking-wide px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/25">
+          Sin Centinela
+        </span>
+      );
+    }
+    if (info.online > 0) {
+      return (
+        <span className="text-[9px] font-black uppercase tracking-wide px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25">
+          {info.online}/{info.total} en línea
+        </span>
+      );
+    }
+    return (
+      <span className="text-[9px] font-black uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-500/20 text-slate-400 border border-slate-500/30">
+        {info.total} PC · off
+      </span>
+    );
+  };
+
+  return (
+    <div className="relative" ref={wrapRef}>
+      <div className="relative">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+        <input
+          className="w-full bg-slate-950 border border-white/10 rounded-xl pl-9 pr-8 py-2 text-xs"
+          placeholder="Buscar cliente por nombre o código…"
+          value={query}
+          onFocus={() => setOpen(true)}
+          onChange={e => {
+            setQuery(e.target.value);
+            setOpen(true);
+            if (value) onChange('');
+          }}
+        />
+        {(query || value) && (
+          <button
+            type="button"
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white"
+            onClick={() => {
+              setQuery('');
+              onChange('');
+              setOpen(true);
+            }}
+            title="Limpiar"
+          >
+            <X size={14} />
+          </button>
+        )}
+      </div>
+      {selected && showCentinelaStatus && (
+        <div className="mt-1.5 flex items-center gap-2">{statusBadgeFor(selected)}</div>
+      )}
+      {open && (
+        <div className="absolute z-50 mt-1 w-full max-h-56 overflow-y-auto rounded-xl border border-white/10 bg-slate-950 shadow-2xl">
+          {filtered.length === 0 ? (
+            <div className="px-3 py-2 text-[11px] text-slate-500 italic">
+              {onlyWithCentinela ? 'Ningún cliente con Centinela coincide' : 'Sin coincidencias'}
+            </div>
+          ) : (
+            filtered.map(c => (
+              <button
+                key={c.id}
+                type="button"
+                className={`w-full text-left px-3 py-2 text-xs hover:bg-brand-500/20 border-b border-white/5 last:border-0 ${
+                  String(c.id) === value ? 'bg-brand-500/15 text-brand-300' : 'text-slate-200'
+                }`}
+                onClick={() => {
+                  onChange(String(c.id));
+                  setQuery(c.razon_social);
+                  setOpen(false);
+                }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <span className="font-bold truncate block">{c.razon_social}</span>
+                    {(c.codigo || c.cclifac) ? (
+                      <span className="text-[10px] text-slate-500 font-mono">
+                        {[c.codigo, gescom7(c.cclifac)].filter(Boolean).join(' · ')}
+                      </span>
+                    ) : null}
+                  </div>
+                  {showCentinelaStatus && statusBadgeFor(c)}
+                </div>
+              </button>
+            ))
+          )}
+          {filtered.length >= 40 && (
+            <div className="px-3 py-1.5 text-[10px] text-slate-500">Escribí más para acotar…</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 function fmtDate(iso?: string | null) {
   if (!iso) return '—';
@@ -78,7 +261,7 @@ function localInputToIso(local: string) {
   return d.toISOString();
 }
 
-export default function AgendaPanel({ darkMode, clients, users, currentUserId, onNotify }: Props) {
+export default function AgendaPanel({ darkMode, clients, users, currentUserId, onlineDeviceIds = [], onNotify }: Props) {
   const [sub, setSub] = useState<SubTab>('meetings');
   const [meetings, setMeetings] = useState<ScheduledMeeting[]>([]);
   const [recordings, setRecordings] = useState<ScheduledRecording[]>([]);
@@ -88,6 +271,9 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
   const [showRecordingForm, setShowRecordingForm] = useState(false);
   const [playingId, setPlayingId] = useState<number | null>(null);
   const [videoBlobUrl, setVideoBlobUrl] = useState<string | null>(null);
+  const [onlyWithCentinela, setOnlyWithCentinela] = useState(true);
+
+  const onlineSet = useMemo(() => new Set(onlineDeviceIds), [onlineDeviceIds]);
 
   const [mForm, setMForm] = useState({
     client_id: '',
@@ -105,12 +291,67 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
     scheduled_at: toLocalInputValue(new Date(Date.now() + 60 * 60 * 1000)),
     duration_minutes: 30,
     notes: '',
+    windows_session_id: '',
   });
+
+  const [winSessions, setWinSessions] = useState<WindowsSessionInfo[]>([]);
+  const [winSessionsLoading, setWinSessionsLoading] = useState(false);
 
   const selectedClientDevices = useMemo(() => {
     const c = clients.find(x => String(x.id) === rForm.client_id);
     return c?.devices || [];
   }, [clients, rForm.client_id]);
+
+  const selectedRecordingClient = useMemo(
+    () => clients.find(x => String(x.id) === rForm.client_id),
+    [clients, rForm.client_id]
+  );
+
+  const selectedDeviceOnline = useMemo(() => {
+    if (!rForm.device_id) return false;
+    const id = Number(rForm.device_id);
+    const d = selectedClientDevices.find(x => x.id === id);
+    return onlineSet.has(id) || !!d?.is_online;
+  }, [rForm.device_id, selectedClientDevices, onlineSet]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const deviceId = Number(rForm.device_id);
+    if (!rForm.device_id || !deviceId) {
+      setWinSessions([]);
+      setRForm(f => (f.windows_session_id ? { ...f, windows_session_id: '' } : f));
+      return;
+    }
+    if (!selectedDeviceOnline) {
+      setWinSessions([]);
+      return;
+    }
+    (async () => {
+      setWinSessionsLoading(true);
+      try {
+        const sessions = await fetchWindowsSessionsPolled(deviceId);
+        if (cancelled) return;
+        setWinSessions(sessions);
+        const current = sessions.find(s => s.current) || sessions[0];
+        if (current) {
+          setRForm(f => ({ ...f, windows_session_id: String(current.id) }));
+        }
+      } catch {
+        if (!cancelled) setWinSessions([]);
+      } finally {
+        if (!cancelled) setWinSessionsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [rForm.device_id, selectedDeviceOnline]);
+
+  const windowsSessionLabel = (s: WindowsSessionInfo) => {
+    const user = s.username || 'sin usuario';
+    const name = s.name || `Sesión ${s.id}`;
+    const state = s.state ? ` · ${s.state}` : '';
+    const cur = s.current ? ' · actual' : '';
+    return `${user} @ ${name} (ID ${s.id})${state}${cur}`;
+  };
 
   const load = async () => {
     setLoading(true);
@@ -182,6 +423,22 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
       onNotify?.('Completá cliente, PC, técnico y fecha');
       return;
     }
+    if (!selectedClientDevices.length) {
+      onNotify?.('Ese cliente no tiene Centinela registrado; no se puede grabar');
+      return;
+    }
+    if (selectedDeviceOnline && winSessions.length > 0 && !rForm.windows_session_id) {
+      onNotify?.('Elegí qué sesión de Windows grabar');
+      return;
+    }
+    if (!selectedDeviceOnline) {
+      const ok = window.confirm(
+        'Esa PC está desconectada ahora. ¿Programar igual? (la grabación fallará si Centinela no está online a la hora acordada)'
+      );
+      if (!ok) return;
+    }
+    const sid = rForm.windows_session_id ? Number(rForm.windows_session_id) : undefined;
+    const sess = winSessions.find(s => s.id === sid);
     try {
       await createAgendaRecording({
         client_id: Number(rForm.client_id),
@@ -190,6 +447,8 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
         scheduled_at: localInputToIso(rForm.scheduled_at),
         duration_minutes: Number(rForm.duration_minutes) || 30,
         notes: rForm.notes || undefined,
+        windows_session_id: sid,
+        windows_session_label: sess ? windowsSessionLabel(sess) : undefined,
       });
       setShowRecordingForm(false);
       onNotify?.('Grabación programada');
@@ -296,16 +555,13 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
               <div className="grid sm:grid-cols-2 gap-3">
                 <label className="text-xs space-y-1">
                   <span className="text-slate-400 font-bold">Cliente</span>
-                  <select
-                    className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2"
+                  <ClientSearchSelect
+                    clients={clients}
                     value={mForm.client_id}
-                    onChange={e => setMForm({ ...mForm, client_id: e.target.value })}
-                  >
-                    <option value="">Seleccionar…</option>
-                    {clients.map(c => (
-                      <option key={c.id} value={c.id}>{c.razon_social}</option>
-                    ))}
-                  </select>
+                    onChange={id => setMForm({ ...mForm, client_id: id })}
+                    onlineSet={onlineSet}
+                    showCentinelaStatus
+                  />
                 </label>
                 <label className="text-xs space-y-1">
                   <span className="text-slate-400 font-bold">Título</span>
@@ -419,36 +675,117 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
 
           {showRecordingForm && (
             <div className={`p-5 rounded-2xl border ${card} space-y-3`}>
-              <div className="flex justify-between items-center">
+              <div className="flex justify-between items-center gap-3 flex-wrap">
                 <h3 className="font-bold text-sm">Nueva grabación remota</h3>
-                <button onClick={() => setShowRecordingForm(false)}><X size={16} /></button>
+                <div className="flex items-center gap-3">
+                  <label className="flex items-center gap-1.5 text-[10px] text-slate-400 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={onlyWithCentinela}
+                      onChange={e => setOnlyWithCentinela(e.target.checked)}
+                      className="rounded border-white/20"
+                    />
+                    Solo con Centinela
+                  </label>
+                  <button onClick={() => setShowRecordingForm(false)}><X size={16} /></button>
+                </div>
               </div>
               <div className="grid sm:grid-cols-2 gap-3">
                 <label className="text-xs space-y-1">
                   <span className="text-slate-400 font-bold">Cliente</span>
-                  <select
-                    className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2"
+                  <ClientSearchSelect
+                    clients={clients}
                     value={rForm.client_id}
-                    onChange={e => setRForm({ ...rForm, client_id: e.target.value, device_id: '' })}
-                  >
-                    <option value="">Seleccionar…</option>
-                    {clients.map(c => (
-                      <option key={c.id} value={c.id}>{c.razon_social}</option>
-                    ))}
-                  </select>
+                    onChange={id => setRForm({ ...rForm, client_id: id, device_id: '', windows_session_id: '' })}
+                    onlineSet={onlineSet}
+                    showCentinelaStatus
+                    onlyWithCentinela={onlyWithCentinela}
+                  />
                 </label>
                 <label className="text-xs space-y-1">
                   <span className="text-slate-400 font-bold">PC / Device</span>
                   <select
                     className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2"
                     value={rForm.device_id}
-                    onChange={e => setRForm({ ...rForm, device_id: e.target.value })}
+                    onChange={e => setRForm({ ...rForm, device_id: e.target.value, windows_session_id: '' })}
+                    disabled={!rForm.client_id || selectedClientDevices.length === 0}
                   >
-                    <option value="">Seleccionar…</option>
-                    {selectedClientDevices.map(d => (
-                      <option key={d.id} value={d.id}>{d.device_name} {d.assist_id ? `(${d.assist_id})` : ''}</option>
+                    <option value="">
+                      {!rForm.client_id
+                        ? 'Elegí un cliente…'
+                        : selectedClientDevices.length === 0
+                          ? 'Sin PCs con Centinela'
+                          : 'Seleccionar…'}
+                    </option>
+                    {selectedClientDevices.map(d => {
+                      const online = onlineSet.has(d.id) || !!d.is_online;
+                      return (
+                        <option key={d.id} value={d.id}>
+                          {online ? '● ' : '○ '}
+                          {d.device_name}
+                          {d.assist_id ? ` (${d.assist_id})` : ''}
+                          {online ? ' — en línea' : ' — desconectado'}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {rForm.device_id && (
+                    <span className={`text-[10px] font-bold ${selectedDeviceOnline ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {selectedDeviceOnline
+                        ? 'Centinela en línea ahora'
+                        : 'Centinela desconectado ahora (podés programar igual)'}
+                    </span>
+                  )}
+                </label>
+                <label className="text-xs space-y-1 sm:col-span-2">
+                  <span className="text-slate-400 font-bold flex items-center justify-between gap-2">
+                    <span>Sesión Windows a grabar</span>
+                    {rForm.device_id && selectedDeviceOnline && (
+                      <button
+                        type="button"
+                        className="text-[10px] text-sky-400 hover:text-sky-300 font-bold"
+                        onClick={async () => {
+                          setWinSessionsLoading(true);
+                          try {
+                            const sessions = await fetchWindowsSessionsPolled(Number(rForm.device_id));
+                            setWinSessions(sessions);
+                            if (!rForm.windows_session_id && sessions[0]) {
+                              setRForm(f => ({ ...f, windows_session_id: String(sessions[0].id) }));
+                            }
+                          } finally {
+                            setWinSessionsLoading(false);
+                          }
+                        }}
+                      >
+                        {winSessionsLoading ? 'Consultando…' : 'Actualizar sesiones'}
+                      </button>
+                    )}
+                  </span>
+                  <select
+                    className="w-full bg-slate-950 border border-white/10 rounded-xl px-3 py-2"
+                    value={rForm.windows_session_id}
+                    onChange={e => setRForm({ ...rForm, windows_session_id: e.target.value })}
+                    disabled={!rForm.device_id || winSessionsLoading || (!winSessions.length && selectedDeviceOnline)}
+                  >
+                    {!rForm.device_id && <option value="">Elegí una PC primero…</option>}
+                    {rForm.device_id && !selectedDeviceOnline && (
+                      <option value="">PC offline — no se pueden listar sesiones ahora</option>
+                    )}
+                    {rForm.device_id && selectedDeviceOnline && winSessionsLoading && (
+                      <option value="">Consultando sesiones en el servidor…</option>
+                    )}
+                    {rForm.device_id && selectedDeviceOnline && !winSessionsLoading && winSessions.length === 0 && (
+                      <option value="">Sin sesiones reportadas (¿Centinela en Session 0?)</option>
+                    )}
+                    {winSessions.map(s => (
+                      <option key={s.id} value={s.id}>
+                        {windowsSessionLabel(s)}
+                      </option>
                     ))}
                   </select>
+                  <span className="text-[10px] text-slate-500">
+                    En Terminal Server / RDS elegí el usuario cuyo escritorio querés grabar. Al iniciar, Centinela cambia a esa sesión.
+                  </span>
                 </label>
                 <label className="text-xs space-y-1">
                   <span className="text-slate-400 font-bold">Técnico</span>
@@ -490,9 +827,15 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
                   />
                 </label>
               </div>
+              {selectedRecordingClient && selectedClientDevices.length === 0 && (
+                <p className="text-[11px] text-red-400 font-semibold">
+                  Este cliente no tiene Centinela registrado. No se puede programar una grabación remota.
+                </p>
+              )}
               <button
                 onClick={handleCreateRecording}
-                className="px-4 py-2 rounded-xl bg-brand-500 hover:bg-brand-600 text-white text-xs font-bold"
+                disabled={!rForm.client_id || selectedClientDevices.length === 0}
+                className="px-4 py-2 rounded-xl bg-brand-500 hover:bg-brand-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold"
               >
                 Guardar
               </button>
@@ -516,6 +859,11 @@ export default function AgendaPanel({ darkMode, clients, users, currentUserId, o
                     <p className="text-xs text-slate-400 mt-1">
                       {r.client_name} · {fmtDate(r.scheduled_at)} · {r.duration_minutes} min · {r.technician_name}
                     </p>
+                    {r.windows_session_label && (
+                      <p className="text-[11px] text-sky-400/90 mt-1 font-semibold">
+                        Sesión: {r.windows_session_label}
+                      </p>
+                    )}
                     {r.notes && <p className="text-[11px] text-slate-500 mt-1">{r.notes}</p>}
                     {r.error_message && <p className="text-[11px] text-red-400 mt-1">{r.error_message}</p>}
                   </div>

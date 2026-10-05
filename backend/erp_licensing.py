@@ -908,6 +908,7 @@ def load_gesacti_modules():
     json_path = os.path.join(os.path.dirname(__file__), "data", "modulos_gesacti.json")
     dbf_paths = [
         os.getenv("GESACTI_MODULOS_DBF", ""),
+        r"\\192.168.10.24\X\programa\MODULOS.DBF",
         r"m:\programa\MODULOS.DBF",
         r"x:\Util_Activacion\MODULOS.DBF",
         os.path.join(os.path.dirname(__file__), "data", "MODULOS.DBF"),

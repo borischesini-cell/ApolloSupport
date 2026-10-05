@@ -1,0 +1,26 @@
+ApolloSupport — Actividades múltiples + adjuntos en pedidos
+Fecha: 2026-09-18
+Puente: Y:\ApolloSupport  (\\192.168.11.20\Puente\ApolloSupport)
+
+================================================================================
+QUÉ TRAE
+================================================================================
+1) Un usuario puede estar en más de una actividad (Atención, Desarrollo, Finanzas, Caja)
+2) Nuevo pedido a Programación: se pueden adjuntar Excel, JPG, TXT, PDF, etc.
+
+================================================================================
+PASOS EN SERVIDOR SUPPORT (portal)
+================================================================================
+1. Copiar desde el puente:
+     backend\main.py
+     backend\models.py
+     backend\schemas.py
+     frontend\dist\   (carpeta completa)
+
+2. Reiniciar servicio ApolloBackend
+
+3. Hard refresh del portal (Ctrl+F5)
+
+Verificar:
+  - Plantel → Modificar usuario → casillas de Actividades (varias a la vez)
+  - Pedidos → Nuevo pedido → Adjuntos (Excel / JPG / TXT / PDF)

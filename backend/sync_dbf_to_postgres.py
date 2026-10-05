@@ -77,149 +77,145 @@ def clean_str(val):
         return val.replace('\x00', '').strip()
     return str(val).replace('\x00', '').strip()
 
-def sync_data():
+
+def _as_date(val):
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    text = clean_str(val)
+    if not text:
+        return None
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y%m%d"):
+        try:
+            return datetime.strptime(text[:10] if fmt != "%Y%m%d" else text[:8], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def record_to_client_dict(record: dict) -> dict:
+    """Normaliza un registro CLIGESCO / GesActi al dict de Support."""
+    if not isinstance(record, dict):
+        record = dict(record)
+    ccod = clean_str(record.get("codigo") or record.get("CCOD") or record.get("CCod"))
+    if ccod.isdigit() and len(ccod) <= 4:
+        ccod = ccod.zfill(4)
+    cdes = clean_str(record.get("nombre_fantasia") or record.get("CDES") or record.get("CDes") or record.get("CNOMFA"))
+    craso = clean_str(record.get("razon_social") or record.get("CRASO") or record.get("CRaso"))
+    cparte = clean_str(record.get("cparte") or record.get("CPARTE") or record.get("CParte"))
+    cacti_raw = record.get("activo", record.get("CACTI", record.get("CActi", True)))
+    if cacti_raw in (None, ""):
+        cacti = True
+    elif isinstance(cacti_raw, str):
+        cacti = cacti_raw.strip().lower() not in ("0", "false", "f", "n", "no")
+    else:
+        cacti = bool(cacti_raw)
+    if record.get("deleted") in (True, "true", "1", 1):
+        cacti = False
+    razon = craso or cdes or (f"Cliente {ccod}" if ccod else "Cliente")
+    return {
+        "codigo": ccod.upper() if ccod else "",
+        "razon_social": razon,
+        "nombre_fantasia": cdes or None,
+        "identificador_fiscal": cparte or None,
+        "cparte": cparte or None,
+        "version_apollo": clean_str(record.get("version_apollo") or record.get("CVERSION") or record.get("CVersion")) or None,
+        "activo": cacti,
+        "saldo": float(record.get("saldo", record.get("CSALDO", record.get("CSaldo", 0.0))) or 0.0),
+        "email": clean_str(record.get("email") or record.get("CEMAIL") or record.get("CEMail")) or None,
+        "localidad": clean_str(record.get("localidad") or record.get("CLOCALIDA") or record.get("CLocalida")) or None,
+        "fecha_ultimo_pago": _as_date(record.get("fecha_ultimo_pago") or record.get("CULPA") or record.get("CUlPa")),
+        "fecha_registro": _as_date(record.get("fecha_registro") or record.get("CFECHA") or record.get("CFecha")),
+        "vendedor_codigo": clean_str(record.get("vendedor_codigo") or record.get("CVENDEDOR") or record.get("CVendedor")) or None,
+        "vendedor_nombre": clean_str(record.get("vendedor_nombre") or record.get("CNOMVEN") or record.get("CNomVen")) or None,
+        "clasificacion_codigo": clean_str(record.get("clasificacion_codigo") or record.get("CCLAS") or record.get("CClas")) or None,
+        "clasificacion_nombre": clean_str(record.get("clasificacion_nombre") or record.get("CNOMCLAS") or record.get("CNomClas")) or None,
+        "extracto": clean_str(record.get("extracto") or record.get("CEXTRACTO")) or None,
+        "cclifac": clean_str(record.get("cclifac") or record.get("CCLIFAC") or record.get("CCliFac")) or None,
+    }
+
+
+def apply_client_row(db, row: dict, *, partial: bool = False) -> str:
+    """Inserta o actualiza un cliente. Devuelve 'inserted' | 'updated' | 'skipped'."""
+    data = record_to_client_dict(row)
+    codigo = data.get("codigo") or ""
+    if not codigo:
+        return "skipped"
+    db_client = db.query(models.Client).filter(models.Client.codigo == codigo).first()
+    if not db_client and data.get("cclifac"):
+        fac = data["cclifac"]
+        db_client = db.query(models.Client).filter(models.Client.cclifac == fac).first()
+    if db_client:
+        for key, value in data.items():
+            if key == "codigo":
+                continue
+            if partial and value in (None, ""):
+                continue
+            setattr(db_client, key, value)
+        return "updated"
+    db.add(models.Client(**data))
+    return "inserted"
+
+
+def apply_clients_batch(db, rows: list) -> dict:
+    inserted = updated = skipped = 0
+    seen = set()
+    for row in rows or []:
+        data = record_to_client_dict(row if isinstance(row, dict) else dict(row))
+        codigo = data.get("codigo") or ""
+        if not codigo or codigo in seen:
+            skipped += 1
+            continue
+        seen.add(codigo)
+        action = apply_client_row(db, data, partial=False)
+        if action == "inserted":
+            inserted += 1
+        elif action == "updated":
+            updated += 1
+        else:
+            skipped += 1
+    return {"inserted": inserted, "updated": updated, "skipped": skipped, "total": inserted + updated}
+
+
+def sync_data(dbf_path: str | None = None, db=None):
     """
     Lee CLIGESCO.DBF y sincroniza la información con PostgreSQL.
+    Si no hay path usable (p.ej. producción sin M:), no toca la base.
     """
-    dbf_path = r"p:\ApolloSupport\bases\CLIGESCO.DBF"
-    if not os.path.exists(dbf_path):
-        print("Error: No se encontró CLIGESCO.DBF en la ruta:", dbf_path)
-        return
+    if not dbf_path:
+        try:
+            from cligesco_dbf import primary_cligesco_path
+            dbf_path = primary_cligesco_path() or r"\\192.168.10.24\X\programa\CLIGESCO.DBF"
+        except Exception:
+            dbf_path = r"\\192.168.10.24\X\programa\CLIGESCO.DBF"
+    if not dbf_path or not os.path.exists(dbf_path):
+        msg = f"No se encontró CLIGESCO.DBF en la ruta: {dbf_path}"
+        print("Error:", msg)
+        raise FileNotFoundError(msg)
 
-    print("Leyendo CLIGESCO.DBF...")
-    table = DBF(dbf_path, encoding='latin1')
-    
-    db = SessionLocal()
+    print("Leyendo CLIGESCO.DBF...", dbf_path)
+    table = DBF(dbf_path, encoding="latin1", ignore_missing_memofile=True)
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
     try:
-        print("Sincronizando clientes...")
-        count_inserted = 0
-        count_updated = 0
-        count_deleted = 0
-        
-        # Guardaremos los códigos procesados para evitar duplicados en la misma transacción si la hubiera en la tabla DBF
-        procesados = set()
-        
-        for record in table:
-            # Extraer campos y limpiar espacios y bytes nulos
-            ccod = clean_str(record.get("CCOD"))
-            if not ccod:
-                continue
-                
-            if ccod in procesados:
-                print(f"Aviso: Código de cliente {ccod} duplicado en CLIGESCO.DBF. Saltando duplicado.")
-                continue
-                
-            procesados.add(ccod)
-            
-            cacti = bool(record.get("CACTI", True))
-            if not cacti:
-                # Si el cliente no está activo, se borra directamente de la base de datos si existe
-                db_client = db.query(models.Client).filter(models.Client.codigo == ccod).first()
-                if db_client:
-                    # Borrar primero tickets y dispositivos relacionados para evitar errores de clave foránea
-                    for ticket in db_client.tickets:
-                        db.delete(ticket)
-                    for dev in db_client.devices:
-                        db.delete(dev)
-                    db.delete(db_client)
-                    count_deleted += 1
-                continue
-            
-            cdes = clean_str(record.get("CDES"))
-            craso = clean_str(record.get("CRASO"))
-            cparte = clean_str(record.get("CPARTE"))
-            cversion = clean_str(record.get("CVERSION"))
-            csaldo = float(record.get("CSALDO", 0.0) or 0.0)
-            cemail = clean_str(record.get("CEMAIL"))
-            clocalida = clean_str(record.get("CLOCALIDA"))
-            cclifac = clean_str(record.get("CCLIFAC"))
-            
-            # Fechas (pueden venir como None o datetime.date)
-            fecha_pago = record.get("CULPA")
-            if isinstance(fecha_pago, datetime):
-                fecha_pago = fecha_pago.date()
-            elif not isinstance(fecha_pago, date):
-                fecha_pago = None
-                
-            fecha_reg = record.get("CFECHA")
-            if isinstance(fecha_reg, datetime):
-                fecha_reg = fecha_reg.date()
-            elif not isinstance(fecha_reg, date):
-                fecha_reg = None
-                
-            vendedor_cod = clean_str(record.get("CVENDEDOR"))
-            vendedor_nom = clean_str(record.get("CNOMVEN"))
-            clas_cod = clean_str(record.get("CCLAS"))
-            clas_nom = clean_str(record.get("CNOMCLAS"))
-            extracto = record.get("CEXTRACTO")
-            if extracto:
-                extracto = extracto.replace('\x00', '').strip()
-            else:
-                extracto = None
-
-            # Razón social default
-            razon_social = craso if craso else cdes
-            if not razon_social:
-                razon_social = f"Cliente {ccod}"
-
-            # Seteamos identificador_fiscal directamente
-            identificador_fiscal = cparte if cparte else None
-
-            # Buscar por código ERP
-            db_client = db.query(models.Client).filter(models.Client.codigo == ccod).first()
-            
-            if db_client:
-                # Actualizar campos existentes
-                db_client.razon_social = razon_social
-                db_client.nombre_fantasia = cdes
-                db_client.identificador_fiscal = identificador_fiscal
-                db_client.cparte = cparte
-                db_client.version_apollo = cversion
-                db_client.activo = cacti
-                db_client.saldo = csaldo
-                db_client.email = cemail
-                db_client.localidad = clocalida
-                db_client.fecha_ultimo_pago = fecha_pago
-                db_client.fecha_registro = fecha_reg
-                db_client.vendedor_codigo = vendedor_cod
-                db_client.vendedor_nombre = vendedor_nom
-                db_client.clasificacion_codigo = clas_cod
-                db_client.clasificacion_nombre = clas_nom
-                db_client.extracto = extracto
-                db_client.cclifac = cclifac
-                count_updated += 1
-            else:
-                # Crear nuevo cliente
-                db_client = models.Client(
-                    codigo=ccod,
-                    razon_social=razon_social,
-                    nombre_fantasia=cdes,
-                    identificador_fiscal=identificador_fiscal,
-                    cparte=cparte,
-                    version_apollo=cversion,
-                    activo=cacti,
-                    saldo=csaldo,
-                    email=cemail,
-                    localidad=clocalida,
-                    fecha_ultimo_pago=fecha_pago,
-                    fecha_registro=fecha_reg,
-                    vendedor_codigo=vendedor_cod,
-                    vendedor_nombre=vendedor_nom,
-                    clasificacion_codigo=clas_cod,
-                    clasificacion_nombre=clas_nom,
-                    extracto=extracto,
-                    cclifac=cclifac
-                )
-                db.add(db_client)
-                count_inserted += 1
-                
+        stats = apply_clients_batch(db, [dict(record) for record in table])
         db.commit()
-        print(f"Sincronización completada: {count_inserted} insertados, {count_updated} actualizados, {count_deleted} inactivos eliminados.")
-    except Exception as e:
+        print(
+            f"Sincronización completada: {stats['inserted']} insertados, "
+            f"{stats['updated']} actualizados."
+        )
+        stats["path"] = dbf_path
+        return stats
+    except Exception:
         db.rollback()
-        print("Error durante la sincronización:", e)
+        raise
     finally:
-        db.close()
+        if own_db:
+            db.close()
 
 if __name__ == "__main__":
     add_columns_safely()

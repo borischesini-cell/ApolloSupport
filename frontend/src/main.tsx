@@ -38,9 +38,7 @@ async function bootstrap() {
   }
 
   createRoot(document.getElementById('root')!).render(
-    <StrictMode>
-      <Root />
-    </StrictMode>,
+    <Root />
   );
 }
 

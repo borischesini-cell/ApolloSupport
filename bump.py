@@ -2,7 +2,7 @@ import os
 import re
 import json
 
-NEW_VERSION = "3.2.6"  # <--- CAMBIAR ESTE NUMERO PARA ACTUALIZAR TODO EL PROYECTO
+NEW_VERSION = "3.3.2"  # <--- CAMBIAR ESTE NUMERO PARA ACTUALIZAR TODO EL PROYECTO
 
 files_to_update = [
     {
