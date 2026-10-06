@@ -1549,6 +1549,9 @@ export default function App() {
   const webrtcPcRef = useRef<RTCPeerConnection | null>(null);
   const webrtcPendingIceRef = useRef<RTCIceCandidateInit[]>([]);
   const [webrtcState, setWebrtcState] = useState<'off' | 'connecting' | 'open' | 'failed'>('off');
+  // Con el canal rápido abierto el FPS sale de las stats del track WebRTC, no del stream JPEG del WS.
+  const webrtcOpenRef = useRef(false);
+  const [rtcStats, setRtcStats] = useState<{ lossPct: number; kbps: number } | null>(null);
   const hqBufferRef = useRef<Uint8Array>(new Uint8Array(0));
   const hqPendingChunksRef = useRef<ArrayBuffer[]>([]);
   const hqPendingWarnedRef = useRef(false);
@@ -1848,9 +1851,11 @@ export default function App() {
       frameTimestampsRef.current.push(now);
       const twoSecsAgo = now - 2000;
       frameTimestampsRef.current = frameTimestampsRef.current.filter(t => t > twoSecsAgo);
-      const fps = Math.round(frameTimestampsRef.current.length / 2);
-      setConnectionFps(fps);
-      setConnectionQuality(connectionQualityFromFps(fps));
+      if (!webrtcOpenRef.current) {
+        const fps = Math.round(frameTimestampsRef.current.length / 2);
+        setConnectionFps(fps);
+        setConnectionQuality(connectionQualityFromFps(fps));
+      }
       if (sessionSwitchingRef.current && src) {
         pendingSwitchWindowsSessionRef.current = null;
         setSessionSwitching(false);
@@ -1864,6 +1869,7 @@ export default function App() {
       feedHqChunkImplRef.current(chunk);
     },
     onQuality: (fps, quality) => {
+      if (webrtcOpenRef.current) return;
       setConnectionFps(fps);
       setConnectionQuality(quality);
     },
@@ -1923,8 +1929,6 @@ export default function App() {
           webrtcVideoRef.current.play().catch(() => {});
         }
         setWebrtcState('open');
-        setConnectionFps(20);
-        setConnectionQuality('excellent');
         setShowNotification('Canal rápido conectado (P2P/UDP)');
         setTimeout(() => setShowNotification(null), 2500);
         sendViewerCommandRef.current({ type: 'stop_hq' });
@@ -2000,6 +2004,49 @@ export default function App() {
     }
     startWebRtc();
   }, [webrtcState, startWebRtc, stopWebRtc]);
+
+  // FPS real del canal rápido: frames decodificados por segundo según getStats().
+  useEffect(() => {
+    webrtcOpenRef.current = webrtcState === 'open';
+    if (webrtcState !== 'open') {
+      setRtcStats(null);
+      return;
+    }
+    let prev: { t: number; frames: number; bytes: number; lost: number; recv: number } | null = null;
+    const id = window.setInterval(async () => {
+      const pc = webrtcPcRef.current;
+      if (!pc) return;
+      try {
+        const report = await pc.getStats();
+        report.forEach((r: any) => {
+          if (r.type !== 'inbound-rtp' || (r.kind ?? r.mediaType) !== 'video') return;
+          const cur = {
+            t: r.timestamp as number,
+            frames: (r.framesDecoded ?? 0) as number,
+            bytes: (r.bytesReceived ?? 0) as number,
+            lost: (r.packetsLost ?? 0) as number,
+            recv: (r.packetsReceived ?? 0) as number,
+          };
+          if (prev && cur.t > prev.t) {
+            const dt = (cur.t - prev.t) / 1000;
+            const fps = Math.round((cur.frames - prev.frames) / dt);
+            const dLost = Math.max(0, cur.lost - prev.lost);
+            const dRecv = Math.max(0, cur.recv - prev.recv);
+            setConnectionFps(fps);
+            setConnectionQuality(connectionQualityFromFps(fps));
+            setRtcStats({
+              lossPct: dLost + dRecv > 0 ? Math.round((dLost * 1000) / (dLost + dRecv)) / 10 : 0,
+              kbps: Math.round(((cur.bytes - prev.bytes) * 8) / dt / 1000),
+            });
+          }
+          prev = cur;
+        });
+      } catch {
+        /* getStats puede fallar si el pc se cierra entre ticks */
+      }
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [webrtcState]);
 
   const agentSupportsPasteText = useCallback((deviceId: number) => {
     const telem = centinelasRef.current[deviceId] || centinelasRef.current[String(deviceId)];
@@ -4709,7 +4756,14 @@ export default function App() {
             </span>
           )}
           {hasLiveRemoteVideo && (
-            <span className="hidden md:inline text-[10px] font-mono text-slate-400 shrink-0">{connectionFps} FPS</span>
+            <span
+              className="hidden md:inline text-[10px] font-mono text-slate-400 shrink-0"
+              title={webrtcState === 'open' && rtcStats
+                ? `Canal rápido (P2P): ${connectionFps} FPS reales decodificados · ${rtcStats.kbps} kbps · pérdida ${rtcStats.lossPct}%`
+                : 'FPS del stream estándar (WebSocket)'}
+            >
+              {connectionFps} FPS{webrtcState === 'open' ? ' P2P' : ''}
+            </span>
           )}
           <label
             className="shrink-0 px-3 py-1.5 rounded-xl text-[11px] font-black uppercase tracking-wider border border-sky-500/40 bg-sky-700 hover:bg-sky-600 text-white cursor-pointer"
