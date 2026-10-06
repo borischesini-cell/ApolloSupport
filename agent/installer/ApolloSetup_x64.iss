@@ -4,7 +4,7 @@
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.3.38"
+#define MyAppVersion   "3.3.39"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"

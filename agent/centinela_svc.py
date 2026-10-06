@@ -25,7 +25,7 @@ import logging.handlers
 
 # ── Configuracion ─────────────────────────────────────────────────────────────
 SERVICE_NAME    = "ApolloCentinela"
-__version__     = "3.3.38"
+__version__     = "3.3.39"
 SERVICE_MUTEX_NAME = "Global\\ApolloCentinelaService"
 ERROR_ALREADY_EXISTS = 183
 BASE_DIR        = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))

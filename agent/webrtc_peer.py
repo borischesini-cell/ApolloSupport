@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
+from fractions import Fraction
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger("centinela")
@@ -29,6 +31,7 @@ try:
         RTCSessionDescription,
         VideoStreamTrack,
     )
+    from aiortc.mediastreams import VIDEO_CLOCK_RATE, MediaStreamError
     from av.video.frame import VideoFrame
     AIORTC_OK = True
 except Exception as exc:
@@ -76,22 +79,52 @@ def _ice_servers_from_payload(raw) -> list:
     return servers or [RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
 
 
-def _grab_screen():
+_SCALE_CACHE = {"src": None, "w": 0, "img": None}
+
+
+def _grab_scaled(max_width: int):
+    """Captura y escala en un paso. Devuelve PIL RGB (ancho/alto pares) o None.
+
+    DXGI: escala directo desde el buffer BGRX (sin el .convert("RGB") a resolucion
+    completa) y con BILINEAR+reducing_gap, mucho mas barato que el BICUBIC por defecto.
+    """
+    from PIL import Image
+    img = None
     try:
-        from dxgi_capture import grab_rgb
-        img = grab_rgb(0)
-        if img is not None:
-            return img
+        from dxgi_capture import get_capturer
+        cap = get_capturer(0)
+        frame = cap.grab_bgra() if cap is not None else None
+        if frame is not None:
+            w, h, bgra = frame
+            # DXGI reusa el mismo objeto bytes si no hubo frame nuevo: no reescalar.
+            if bgra is _SCALE_CACHE["src"] and max_width == _SCALE_CACHE["w"] and _SCALE_CACHE["img"] is not None:
+                return _SCALE_CACHE["img"]
+            img = Image.frombuffer("RGBX", (w, h), bgra, "raw", "BGRX", 0, 1)
+            _SCALE_CACHE["src"] = bgra
     except Exception:
-        pass
-    try:
-        from PIL import ImageGrab
-        return ImageGrab.grab()
-    except Exception:
-        return None
+        img = None
+    if img is None:
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grab()
+        except Exception:
+            return None
+    w, h = img.size
+    if max_width and w > max_width:
+        nw = max_width & ~1
+        nh = max(2, int(h * nw / w) & ~1)
+        img = img.resize((nw, nh), Image.Resampling.BILINEAR, reducing_gap=2.0)
+    elif (w & 1) or (h & 1):
+        img = img.crop((0, 0, w & ~1, h & ~1))
+    img = img if img.mode == "RGB" else img.convert("RGB")
+    _SCALE_CACHE["w"] = max_width
+    _SCALE_CACHE["img"] = img
+    return img
 
 
 class ScreenTrack(VideoStreamTrack):
+    """Track de pantalla. Un hilo productor captura a `fps`; recv() solo toma el
+    ultimo frame listo, asi la captura/escalado no se serializa con el encode VP8."""
     kind = "video"
 
     def __init__(self, fps: int = TARGET_FPS, max_width: int = MAX_WIDTH, log_fn: Optional[LogFn] = None):
@@ -102,21 +135,59 @@ class ScreenTrack(VideoStreamTrack):
         self._log_fn = log_fn
         self._frames = 0
         self._t0: Optional[float] = None
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+        self._cap_frames = 0
+        self._pace_start: Optional[float] = None
+        self._pace_n = 0
+        self._thread = threading.Thread(target=self._producer, name="webrtc-capture", daemon=True)
+        self._thread.start()
+
+    def _producer(self):
+        period = 1.0 / self._fps
+        nxt = time.monotonic()
+        while not self._stop_evt.is_set():
+            try:
+                img = _grab_scaled(self._max_width)
+            except Exception:
+                img = None
+            if img is not None:
+                with self._lock:
+                    self._last = img
+                    self._cap_frames += 1
+            nxt += period
+            delay = nxt - time.monotonic()
+            if delay > 0:
+                self._stop_evt.wait(delay)
+            else:
+                nxt = time.monotonic()  # no acumular deuda si la captura es mas lenta
+
+    def stop(self):
+        self._stop_evt.set()
+        super().stop()
+
+    async def next_timestamp(self):
+        """Pacing a self._fps (el de aiortc esta fijo en 30)."""
+        if self.readyState != "live":
+            raise MediaStreamError
+        ptime = 1.0 / self._fps
+        if self._pace_start is None:
+            self._pace_start = time.time()
+            self._pace_n = 0
+        else:
+            self._pace_n += 1
+            wait = self._pace_start + self._pace_n * ptime - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        return int(self._pace_n * ptime * VIDEO_CLOCK_RATE), Fraction(1, VIDEO_CLOCK_RATE)
 
     async def recv(self):
         pts, time_base = await self.next_timestamp()
-        img = await asyncio.get_event_loop().run_in_executor(None, _grab_screen)
-        if img is None:
+        with self._lock:
             img = self._last
         if img is None:
             from PIL import Image
             img = Image.new("RGB", (640, 360), (15, 23, 42))
-        self._last = img
-        w, h = img.size
-        if self._max_width and w > self._max_width:
-            nh = max(2, int(h * self._max_width / w) & ~1)
-            nw = self._max_width & ~1
-            img = img.resize((nw, nh))
         frame = VideoFrame.from_image(img)
         frame.pts = pts
         frame.time_base = time_base
@@ -128,8 +199,8 @@ class ScreenTrack(VideoStreamTrack):
             avg = (self._frames - 1) / dt if dt > 0 else 0.0
             try:
                 await self._log_fn(
-                    "[WEBRTC] track: %d frames en %.1fs (%.1f fps promedio)"
-                    % (self._frames, dt, avg)
+                    "[WEBRTC] track: %d frames en %.1fs (%.1f fps promedio, %d capturas)"
+                    % (self._frames, dt, avg, self._cap_frames)
                 )
             except Exception:
                 pass
