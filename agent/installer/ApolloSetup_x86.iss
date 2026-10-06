@@ -4,7 +4,7 @@
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.3.36"
+#define MyAppVersion   "3.3.38"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"
@@ -67,8 +67,8 @@ Source: "..\apollo_logo.ico";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\apollo_logo.png";      DestDir: "{app}"; Flags: ignoreversion
 
 ; DLLs de Visual C++ Runtime ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â incluidas directamente para compatibilidad
-Source: "dlls\vcruntime140.dll";   DestDir: "{app}"; Flags: ignoreversion
-Source: "dlls\msvcp140.dll";       DestDir: "{app}"; Flags: ignoreversion
+Source: "dlls\x86\vcruntime140.dll";   DestDir: "{app}"; Flags: ignoreversion
+Source: "dlls\x86\msvcp140.dll";       DestDir: "{app}"; Flags: ignoreversion
 
 ; ffmpeg.exe ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â necesario para el modo Alto Rendimiento (H.264 MSE).
 Source: "..\ffmpeg_x86.exe";           DestDir: "{app}"; Flags: ignoreversion nocompression

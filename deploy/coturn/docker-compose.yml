@@ -1,0 +1,13 @@
+# TURN server para el canal rápido WebRTC (coturn).
+# Resuelve NAT symmetric / firewall estricto donde STUN no alcanza.
+# El media relayado por TURN es UDP 3478 (y TCP 3478/5349 como fallback).
+
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: apollo-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]

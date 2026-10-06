@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger("centinela")
 
 EmitFn = Callable[[dict], Awaitable[None]]
+LogFn = Callable[[str], Awaitable[None]]
 
 TARGET_FPS = 20
 MAX_WIDTH = 1280
+DISCONNECT_GRACE_S = 10.0
+STATS_EVERY_FRAMES = 300
 
 _AIORTC_ERR = ""
 try:
@@ -90,11 +94,14 @@ def _grab_screen():
 class ScreenTrack(VideoStreamTrack):
     kind = "video"
 
-    def __init__(self, fps: int = TARGET_FPS, max_width: int = MAX_WIDTH):
+    def __init__(self, fps: int = TARGET_FPS, max_width: int = MAX_WIDTH, log_fn: Optional[LogFn] = None):
         super().__init__()
         self._fps = max(8, min(30, int(fps)))
         self._max_width = max_width
         self._last = None
+        self._log_fn = log_fn
+        self._frames = 0
+        self._t0: Optional[float] = None
 
     async def recv(self):
         pts, time_base = await self.next_timestamp()
@@ -113,14 +120,68 @@ class ScreenTrack(VideoStreamTrack):
         frame = VideoFrame.from_image(img)
         frame.pts = pts
         frame.time_base = time_base
+        self._frames += 1
+        if self._frames == 1:
+            self._t0 = time.monotonic()
+        elif self._frames % STATS_EVERY_FRAMES == 0 and self._t0 and self._log_fn:
+            dt = time.monotonic() - self._t0
+            avg = (self._frames - 1) / dt if dt > 0 else 0.0
+            try:
+                await self._log_fn(
+                    "[WEBRTC] track: %d frames en %.1fs (%.1f fps promedio)"
+                    % (self._frames, dt, avg)
+                )
+            except Exception:
+                pass
         return frame
 
 
 class WebRtcSession:
-    def __init__(self, emit: EmitFn):
+    def __init__(self, emit: EmitFn, log_fn: Optional[LogFn] = None):
         self.emit = emit
+        self.log_fn = log_fn
         self.pc: Optional[Any] = None
         self._closed = False
+        self._fail_timer: Optional[asyncio.Task] = None
+
+    async def _report(self, mapped: Optional[str], detail: str = ""):
+        msg = "[WEBRTC]"
+        if mapped:
+            msg += " state→%s" % mapped
+        if detail:
+            msg += " %s" % detail
+        logger.info("%s", msg)
+        if self.log_fn:
+            try:
+                await self.log_fn(msg)
+            except Exception:
+                pass
+        if mapped:
+            try:
+                await self.emit({"type": "webrtc_state", "state": mapped})
+            except Exception:
+                pass
+
+    def _cancel_fail_timer(self):
+        t = self._fail_timer
+        self._fail_timer = None
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    async def _delayed_fail(self, state_seen: str):
+        try:
+            await asyncio.sleep(DISCONNECT_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        if self._closed or not self.pc:
+            return
+        now = getattr(self.pc, "connectionState", "unknown")
+        if now in ("connected", "completed"):
+            return
+        await self._report("failed", "connectionstate=%s hace %.0fs, ahora=%s" % (state_seen, DISCONNECT_GRACE_S, now))
 
     async def start_from_offer(self, sdp: str, ice_servers=None):
         if not AIORTC_OK:
@@ -131,23 +192,27 @@ class WebRtcSession:
             return
         await self.close()
         self._closed = False
+        await self._report(None, "offer recibido, creando peer")
         config = RTCConfiguration(iceServers=_ice_servers_from_payload(ice_servers))
         self.pc = RTCPeerConnection(configuration=config)
-        self.pc.addTrack(ScreenTrack())
+        self.pc.addTrack(ScreenTrack(log_fn=self.log_fn))
 
         @self.pc.on("connectionstatechange")
         async def _on_state():
             state = getattr(self.pc, "connectionState", "unknown") if self.pc else "closed"
-            logger.info("[WEBRTC] connectionstate=%s", state)
-            mapped = state
-            if state == "connected":
-                mapped = "open"
-            elif state in ("failed", "disconnected"):
-                mapped = "failed"
-            try:
-                await self.emit({"type": "webrtc_state", "state": mapped})
-            except Exception:
-                pass
+            if state in ("connected", "completed"):
+                self._cancel_fail_timer()
+                await self._report("open", "connectionstate=%s" % state)
+            elif state == "disconnected":
+                # Transitorio frecuente en P2P UDP: dar gracia antes de declarar fallo.
+                self._cancel_fail_timer()
+                self._fail_timer = asyncio.create_task(self._delayed_fail(state))
+                await self._report(None, "connectionstate=disconnected (gracia %.0fs)" % DISCONNECT_GRACE_S)
+            elif state == "failed":
+                self._cancel_fail_timer()
+                await self._report("failed", "connectionstate=failed")
+            elif state == "closed":
+                self._cancel_fail_timer()
 
         await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
         answer = await self.pc.createAnswer()
@@ -159,7 +224,7 @@ class WebRtcSession:
             "type": "webrtc_answer",
             "sdp": self.pc.localDescription.sdp,
         })
-        logger.info("[WEBRTC] answer enviado (%d chars)", len(self.pc.localDescription.sdp or ""))
+        await self._report(None, "answer enviado (%d chars)" % len(self.pc.localDescription.sdp or ""))
 
     async def add_ice(self, candidate: str, sdp_mid=None, sdp_mline_index=None):
         if not self.pc or not candidate:
@@ -193,6 +258,7 @@ class WebRtcSession:
 
     async def close(self):
         self._closed = True
+        self._cancel_fail_timer()
         pc = self.pc
         self.pc = None
         if pc:
@@ -205,7 +271,7 @@ class WebRtcSession:
 _SESSION: Optional[WebRtcSession] = None
 
 
-async def handle_webrtc_message(data: dict, emit: EmitFn):
+async def handle_webrtc_message(data: dict, emit: EmitFn, log_fn: Optional[LogFn] = None):
     global _SESSION
     kind = data.get("type")
     if kind == "webrtc_offer":
@@ -215,7 +281,7 @@ async def handle_webrtc_message(data: dict, emit: EmitFn):
                 "message": "Este agente no tiene el módulo WebRTC. Actualizá Centinela 3.3.4+.",
             })
             return
-        _SESSION = WebRtcSession(emit)
+        _SESSION = WebRtcSession(emit, log_fn)
         await _SESSION.start_from_offer(data.get("sdp") or "", data.get("ice_servers"))
     elif kind == "webrtc_ice":
         if _SESSION:

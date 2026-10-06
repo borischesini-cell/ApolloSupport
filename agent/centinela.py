@@ -56,7 +56,7 @@ import mss
 # ==============================================================================
 # CONFIGURACION Y VERSIONADO
 # ==============================================================================
-CLIENT_VERSION = "3.3.36"
+CLIENT_VERSION = "3.3.38"
 BUILD_DATE     = "2026-10-05"  # <--- SE ACTUALIZA MANUALMENTE EN CADA RELEASE
 # ==============================================================================
 
@@ -2808,7 +2808,7 @@ async def send_telemetry(lbl_status, lbl_detail=None):
 
                                 try:
                                     from webrtc_peer import handle_webrtc_message
-                                    asyncio.create_task(handle_webrtc_message(data, _rtc_emit))
+                                    asyncio.create_task(handle_webrtc_message(data, _rtc_emit, emit_bitacora_log))
                                 except Exception as e:
                                     logger.error("[WEBRTC] handler: %s", e)
                                     try:

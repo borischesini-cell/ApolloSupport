@@ -4,7 +4,7 @@
 ; ==============================================================================
 
 #define MyAppName      "Apollo Centinela"
-#define MyAppVersion   "3.3.36"
+#define MyAppVersion   "3.3.38"
 #define MyAppPublisher "Master IS"
 #define MyAppURL       "https://support.ultimate.net.ar"
 #define ServiceExe     "ApolloCentinelaService.exe"
@@ -70,9 +70,9 @@ Source: "..\apollo_logo.ico";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\apollo_logo.png";      DestDir: "{app}"; Flags: ignoreversion
 
 ; DLLs de Visual C++ Runtime ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â incluidas directamente para compatibilidad
-Source: "dlls\vcruntime140.dll";   DestDir: "{app}"; Flags: ignoreversion
-Source: "dlls\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dlls\msvcp140.dll";       DestDir: "{app}"; Flags: ignoreversion
+Source: "dlls\x64\vcruntime140.dll";   DestDir: "{app}"; Flags: ignoreversion
+Source: "dlls\x64\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dlls\x64\msvcp140.dll";       DestDir: "{app}"; Flags: ignoreversion
 
 ; Visual C++ 2015-2022 Redistributable ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â instala Universal CRT
 Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall

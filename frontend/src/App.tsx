@@ -1938,8 +1938,30 @@ export default function App() {
           sdpMLineIndex: ev.candidate.sdpMLineIndex,
         });
       };
+      let disconnectTimer: number | null = null;
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        const st = pc.connectionState;
+        if (st === 'connected') {
+          if (disconnectTimer) { window.clearTimeout(disconnectTimer); disconnectTimer = null; }
+          return;
+        }
+        if (st === 'disconnected') {
+          // Transitorio en WebRTC P2P: esperar 10s a que se recupere antes de declarar fallo.
+          if (disconnectTimer) window.clearTimeout(disconnectTimer);
+          disconnectTimer = window.setTimeout(() => {
+            if (webrtcPcRef.current !== pc) return;
+            const cur = pc.connectionState;
+            if (cur === 'connected') return;
+            stopWebRtc();
+            setWebrtcState('failed');
+            sendViewerCommandRef.current({ type: 'refresh_frame' });
+            setShowNotification('Canal rápido se cayó. Volviendo a HD/WebP…');
+            setTimeout(() => setShowNotification(null), 4000);
+          }, 10000);
+          return;
+        }
+        if (st === 'failed') {
+          if (disconnectTimer) { window.clearTimeout(disconnectTimer); disconnectTimer = null; }
           // Cerrar peer y volver al stream normal (no dejar pantalla negra).
           stopWebRtc();
           setWebrtcState('failed');
