@@ -17,7 +17,7 @@ logger = logging.getLogger("centinela")
 EmitFn = Callable[[dict], Awaitable[None]]
 LogFn = Callable[[str], Awaitable[None]]
 
-TARGET_FPS = 20
+TARGET_FPS = 30
 MAX_WIDTH = 1280
 DISCONNECT_GRACE_S = 10.0
 STATS_EVERY_FRAMES = 300
