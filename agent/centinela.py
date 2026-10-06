@@ -56,8 +56,8 @@ import mss
 # ==============================================================================
 # CONFIGURACION Y VERSIONADO
 # ==============================================================================
-CLIENT_VERSION = "3.3.39"
-BUILD_DATE     = "2026-10-06"  # <--- SE ACTUALIZA MANUALMENTE EN CADA RELEASE
+CLIENT_VERSION = "3.3.40"
+BUILD_DATE     = "2026-10-07"  # <--- SE ACTUALIZA MANUALMENTE EN CADA RELEASE
 # ==============================================================================
 
 class _CentinelaFilter(logging.Filter):

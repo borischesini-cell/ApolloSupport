@@ -80,35 +80,77 @@ def _ice_servers_from_payload(raw) -> list:
 
 
 _SCALE_CACHE = {"src": None, "w": 0, "img": None}
+# Metodo que dio el ultimo frame y ultimo error por metodo (para el log de estadisticas).
+_CAP_STATE = {"method": "", "errors": {}}
+_TLS = threading.local()
+_DXGI_RETRY_AT = [0.0]  # tras fallar, no reintentar DXGI por 5 s (en RDP falla siempre)
+
+
+def _note_err(method: str, exc: Exception) -> None:
+    _CAP_STATE["errors"][method] = ("%s: %s" % (type(exc).__name__, exc))[:120]
+
+
+def _grab_dxgi(Image):
+    from dxgi_capture import get_capturer
+    cap = get_capturer(0)
+    frame = cap.grab_bgra() if cap is not None else None
+    if frame is None:
+        return None
+    w, h, bgra = frame
+    # DXGI reusa el mismo objeto bytes si no hubo frame nuevo: no reescalar.
+    if bgra is _SCALE_CACHE["src"] and _SCALE_CACHE["img"] is not None:
+        return "cached"
+    _SCALE_CACHE["src"] = bgra
+    return Image.frombuffer("RGBX", (w, h), bgra, "raw", "BGRX", 0, 1)
+
+
+def _grab_mss(Image):
+    # Sesiones RDP / sin DXGI: mss es lo que usa el modo estandar y funciona ahi.
+    # La instancia es por hilo (mss guarda handles GDI del hilo que la creo).
+    sct = getattr(_TLS, "sct", None)
+    if sct is None:
+        import mss
+        sct = _TLS.sct = mss.mss()
+    mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+    shot = sct.grab(mon)
+    return Image.frombuffer("RGBX", shot.size, shot.bgra, "raw", "BGRX", 0, 1)
+
+
+def _grab_imagegrab(Image):
+    from PIL import ImageGrab
+    return ImageGrab.grab()
 
 
 def _grab_scaled(max_width: int):
     """Captura y escala en un paso. Devuelve PIL RGB (ancho/alto pares) o None.
 
-    DXGI: escala directo desde el buffer BGRX (sin el .convert("RGB") a resolucion
-    completa) y con BILINEAR+reducing_gap, mucho mas barato que el BICUBIC por defecto.
+    Cascada DXGI -> mss -> ImageGrab (DXGI no existe en sesiones RDP). Escala directo
+    desde el buffer BGRX con BILINEAR+reducing_gap, mucho mas barato que BICUBIC.
     """
     from PIL import Image
     img = None
-    try:
-        from dxgi_capture import get_capturer
-        cap = get_capturer(0)
-        frame = cap.grab_bgra() if cap is not None else None
-        if frame is not None:
-            w, h, bgra = frame
-            # DXGI reusa el mismo objeto bytes si no hubo frame nuevo: no reescalar.
-            if bgra is _SCALE_CACHE["src"] and max_width == _SCALE_CACHE["w"] and _SCALE_CACHE["img"] is not None:
-                return _SCALE_CACHE["img"]
-            img = Image.frombuffer("RGBX", (w, h), bgra, "raw", "BGRX", 0, 1)
-            _SCALE_CACHE["src"] = bgra
-    except Exception:
-        img = None
-    if img is None:
+    for name, fn in (("dxgi", _grab_dxgi), ("mss", _grab_mss), ("imagegrab", _grab_imagegrab)):
+        if name == "dxgi" and time.monotonic() < _DXGI_RETRY_AT[0]:
+            continue
         try:
-            from PIL import ImageGrab
-            img = ImageGrab.grab()
-        except Exception:
-            return None
+            got = fn(Image)
+        except Exception as exc:
+            _note_err(name, exc)
+            got = None
+        if got is None:
+            if name == "dxgi":
+                _DXGI_RETRY_AT[0] = time.monotonic() + 5.0
+            continue
+        if isinstance(got, str):  # "cached": mismo frame DXGI que el anterior
+            _CAP_STATE["method"] = name
+            if max_width == _SCALE_CACHE["w"]:
+                return _SCALE_CACHE["img"]
+            continue
+        img = got
+        _CAP_STATE["method"] = name
+        break
+    if img is None:
+        return None
     w, h = img.size
     if max_width and w > max_width:
         nw = max_width & ~1
@@ -199,8 +241,9 @@ class ScreenTrack(VideoStreamTrack):
             avg = (self._frames - 1) / dt if dt > 0 else 0.0
             try:
                 await self._log_fn(
-                    "[WEBRTC] track: %d frames en %.1fs (%.1f fps promedio, %d capturas)"
-                    % (self._frames, dt, avg, self._cap_frames)
+                    "[WEBRTC] track: %d frames en %.1fs (%.1f fps promedio, %d capturas, metodo=%s%s)"
+                    % (self._frames, dt, avg, self._cap_frames, _CAP_STATE["method"] or "NINGUNO",
+                       (", errores=%s" % _CAP_STATE["errors"]) if _CAP_STATE["errors"] else "")
                 )
             except Exception:
                 pass
